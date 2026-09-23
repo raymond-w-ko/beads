@@ -97,41 +97,24 @@ endif
 BUILD_TAGS := gms_pure_go
 REGRESSION_TIMEOUT ?= 20m
 
-# Build the bd binary
-build:
-	@echo "Building bd..."
+# Build the bd binary. This fork builds remote-only bd: no embedded Dolt engine,
+# and it never runs a local `dolt` binary; it only talks to an external dolt
+# sql-server. CGO_ENABLED=0 drops the embedded engine (and needs no C compiler);
+# the remote_dolt_only tag makes every local-dolt path refuse and sets the
+# tailnet server defaults (see internal/localdolt). Tests still use CGO_ENABLED=1.
+REMOTE_ONLY_BUILD_TAGS := $(BUILD_TAGS) remote_dolt_only
 ifeq ($(OS),Windows_NT)
-	@if [ -n "$$CC" ]; then \
-		echo "Using CC=$$CC"; \
-		go build -tags "$(BUILD_TAGS)" -ldflags="-X main.Build=$(GIT_BUILD)" -o $(BUILD_DIR)/bd.exe ./cmd/bd; \
-	elif command -v gcc >/dev/null 2>&1; then \
-		CC=gcc go build -tags "$(BUILD_TAGS)" -ldflags="-X main.Build=$(GIT_BUILD)" -o $(BUILD_DIR)/bd.exe ./cmd/bd; \
-	elif command -v clang >/dev/null 2>&1 && clang -dumpmachine 2>/dev/null | grep -qi 'windows.*gnu'; then \
-		CC=clang go build -tags "$(BUILD_TAGS)" -ldflags="-X main.Build=$(GIT_BUILD)" -o $(BUILD_DIR)/bd.exe ./cmd/bd; \
-	else \
-		for bin in $(WINDOWS_CGO_BINS); do \
-			if [ -x "$$bin/gcc.exe" ]; then \
-				echo "Using Windows CGO gcc from $$bin"; \
-				PATH="$$bin:$$PATH" CC=gcc go build -tags "$(BUILD_TAGS)" -ldflags="-X main.Build=$(GIT_BUILD)" -o $(BUILD_DIR)/bd.exe ./cmd/bd; \
-				exit $$?; \
-			fi; \
-			if [ -x "$$bin/clang.exe" ] && "$$bin/clang.exe" -dumpmachine 2>/dev/null | grep -qi 'windows.*gnu'; then \
-				echo "Using Windows CGO clang from $$bin"; \
-				PATH="$$bin:$$PATH" CC=clang go build -tags "$(BUILD_TAGS)" -ldflags="-X main.Build=$(GIT_BUILD)" -o $(BUILD_DIR)/bd.exe ./cmd/bd; \
-				exit $$?; \
-			fi; \
-		done; \
-		echo "ERROR: Windows CGO builds require a GCC-compatible compiler." >&2; \
-		echo "       Install MinGW-w64/MSYS2 gcc or MSYS2 clang/LLVM targeting windows-gnu." >&2; \
-		echo "       Put it on PATH, set CC, or set WINDOWS_CGO_BINS=/path/to/toolchain/bin." >&2; \
-		exit 1; \
-	fi
+BD_BIN := bd.exe
 else
-	go build -tags "$(BUILD_TAGS)" -ldflags="-X main.Build=$(GIT_BUILD)" -o $(BUILD_DIR)/bd ./cmd/bd
+BD_BIN := bd
+endif
+
+build:
+	@echo "Building remote-only bd..."
+	CGO_ENABLED=0 go build -tags "$(REMOTE_ONLY_BUILD_TAGS)" -ldflags="-X main.Build=$(GIT_BUILD)" -o $(BUILD_DIR)/$(BD_BIN) ./cmd/bd
 ifeq ($(shell uname),Darwin)
 	@codesign -s - -f $(BUILD_DIR)/bd 2>/dev/null || true
 	@echo "Signed bd for macOS"
-endif
 endif
 
 # Diagnose the local build environment for the gms_pure_go/CGO build trap
