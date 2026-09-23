@@ -22,6 +22,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/steveyegge/beads/internal/doltserver"
+	"github.com/steveyegge/beads/internal/localdolt"
 	"github.com/steveyegge/beads/internal/procid"
 	"github.com/steveyegge/beads/internal/storage/dbproxy/identity"
 	"github.com/steveyegge/beads/internal/storage/dbproxy/pidfile"
@@ -61,6 +62,9 @@ type DoltServer struct {
 var _ DatabaseServer = (*DoltServer)(nil)
 
 func NewDoltServer(doltBinExec, rootDir, configPath, logFilePath string, keepAlivePeriod time.Duration, database string) (*DoltServer, error) {
+	if err := localdolt.Check("server: NewDoltServer"); err != nil {
+		return nil, err
+	}
 	if doltBinExec == "" {
 		return nil, errors.New("server: NewDoltServer: doltBinExec is required")
 	}

@@ -5,6 +5,8 @@ package embeddeddolt
 import (
 	"context"
 	"errors"
+
+	"github.com/steveyegge/beads/internal/localdolt"
 )
 
 // EmbeddedDoltStore is a stub for builds without CGO.
@@ -14,7 +16,14 @@ type EmbeddedDoltStore struct {
 	branch   string
 }
 
-var errNoCGO = errors.New("embeddeddolt: requires CGO (build with CGO_ENABLED=1)")
+var errNoCGO = noCGOError()
+
+func noCGOError() error {
+	if err := localdolt.Check("embedded Dolt"); err != nil {
+		return err
+	}
+	return errors.New("embeddeddolt: requires CGO (build with CGO_ENABLED=1)")
+}
 
 // Open returns an error when CGO is not enabled.
 func Open(_ context.Context, _, _, _ string) (*EmbeddedDoltStore, error) {

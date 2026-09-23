@@ -39,6 +39,7 @@ import (
 	"github.com/steveyegge/beads/internal/fdhygiene"
 	"github.com/steveyegge/beads/internal/githooksenv"
 	"github.com/steveyegge/beads/internal/gittraceenv"
+	"github.com/steveyegge/beads/internal/localdolt"
 	"github.com/steveyegge/beads/internal/lockfile"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
 )
@@ -169,6 +170,9 @@ func rotateDebugProfile(beadsDir string) {
 // This is used by KillStaleServers and Start to avoid killing or
 // interfering with externally-managed dolt processes (GH#2641).
 func IsAutoStartDisabled() bool {
+	if localdolt.Disabled() {
+		return true
+	}
 	if isFalsyBool(os.Getenv("BEADS_DOLT_AUTO_START")) {
 		return true
 	}
@@ -1320,6 +1324,9 @@ func buildDoltServerArgsWithConfig(configPath string, debug bool, profDir string
 // Start explicitly starts a dolt sql-server for the project.
 // Returns the State of the started server, or an error.
 func Start(beadsDir string) (*State, error) {
+	if err := localdolt.Check("start dolt sql-server"); err != nil {
+		return nil, err
+	}
 	cfg := DefaultConfig(beadsDir)
 	doltDir := ResolveDoltDir(beadsDir)
 
@@ -2021,6 +2028,9 @@ func MarkDoltDirCompatible(doltDir string) error {
 // If .dolt/ exists, seeds the .bd-dolt-ok marker for existing working databases.
 // See GH#2137 for background on pre-0.56 database compatibility.
 func ensureDoltInit(doltDir string) error {
+	if err := localdolt.Check("dolt init"); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(doltDir, config.BeadsDirPerm); err != nil {
 		return fmt.Errorf("creating dolt directory: %w", err)
 	}

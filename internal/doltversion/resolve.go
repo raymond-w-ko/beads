@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+
+	"github.com/steveyegge/beads/internal/localdolt"
 )
 
 // DoltBinEnvVar is the environment variable that lets an operator pin the
@@ -113,6 +115,9 @@ func ReadEnvOverride() string {
 // binary and launching a different one. filepath.Abs forces both steps to
 // agree on the same cwd-relative file in that case.
 func Resolve(opts ResolveOptions) (string, Source, error) {
+	if err := localdolt.Check("resolve dolt binary"); err != nil {
+		return "", SourcePath, err
+	}
 	if opts.EnvValue != "" {
 		abs, err := filepath.Abs(opts.EnvValue)
 		if err != nil {

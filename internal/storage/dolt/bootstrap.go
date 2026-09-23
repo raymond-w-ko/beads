@@ -11,6 +11,7 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/githooksenv"
 	"github.com/steveyegge/beads/internal/gittraceenv"
+	"github.com/steveyegge/beads/internal/localdolt"
 	"github.com/steveyegge/beads/internal/lockfile"
 	"github.com/steveyegge/beads/internal/remotecache"
 )
@@ -59,6 +60,9 @@ func BootstrapFromRemoteWithDB(ctx context.Context, doltDir, remoteURL, database
 		return false, fmt.Errorf("invalid database name %q (use cfg.GetDoltDatabase() to resolve the configured name): %w", database, err)
 	}
 
+	if err := localdolt.Check("remote bootstrap"); err != nil {
+		return false, err
+	}
 	// Verify dolt CLI is available
 	if _, err := exec.LookPath("dolt"); err != nil {
 		return false, fmt.Errorf("dolt CLI not found (required for remote bootstrap): %w", err)

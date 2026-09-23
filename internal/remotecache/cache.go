@@ -13,6 +13,7 @@ import (
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/githooksenv"
 	"github.com/steveyegge/beads/internal/gittraceenv"
+	"github.com/steveyegge/beads/internal/localdolt"
 	"github.com/steveyegge/beads/internal/lockfile"
 	"github.com/steveyegge/beads/internal/storage"
 )
@@ -84,6 +85,9 @@ func (c *Cache) lockPath(remoteURL string) string {
 func (c *Cache) Ensure(ctx context.Context, remoteURL string) (string, error) {
 	if err := ValidateRemoteURL(remoteURL); err != nil {
 		return "", fmt.Errorf("invalid remote URL: %w", err)
+	}
+	if err := localdolt.Check("remote cache"); err != nil {
+		return "", err
 	}
 	if _, err := exec.LookPath("dolt"); err != nil {
 		return "", fmt.Errorf("dolt CLI not found (required for remote cache): %w", err)

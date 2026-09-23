@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/compact"
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/localdolt"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -800,6 +801,9 @@ func runCompactDolt() error {
 		return nil
 	}
 
+	if err := localdolt.Check("dolt gc"); err != nil {
+		return HandleErrorWithHint(err.Error(), "run dolt gc on the server host")
+	}
 	// Check if dolt command is available
 	if _, err := exec.LookPath("dolt"); err != nil {
 		return HandleErrorWithHint("dolt command not found in PATH", "install Dolt from https://github.com/dolthub/dolt")

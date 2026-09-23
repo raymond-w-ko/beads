@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/doltremote"
+	"github.com/steveyegge/beads/internal/localdolt"
 	"github.com/steveyegge/beads/internal/remotecache"
 	"github.com/steveyegge/beads/internal/storage"
 )
@@ -115,6 +116,9 @@ func PersistedRemotes(dbPath string) ([]storage.RemoteInfo, error) {
 // directory. This is a read-only guard for deciding whether CLI push/pull/fetch
 // can safely run from that directory; remote mutation still goes through SQL.
 func ListCLIRemotes(dbPath string) ([]storage.RemoteInfo, error) {
+	if err := localdolt.Check("dolt remote -v"); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), listCLIRemotesTimeout(dbPath))
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "dolt", "remote", "-v") // #nosec G204 -- fixed command
@@ -155,6 +159,9 @@ func RemoteURLsMatch(got, want string) bool {
 // Remote mutation should normally go through SQL; this is reserved for the
 // local CLI mirror required by subprocess push/pull/fetch routing.
 func AddCLIRemote(dbPath, name, url string) error {
+	if err := localdolt.Check("dolt remote add"); err != nil {
+		return err
+	}
 	if err := remotecache.ValidateRemoteName(name); err != nil {
 		return fmt.Errorf("invalid remote name: %w", err)
 	}
@@ -172,6 +179,9 @@ func AddCLIRemote(dbPath, name, url string) error {
 
 // RemoveCLIRemote removes a remote at the filesystem level via dolt CLI.
 func RemoveCLIRemote(dbPath, name string) error {
+	if err := localdolt.Check("dolt remote remove"); err != nil {
+		return err
+	}
 	if err := remotecache.ValidateRemoteName(name); err != nil {
 		return fmt.Errorf("invalid remote name: %w", err)
 	}

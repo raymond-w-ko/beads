@@ -43,6 +43,7 @@ import (
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/gittraceenv"
+	"github.com/steveyegge/beads/internal/localdolt"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
 	"github.com/steveyegge/beads/internal/storage/issueops"
@@ -3154,6 +3155,11 @@ func (s *DoltStore) IsReadOnly() bool {
 // Use this instead of Path() when running dolt CLI commands that target the
 // actual database (e.g., remote add/remove, push, pull).
 func (s *DoltStore) CLIDir() string {
+	// Remote-only builds have no local CLI directory, which turns off CLI
+	// push/pull routing and the pre-push fsck.
+	if localdolt.Disabled() {
+		return ""
+	}
 	if s.serverMode && doltserver.IsSharedServerMode() && s.beadsDir != "" {
 		return filepath.Join(doltserver.ResolveDoltDir(s.beadsDir), s.database)
 	}
