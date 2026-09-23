@@ -1485,11 +1485,11 @@ func applyConfigDefaults(cfg *Config) {
 		cfg.ServerSocket = os.Getenv("BEADS_DOLT_SERVER_SOCKET")
 	}
 	if cfg.ServerHost == "" {
-		// Host resolution: BEADS_DOLT_SERVER_HOST env > default 127.0.0.1.
+		// Host resolution: BEADS_DOLT_SERVER_HOST env > configfile.DefaultDoltServerHost.
 		if h := os.Getenv("BEADS_DOLT_SERVER_HOST"); h != "" {
 			cfg.ServerHost = h
 		} else {
-			cfg.ServerHost = "127.0.0.1"
+			cfg.ServerHost = configfile.DefaultDoltServerHost
 		}
 	}
 	// Port resolution: caller-preset explicit ServerPort > BEADS_DOLT_SERVER_PORT
@@ -1559,11 +1559,14 @@ func applyConfigDefaults(cfg *Config) {
 		}
 	}
 	if cfg.ServerUser == "" {
-		cfg.ServerUser = "root"
+		cfg.ServerUser = configfile.DefaultDoltServerUser
 	}
 	// Check environment variable for password (more secure than command-line)
 	if cfg.ServerPassword == "" {
 		cfg.ServerPassword = os.Getenv("BEADS_DOLT_PASSWORD")
+	}
+	if cfg.ServerPassword == "" {
+		cfg.ServerPassword = localdolt.DefaultServerPassword
 	}
 
 	// Remote credentials for Hosted Dolt push/pull (env vars take precedence)

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/localdolt"
 	"github.com/steveyegge/beads/internal/storage/backendnames"
 )
 
@@ -329,9 +330,9 @@ const (
 
 // Default Dolt server settings
 const (
-	DefaultDoltServerHost     = "127.0.0.1"
+	DefaultDoltServerHost     = localdolt.DefaultServerHost
 	DefaultDoltServerPort     = 3307 // Use 3307 to avoid conflict with MySQL on 3306
-	DefaultDoltServerUser     = "root"
+	DefaultDoltServerUser     = localdolt.DefaultServerUser
 	DefaultDoltDatabase       = "beads"
 	DefaultDoltRemotesAPIPort = 8080 // Default dolt remotesapi port for federation
 )
@@ -582,7 +583,7 @@ func (c *Config) GetGlobalProjectID() string {
 //  1. BEADS_DOLT_PASSWORD env var (highest priority, existing behavior)
 //  2. Credentials file lookup by [host:port] section
 //     (path from BEADS_CREDENTIALS_FILE env var, or ~/.config/beads/credentials)
-//  3. Empty string (no password)
+//  3. localdolt.DefaultServerPassword (empty except in remote-only builds)
 //
 // Note: uses the port from configfile (metadata.json / env var), which may differ
 // from the resolved runtime port (doltserver port file). If you have the resolved
@@ -606,7 +607,7 @@ func (c *Config) GetDoltServerPasswordForPort(port int) string {
 	if p := LookupCredentialsPassword(host, port); p != "" {
 		return p
 	}
-	return ""
+	return localdolt.DefaultServerPassword
 }
 
 // GetDoltServerTLS returns whether TLS is enabled for server connections.
