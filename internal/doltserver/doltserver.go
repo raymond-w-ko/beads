@@ -1089,6 +1089,12 @@ func EnsureRunningDetailed(beadsDir string) (port int, startedByUs bool, err err
 	// somehow reached this point (e.g. stale AutoStart=true in config).
 	if IsAutoStartDisabled() {
 		cfg := DefaultConfig(beadsDir)
+		if localdolt.Disabled() {
+			return 0, false, fmt.Errorf("Dolt server unreachable (port %d), and this remote-only build never "+
+				"starts a local server.\n\n"+
+				"Verify the configured server is running and reachable from this host:\n"+
+				"  bd dolt status   # detailed external-server check", cfg.Port)
+		}
 		if host, ok := externalNonLocalhostHost(beadsDir); ok {
 			return 0, false, fmt.Errorf("Configured Dolt server at %s:%d is unreachable, and auto-start "+
 				"is disabled (dolt.auto-start: false in config.yaml or BEADS_DOLT_AUTO_START=0).\n\n"+

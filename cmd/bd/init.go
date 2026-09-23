@@ -21,6 +21,7 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/git"
+	"github.com/steveyegge/beads/internal/localdolt"
 	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/backends"
@@ -614,6 +615,10 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 
 		// Also treat BEADS_DOLT_SERVER_MODE=1 env var as --server.
 		if os.Getenv("BEADS_DOLT_SERVER_MODE") == "1" {
+			initServerMode = true
+		}
+		// Remote-only builds have no embedded engine; server mode is the only store.
+		if localdolt.Disabled() && !initProxiedServer {
 			initServerMode = true
 		}
 

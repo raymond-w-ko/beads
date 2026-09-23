@@ -1928,6 +1928,11 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 					cfg.ServerHost, cfg.ServerPort,
 					cfg.ServerHost, cfg.ServerPort,
 					cfg.ServerHost, cfg.ServerPort)
+			} else if localdolt.Disabled() {
+				hint = fmt.Sprintf("Configured Dolt server at %s:%d is unreachable.\n"+
+					"This remote-only build never starts a local server. Verify the server is running:\n"+
+					"  nc -zv %s %d",
+					cfg.ServerHost, cfg.ServerPort, cfg.ServerHost, cfg.ServerPort)
 			} else if !cfg.AutoStart && doltserver.IsAutoStartDisabled() {
 				hint = "Dolt server auto-start is disabled (dolt.auto-start: false).\n" +
 					"Start the server manually:\n  bd dolt start"
@@ -2191,7 +2196,7 @@ func initializeServerCircuitBreaker(cfg *Config) *circuitBreaker {
 // also set cfg.ReadOnly but must still be able to auto-start a stopped
 // managed server, per dolt_autostart_lifecycle_integration_test.go.
 func serverOpenCanAutoStart(cfg *Config) bool {
-	return !cfg.DisableAutoStart && cfg.AutoStart && cfg.Path != "" &&
+	return !localdolt.Disabled() && !cfg.DisableAutoStart && cfg.AutoStart && cfg.Path != "" &&
 		cfg.ServerSocket == "" && isLocalHost(cfg.ServerHost)
 }
 

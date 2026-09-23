@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/localdolt"
 )
 
 // ServerMode describes who owns and manages the dolt sql-server lifecycle.
@@ -59,6 +60,11 @@ func (m ServerMode) String() string {
 // The function loads metadata.json only if the file exists, to avoid
 // triggering the legacy config.json -> metadata.json migration side effect.
 func ResolveServerMode(beadsDir string) ServerMode {
+	// Remote-only builds never own or embed a server.
+	if localdolt.Disabled() {
+		return ServerModeExternal
+	}
+
 	// 1. BEADS_DOLT_SERVER_MODE=1 env var -> external (explicit server mode)
 	if os.Getenv("BEADS_DOLT_SERVER_MODE") == "1" {
 		return ServerModeExternal
