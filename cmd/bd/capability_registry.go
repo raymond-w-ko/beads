@@ -6,6 +6,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+
+	"github.com/steveyegge/beads/internal/localdolt"
 )
 
 // The proxied-server capability registry: one table for every command path.
@@ -215,12 +217,19 @@ func permitted(path string) capabilityRow {
 //
 // backupRemoteSchemeTracking is why these rows carry a Tracking item despite
 // being Reason=design: the outcome is settled, the remote-scheme CASE is not.
+//
+// A remote-only build (remote_dolt_only) owns no Dolt server: a managed-local
+// backend is one it may not spawn or back up, so there the row refuses on
+// every topology.
 func backupRefusal(path string) capabilityRow {
-	return refusedPath(path, "proxy.backup.unsupported", ProxyReasonDesign, backupRemoteSchemeTracking).
+	row := refusedPath(path, "proxy.backup.unsupported", ProxyReasonDesign, backupRemoteSchemeTracking).
 		withMessage(path + " is not supported in proxied-server mode against a Dolt server bd does not own: " +
 			"the backup remote is registered on the server, where it is global to every client, " +
-			"and a file:// destination names a filesystem this client cannot see").
-		honoredOn(ProxyTopologyManagedLocal)
+			"and a file:// destination names a filesystem this client cannot see")
+	if localdolt.Disabled() {
+		return row
+	}
+	return row.honoredOn(ProxyTopologyManagedLocal)
 }
 
 // backupRemoteSchemeTracking records the one part of the backup refusal that is
