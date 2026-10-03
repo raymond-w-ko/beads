@@ -360,15 +360,27 @@ func isForcedMigrate(cmd *cobra.Command) bool {
 // open targets `beads_global`, so the block's `bd migrate schema` would
 // migrate the PROJECT database and leave the refusal in place — the working
 // remedy is the same verb with the same flag.
-func printGlobalDatabaseConsentHint(w io.Writer) {
+//
+// It takes the refusal because "the same verb" is not the same verb on every
+// arm: the #6575 data-behind stop on a shared store is remote-backed by
+// construction, and there the bare verb's consent is never read (see
+// schema.SharedConsentCommandForced), so retargeting the bare form would hand
+// the operator a global-scoped command that still cannot succeed. This mirrors
+// the retarget in handleRemoteMigrateGateJSON. A nil error keeps the
+// pre-existing bare-verb wording.
+func printGlobalDatabaseConsentHint(w io.Writer, e *schema.RemoteMigrateGateError) {
 	if !globalFlag {
 		return
+	}
+	consent := schema.SharedConsentCommandGlobal
+	if e != nil && e.IsDataBehind() && e.Shared {
+		consent = schema.SharedConsentCommandForcedGlobal
 	}
 	fmt.Fprintf(w,
 		"\n  This command targeted the global database (--global), so run the\n"+
 			"  migrate step with the same flag:\n"+
 			"        %s\n",
-		schema.SharedConsentCommandGlobal)
+		consent)
 }
 
 // renderTypedOpenError prints the actionable block for the store-open failures
@@ -398,7 +410,7 @@ func renderTypedOpenError(err error) bool {
 			handleRemoteMigrateGateJSON(gateErr)
 		} else {
 			fmt.Fprint(os.Stderr, gateErr.UserMessage())
-			printGlobalDatabaseConsentHint(os.Stderr)
+			printGlobalDatabaseConsentHint(os.Stderr, gateErr)
 		}
 		return true
 	}
@@ -867,7 +879,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&sandboxMode, "sandbox", false, "Sandbox mode: disables Dolt auto-push")
 	rootCmd.PersistentFlags().BoolVar(&readonlyMode, "readonly", false, "Read-only mode: block write operations (for worker sandboxes)")
 	rootCmd.PersistentFlags().BoolVar(&globalFlag, "global", false, "Use the global shared-server database (beads_global)")
-	rootCmd.PersistentFlags().StringVar(&doltAutoCommit, "dolt-auto-commit", "", "Dolt auto-commit policy (off|on|batch). 'on': commit after each write. 'batch': defer commits to bd dolt commit; uncommitted changes persist in the working set until then (a live batch-mode bd process also flushes on SIGTERM/SIGHUP). Applies to embedded and direct SQL-server modes; proxied-server routes are unaffected. Default: on. Override via config key dolt.auto-commit")
+	rootCmd.PersistentFlags().StringVar(&doltAutoCommit, "dolt-auto-commit", "", "Dolt auto-commit policy (off|on|batch). 'on': commit after each write. 'batch': defer commits to bd dolt commit; uncommitted changes persist in the working set until then (a live batch-mode bd process also flushes on SIGTERM/SIGHUP, except in proxied-server mode, where bd dolt commit is the only flush point). In proxied-server mode the deferral covers the writes the CLI makes on that route, including config and version metadata; explicit commit points (bd batch, bd mol bond/pour/squash, bd mol wisp create, and the wisp half of bd mol burn) still commit, and a bd serve process on the same database is unaffected. Default: on. Override via config key dolt.auto-commit")
 	rootCmd.PersistentFlags().BoolVar(&cpuProfileEnabled, "cpu-profile", false, "Generate CPU profile for performance analysis")
 	rootCmd.PersistentFlags().StringVar(&memProfilePath, "mem-profile", "", "Write heap profile to FILE on exit (also respects BEADS_MEM_PROFILE)")
 	rootCmd.PersistentFlags().BoolVarP(&verboseFlag, "verbose", "v", false, "Enable verbose/debug output")
@@ -1273,17 +1285,17 @@ var rootCmd = &cobra.Command{
 					fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 				}
 			}
+			if beadsDir == "" {
+				beadsDir = beads.FindBeadsDir()
+			}
 			if cmdName == "doctor" && usesProxiedServer() {
 				// Refuse only on a real refusal. The registry validator
 				// returns nil for doctor subcommands, and returning early on
 				// that would skip the legacy-store guard and autocommit-mode
 				// resolution every other skipsStoreInit command still runs.
-				if err := validateProxyRegistryBeforeProvider(cmd); err != nil {
+				if err := validateProxyRegistryBeforeProvider(cmd, resolveProxiedTopology(beadsDir)); err != nil {
 					return err
 				}
-			}
-			if beadsDir == "" {
-				beadsDir = beads.FindBeadsDir()
 			}
 			if err := guardLegacyNoStoreCommand(cmd, beadsDir); err != nil {
 				isMigrationCommand := false
@@ -1432,6 +1444,11 @@ var rootCmd = &cobra.Command{
 					// (GH#bd-0qel)
 					targetBeadsDir := beads.FindBeadsDir()
 					if targetBeadsDir == "" {
+						// An explicit BEADS_DIR is authoritative even
+						// before it holds project files.
+						targetBeadsDir = beads.ExplicitBeadsDir()
+					}
+					if targetBeadsDir == "" {
 						targetBeadsDir = ".beads"
 					}
 					dbPath = utils.CanonicalizePath(filepath.Join(targetBeadsDir, beads.CanonicalDatabaseName))
@@ -1491,7 +1508,7 @@ var rootCmd = &cobra.Command{
 			if err := validateProxyCapabilitiesBeforeProvider(cmd); err != nil {
 				return err
 			}
-			if err := validateProxyRegistryBeforeProvider(cmd); err != nil {
+			if err := validateProxyRegistryBeforeProvider(cmd, resolveProxiedTopology(beadsDir)); err != nil {
 				return err
 			}
 		}
@@ -1798,6 +1815,16 @@ var rootCmd = &cobra.Command{
 			}
 			uowProvider = wireExternalDependencyUOWProvider(uow.NewNotifyingProvider(p, uowSinks))
 
+			// Honor dolt.auto-commit for proxied writes the same way
+			// issueOpsContext already does for the direct/SQL-server routes
+			// (bd-4wamg): batch/off defer the Dolt version commit rather than
+			// minting one per write (GH#4995). uow.issueOperations reads this
+			// off the context for every Create/Update/Close/Reopen it runs.
+			rootCtx, err = issueOpsContext(rootCtx)
+			if err != nil {
+				return HandleError("failed to resolve dolt auto-commit policy: %v", err)
+			}
+
 			if !previewMode {
 				reconcileVersionProxiedServer(rootCtx)
 			}
@@ -1980,6 +2007,15 @@ var rootCmd = &cobra.Command{
 			// out at the other trigger site below.
 			if shouldAutoPruneEventsJournal(cmd) {
 				maybeAutoPruneEventsJournal(rootCtx, beads.FindBeadsDir())
+			}
+			// Auto-backup, through the provider this command opened. Same
+			// gate as the direct arm's maintenance net below (strict
+			// --readonly, `bd serve` and a migration freeze all skip it),
+			// plus previews: a --dry-run must not register a backup remote
+			// or write backup state. proxiedAutoBackupBackend decides the
+			// topology, so this stays inert off managed-local.
+			if runsPostCommandMaintenance(cmd.Name(), readonlyMode) && !isPreviewCommand(cmd) && !commandFreeze.Frozen() {
+				runPostRunAutoBackup(rootCtx)
 			}
 			if uowProvider != nil {
 				_ = uowProvider.Close(rootCtx)

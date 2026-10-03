@@ -25,10 +25,11 @@ const (
 	ProxyModeProxied ProxyMode = "proxied-server"
 )
 
-// ProxyTopology distinguishes the provider deployment shape. Capability
-// policy is currently identical across proxied shapes, but retaining this
-// dimension prevents an external TCP server from being conflated with a local
-// managed one as more surfaces are added.
+// ProxyTopology distinguishes the provider deployment shape. The backup family
+// is the first policy that genuinely differs across these: a Dolt backup
+// destination is resolved on the machine running dolt, so "the server bd
+// spawned itself" and "a server somebody else runs" are different answers to
+// the same command (see capability_registry.go's backup rows).
 type ProxyTopology string
 
 const (
@@ -36,6 +37,17 @@ const (
 	ProxyTopologyManagedLocal ProxyTopology = "managed-local"
 	ProxyTopologyExternalTCP  ProxyTopology = "external-tcp"
 	ProxyTopologyExternalUnix ProxyTopology = "external-unix"
+	// ProxyTopologyTeamServer is a workspace whose database is owned by
+	// beads-team-server. It is a shape rather than a transport: bts owns the
+	// store's schema and identity whether bd reaches it over a port, a socket,
+	// or a child bd started, so the ownership fact decides capability policy and
+	// the transport does not.
+	ProxyTopologyTeamServer ProxyTopology = "team-server"
+	// ProxyTopologyUnknown is what a workspace bd cannot classify reports. It is
+	// never honored by a topology-keyed row, which is the fail-closed half of
+	// the policy: a workspace that cannot prove it owns its Dolt server does not
+	// get the privileges of one that can.
+	ProxyTopologyUnknown ProxyTopology = "unknown"
 )
 
 // ProxyCapabilityOutcome describes what the front door does with a feature.
@@ -154,8 +166,10 @@ var (
 	// is threading it through the UOW reader the way `list` already does, so
 	// the refusal itself is the gap.
 	maxRowsRefusal = refused("proxy.max_rows.unsupported", "--max-rows / BEADS_MAX_ROWS is not supported in proxied-server mode", ProxyReasonUnimplemented, trackLongTail)
-	// `list --watch` is routed, so watching is possible over the provider;
-	// nothing else has been wired to it.
+	// The mode-wide default for a --watch that has not been wired to the
+	// provider. Both commands that register the flag (`list`, `show`) poll the
+	// provider and are honored per-command below, so this refuses only a
+	// future --watch until someone routes it.
 	watchRefusal = refused("proxy.watch.unsupported", "watch mode not supported in proxied-server mode", ProxyReasonUnimplemented, trackLongTail)
 )
 
@@ -185,7 +199,7 @@ var proxyCapabilityMatrix = map[ProxyMode]map[ProxyCapability]proxyCapabilityRul
 }
 
 var proxyCommandCapabilities = map[string]map[ProxyMode]map[ProxyCapability]proxyCapabilityRule{
-	"show":            {ProxyModeProxied: {ProxyCapWatch: watchRefusal}},
+	"show":            {ProxyModeProxied: {ProxyCapWatch: honored()}},
 	"list":            {ProxyModeProxied: {ProxyCapWatch: honored(), ProxyCapMaxRows: honored(), ProxyCapRepo: notApplicable()}},
 	"dep tree":        {ProxyModeProxied: {ProxyCapMaxRows: honored()}},
 	"ready":           {ProxyModeProxied: {ProxyCapMaxRows: maxRowsRefusal}},
@@ -292,11 +306,6 @@ func validateProxyCapabilitiesBeforeProvider(cmd *cobra.Command) error {
 	name := cmd.Name()
 	if name == "create" && cmd.Flags().Changed("repo") {
 		return HandleProxyCapabilityError(AssertProxyCapability(ProxyModeProxied, ProxyCapRepo))
-	}
-	if name == "show" {
-		if watch, _ := cmd.Flags().GetBool("watch"); watch {
-			return HandleProxyCapabilityError(AssertProxyCommandCapability("show", ProxyModeProxied, ProxyCapWatch))
-		}
 	}
 	if name == "ready" {
 		maxRows, _, err := resolveMaxRows(cmd)
