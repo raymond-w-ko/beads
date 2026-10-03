@@ -146,13 +146,14 @@ func runTestScriptWithFakeGo(t *testing.T, callerBinary string) []string {
 		t.Fatalf("bash is required to exercise scripts/test.sh: %v", err)
 	}
 	repoRoot := sourceRepoRoot(t)
-	env := testScriptEnvironment(testEnvRoot, tempRoot, expected, callerBinary)
+	systemPath := testScriptSystemPath(t)
+	env := testScriptEnvironment(testEnvRoot, tempRoot, expected, callerBinary, systemPath)
 	fakeBinShellPath := shellPathUnderEnv(t, bash, fakeBin, env)
 	fakeGoShellPath := shellPathUnderEnv(t, bash, fakeGo, env)
 	driverShellPath := shellPathUnderEnv(t, bash, currentTestExecutable(t), env)
 	callLogShellPath := shellPathUnderEnv(t, bash, callLog, env)
 	env = append(env,
-		"BEADS_TEST_COMMAND_PATH="+fakeBinShellPath+":/usr/bin:/bin",
+		"BEADS_TEST_COMMAND_PATH="+fakeBinShellPath+":"+systemPath,
 		testScriptDriverEnv+"="+driverShellPath,
 		testScriptFakeGoLogEnv+"="+callLogShellPath,
 	)
@@ -182,10 +183,29 @@ func runTestScriptWithFakeGo(t *testing.T, callerBinary string) []string {
 	return strings.Fields(string(content))
 }
 
-func testScriptEnvironment(testEnvRoot string, tempRoot string, expected string, callerBinary string) []string {
+// testScriptSystemPath is the PATH scripts/test.sh runs under: /usr/bin:/bin,
+// plus the directory holding coreutils when it is elsewhere (NixOS keeps them
+// only in /run/current-system/sw/bin). Windows keeps the MSYS paths unchanged.
+func testScriptSystemPath(t *testing.T) string {
+	t.Helper()
+	const systemPath = "/usr/bin:/bin"
+	if runtime.GOOS == "windows" {
+		return systemPath
+	}
+	dirname, err := exec.LookPath("dirname")
+	if err != nil {
+		t.Skipf("coreutils dirname is required to exercise scripts/test.sh: %v", err)
+	}
+	if dir := filepath.Dir(dirname); dir != "/usr/bin" && dir != "/bin" {
+		return systemPath + ":" + dir
+	}
+	return systemPath
+}
+
+func testScriptEnvironment(testEnvRoot string, tempRoot string, expected string, callerBinary string, systemPath string) []string {
 	home := filepath.Join(testEnvRoot, "home")
 	env := []string{
-		"PATH=/usr/bin:/bin",
+		"PATH=" + systemPath,
 		"HOME=" + portableTestScriptPath(home),
 		"USERPROFILE=" + portableTestScriptPath(home),
 		"TMPDIR=" + portableTestScriptPath(tempRoot),

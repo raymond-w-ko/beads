@@ -115,6 +115,8 @@ func TestLookupCredentialsPassword_FallsBackToFile(t *testing.T) {
 	t.Setenv("BEADS_CREDENTIALS_FILE", credFile)
 
 	// Clear port and password env vars so defaults + file lookup kick in.
+	// Pin the host: remote-only builds default to a different one.
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "127.0.0.1")
 	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
 	t.Setenv("BEADS_DOLT_PORT", "")
 	t.Setenv("BEADS_DOLT_PASSWORD", "")
