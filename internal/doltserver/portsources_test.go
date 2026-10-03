@@ -13,6 +13,7 @@ import (
 // source on top of the previous ones: env > port file > Dolt server
 // config.yaml > Beads config.yaml > metadata.json (GH#4511).
 func TestDefaultConfigPrecedenceChain(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
 	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
 
@@ -79,6 +80,7 @@ func TestDefaultConfigPrecedenceChain(t *testing.T) {
 // port-file bookkeeping) or not (a source where the user, or config on the
 // user's behalf, explicitly asserted the port).
 func TestDefaultConfigPortSource(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
 	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
 

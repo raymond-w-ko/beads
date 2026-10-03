@@ -17,7 +17,19 @@ import (
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/githooksenv"
+	"github.com/steveyegge/beads/internal/localdolt"
 )
+
+// skipIfLocalDoltDisabled skips a test that asserts local-Dolt behaviour (an
+// owned or embedded server, ephemeral ports, dolt init, killing stale
+// servers). Remote-only builds fence all of it; remote_only_test.go asserts
+// what they do instead.
+func skipIfLocalDoltDisabled(t *testing.T) {
+	t.Helper()
+	if localdolt.Disabled() {
+		t.Skip("local Dolt is disabled in remote-only builds")
+	}
+}
 
 // The sql-server outlives the shell that started it: an inherited GIT_TRACE=1
 // would poison every server-side git-protocol transfer until restart. The
@@ -266,6 +278,7 @@ func TestIsRunningCorruptPIDRemovesPortFile(t *testing.T) {
 }
 
 func TestDefaultConfig(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	t.Run("standalone_returns_zero_port", func(t *testing.T) {
 		// Clear env vars to test pure standalone behavior
 		t.Setenv("GT_ROOT", "")
@@ -788,6 +801,7 @@ func TestStopNotRunningWithCleanupError(t *testing.T) {
 }
 
 func TestKillStaleServersPreservesOtherRepoServers(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	t.Setenv("BEADS_DOLT_AUTO_START", "") // ensure auto-start guard doesn't short-circuit
 	dir := t.TempDir()
 	canonicalPID := 111
@@ -923,6 +937,7 @@ func TestKillStaleServersSkipsAutoStartDisabled(t *testing.T) {
 }
 
 func TestIsAutoStartDisabled(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	tests := []struct {
 		envVal string
 		want   bool
@@ -972,6 +987,7 @@ func TestIsAutoStartDisabled(t *testing.T) {
 // env and config: either source can independently disable auto-start, and
 // there is no way to force-enable via one source when the other says disabled.
 func TestIsAutoStartDisabled_Sources(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	// Initialize config so config.Set/GetString works.
 	t.Chdir(t.TempDir())
 	if err := config.Initialize(); err != nil {
@@ -1073,6 +1089,7 @@ func TestIsDoltProcessSelf(t *testing.T) {
 // --- Ephemeral port tests ---
 
 func TestDefaultConfigReturnsZeroForStandalone(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	// DefaultConfig must return port 0 for standalone mode (no configured
 	// port source). Start() will allocate an ephemeral port from the OS,
 	// giving each project a unique port without hash collisions (GH#2098).
@@ -1098,6 +1115,7 @@ func TestDefaultConfigEnvVarOverridesEphemeral(t *testing.T) {
 }
 
 func TestDefaultConfigPortFileTakesPrecedence(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	// Port file (written by Start) should take precedence over ephemeral.
 	t.Setenv("GT_ROOT", "")
 	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
@@ -1188,6 +1206,7 @@ func TestIsPreV56DoltDir_NoDotDolt(t *testing.T) {
 }
 
 func TestEnsureDoltInit_SeedsMarker(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	doltDir := t.TempDir()
 	dotDolt := filepath.Join(doltDir, ".dolt", "noms")
 	if err := os.MkdirAll(dotDolt, 0750); err != nil {
@@ -1552,6 +1571,7 @@ func TestDefaultConfig_SharedModeBeadsDir(t *testing.T) {
 // --- ServerMode tests ---
 
 func TestResolveServerMode_Default(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
 	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
 	config.ResetForTesting()
@@ -1595,6 +1615,7 @@ func TestResolveServerMode_ExplicitPort(t *testing.T) {
 }
 
 func TestResolveServerMode_HostInferredExternal(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	// GH#3545: a non-localhost host with no explicit mode or port means
 	// the server lives on another machine — bd cannot own its lifecycle,
 	// so "bd dolt start" must not launch a repo-local server against it.
@@ -1654,6 +1675,7 @@ func TestResolveServerMode_HostInferredExternal(t *testing.T) {
 }
 
 func TestResolveServerMode_EnvHostBeatsEmbeddedMetadata(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	// GH#2949 precedent applied to the host env var: a runtime remote
 	// host must beat stale dolt_mode=embedded metadata, and the two mode
 	// resolvers (IsDoltServerMode, ResolveServerMode) must agree — or
@@ -1724,6 +1746,7 @@ func TestResolveServerMode_ServerModeEnv(t *testing.T) {
 }
 
 func TestResolveServerMode_EmbeddedMode(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
 	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
 	config.ResetForTesting()
@@ -1761,6 +1784,7 @@ func TestServerMode_String(t *testing.T) {
 }
 
 func TestDefaultConfig_IncludesMode(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
 	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
 	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
@@ -1831,6 +1855,7 @@ func TestResolveServerMode_ServerModeEnvOverridesStaleEmbedded(t *testing.T) {
 }
 
 func TestResolveServerMode_EmbeddedHonoredWithoutServerEnv(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	// When no server env vars are set, metadata.json embedded mode is correct.
 	dir := t.TempDir()
 	beadsDir := filepath.Join(dir, ".beads")

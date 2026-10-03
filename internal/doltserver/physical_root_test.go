@@ -77,6 +77,7 @@ func TestResolvePhysicalRootsEmbeddedMetadata(t *testing.T) {
 }
 
 func TestResolvePhysicalRootsServerMetadata(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	resetPhysicalRootEnv(t)
 	beadsDir := newTestBeadsDir(t)
 	writeBeadsMetadata(t, beadsDir, `{"database":"beads.db","dolt_mode":"server"}`)
@@ -89,6 +90,7 @@ func TestResolvePhysicalRootsServerMetadata(t *testing.T) {
 }
 
 func TestResolvePhysicalRootsServerDataDirConfig(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	resetPhysicalRootEnv(t)
 	absData := filepath.Join(t.TempDir(), "fast-disk")
 
@@ -114,6 +116,7 @@ func TestResolvePhysicalRootsServerDataDirConfig(t *testing.T) {
 }
 
 func TestResolvePhysicalRootsServerDataDirEnv(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	resetPhysicalRootEnv(t)
 
 	t.Run("relative", func(t *testing.T) {
@@ -141,6 +144,7 @@ func TestResolvePhysicalRootsServerDataDirEnv(t *testing.T) {
 }
 
 func TestResolvePhysicalRootsServerModeEnvOverridesEmbeddedMetadata(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	resetPhysicalRootEnv(t)
 	beadsDir := newTestBeadsDir(t)
 	// Runtime env wins over stale persisted mode (GH#2949 semantics).
