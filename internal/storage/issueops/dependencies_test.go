@@ -189,11 +189,20 @@ func TestCycleReachabilityQueryMultipleTablesTraversesUniqueNodes(t *testing.T) 
 	if strings.Contains(query, "UNION ALL") || strings.Contains(query, "depth") {
 		t.Fatalf("multi-table cycle query should traverse unique nodes, not enumerate paths:\n%s", query)
 	}
-	if !strings.Contains(query, "FROM dependencies") {
-		t.Fatalf("query does not include dependencies table:\n%s", query)
+	// Each table is its own recursive branch joined directly on issue_id so the
+	// recursion is an indexed lookup. A derived `JOIN (SELECT ... UNION ...)`
+	// is materialized once per recursion step with no usable index and took
+	// ~10 s per edge on a 7k-edge graph.
+	for _, table := range []string{"dependencies", "wisp_dependencies"} {
+		if !strings.Contains(query, "JOIN "+table+" d ON d.issue_id = r.node") {
+			t.Fatalf("query does not join %s directly on issue_id:\n%s", table, query)
+		}
 	}
-	if !strings.Contains(query, "FROM wisp_dependencies") {
-		t.Fatalf("query does not include wisp_dependencies table:\n%s", query)
+	if strings.Contains(query, "JOIN (SELECT") {
+		t.Fatalf("multi-table cycle query must not materialize a derived dependency table:\n%s", query)
+	}
+	if !strings.Contains(query, "d.type IN ('blocks', 'conditional-blocks', 'parent-child')") {
+		t.Fatalf("query does not filter scheduling-relevant dependency types at the join:\n%s", query)
 	}
 	if !strings.Contains(query, DepTargetExpr) {
 		t.Fatalf("query does not resolve depends_on_id via DepTargetExpr:\n%s", query)
