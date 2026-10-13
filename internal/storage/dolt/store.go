@@ -1310,6 +1310,9 @@ func (s *DoltStore) commitWriteTx(ctx context.Context, lock writeLock, fn func(t
 	if err != nil {
 		return issueops.BlockedRecheck{}, fmt.Errorf("begin write tx: %w", err)
 	}
+	// Runs before release: Conn.Close waits for an open Tx, so a panicking fn
+	// would otherwise hang there instead of propagating. A no-op after Commit.
+	defer func() { _ = tx.Rollback() }()
 	clearJournalScope := s.scopeEventsJournalTransaction(tx)
 	defer clearJournalScope()
 	clearRecheckScope := issueops.ScopeBlockedRecheckTransaction(tx)

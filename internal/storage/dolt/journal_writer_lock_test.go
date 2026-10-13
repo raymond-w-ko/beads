@@ -3,8 +3,16 @@ package dolt
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"go/ast"
+	"go/importer"
+	"go/parser"
+	"go/token"
+	gotypes "go/types"
+	"io/fs"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -143,6 +151,54 @@ func TestWriteTxConn_ReleaseIsBounded(t *testing.T) {
 	}
 	if got := store.db.Stats().OpenConnections; got != 0 {
 		t.Fatalf("a timed-out RELEASE_LOCK returned %d live session(s) to the pool; want the session discarded", got)
+	}
+}
+
+// TestCommitWriteTx_PanicRollsBackAndPropagates pins that a write body that
+// panics surfaces its panic instead of hanging in the deferred release:
+// database/sql's Conn.Close waits for an open Tx to finish, so the transaction
+// must be rolled back before the pinned session is released — locked or not.
+func TestCommitWriteTx_PanicRollsBackAndPropagates(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		lock writeLock
+	}{
+		{"locked", journaledWrite},
+		{"unlocked", unjournaledWrite},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, mock := newJournalLockMockStore(t, true, true)
+			if tc.lock == journaledWrite {
+				mock.ExpectQuery(matchGetLock).WillReturnRows(sqlmock.NewRows([]string{"got"}).AddRow(1))
+			}
+			mock.ExpectBegin()
+			mock.ExpectRollback()
+			if tc.lock == journaledWrite {
+				mock.ExpectExec(matchReleaseLock).WillReturnResult(sqlmock.NewResult(0, 0))
+			}
+
+			recovered := make(chan any, 1)
+			go func() {
+				defer func() { recovered <- recover() }()
+				_, _ = store.commitWriteTx(context.Background(), tc.lock, func(*sql.Tx) error {
+					panic("write body panic")
+				})
+			}()
+			select {
+			case got := <-recovered:
+				if got != "write body panic" {
+					t.Fatalf("recovered %v, want the write body's panic", got)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("a panicking write body hung in the deferred connection release instead of propagating")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("panic path SQL: %v", err)
+			}
+			if got := store.db.Stats().InUse; got != 0 {
+				t.Fatalf("a panicking write body left %d session(s) in use, want the session released", got)
+			}
+		})
 	}
 }
 
@@ -323,39 +379,287 @@ var noJournalCallers = []string{
 // body that can never advance bd_events_seq. A journaled write slipped into
 // one would go back to aborting its peers with 1213 — or being aborted. So no
 // function that calls withRetryTxNoJournal/withWriteTxNoJournal may call a
-// journaling issueops mutator, or a function of this package that calls one.
-// Like the scope guard, reachability is direct (one hop), not a fixpoint.
+// journaling issueops mutator, or a function of this package, on any receiver,
+// that reaches one through any number of helpers (bd-6bqd, bd-n8yb). See
+// parseDoltCallGraph for how calls resolve and noJournalViolations for the one
+// edge the reach does not follow.
 func TestJournalWriterLock_NoJournalBodiesRecordNothing(t *testing.T) {
 	mutators := journalingIssueopsMutators(t)
 	journalingMemoryopsMutators(t, mutators)
-	fns, err := journalscan.ParsePackage(".")
-	if err != nil {
-		t.Fatalf("parse dolt package: %v", err)
-	}
-	journalingHere := map[string]bool{}
-	for _, f := range fns {
-		if f.CallsAnyOf(mutators) {
-			journalingHere[f.Name] = true
-		}
-	}
-	noJournal := map[string]bool{"withRetryTxNoJournal": true, "withWriteTxNoJournal": true}
-	checked := map[string]bool{}
-	for key, f := range fns {
-		if !f.CallsAnyOf(noJournal) {
-			continue
-		}
-		checked[key] = true
-		for _, c := range f.AllCallNames() {
-			if mutators[c] || journalingHere[c] {
-				t.Errorf("%s runs on a NoJournal transaction helper but calls %s, which can record a journal event — use withRetryTx/withWriteTx so it takes the journal writer lock", key, c)
-			}
-		}
+	checked, violations := noJournalViolations(t, parseDoltCallGraph(t), mutators)
+	for _, v := range violations {
+		t.Error(v)
 	}
 	for _, want := range noJournalCallers {
 		if !checked[want] {
 			t.Errorf("NoJournal callers = %v, want %s among them — the guard is not looking where it should", checked, want)
 		}
 	}
+}
+
+// noJournalGuardFixture is a NoJournal body on a non-DoltStore receiver that
+// reaches a journaling mutator through a helper on the same receiver — the
+// case bd-rcw1 found the DoltStore-only reach missing. It is parsed into the
+// package's call graph only, never compiled.
+const noJournalGuardFixture = `package dolt
+
+import (
+	"context"
+	"database/sql"
+	"time"
+
+	"github.com/steveyegge/beads/internal/storage/issueops"
+	"github.com/steveyegge/beads/internal/types"
+)
+
+func (m *memories) fixtureNoJournalProbe(ctx context.Context) error {
+	return m.store.withRetryTxNoJournal(ctx, func(tx *sql.Tx) error {
+		return m.fixtureHopOne(ctx, tx)
+	})
+}
+
+func (m *memories) fixtureHopOne(ctx context.Context, tx *sql.Tx) error {
+	_, err := issueops.ReclaimExpiredLeasesInTx(ctx, tx, time.Now(), types.ReclaimFilter{}, "fixture")
+	return err
+}
+`
+
+// TestJournalWriterLock_NoJournalGuardReachesEveryReceiver pins the guard's
+// reach past DoltStore: the fixture's helper is a memories method, and the
+// guard must name it.
+func TestJournalWriterLock_NoJournalGuardReachesEveryReceiver(t *testing.T) {
+	mutators := journalingIssueopsMutators(t)
+	journalingMemoryopsMutators(t, mutators)
+	_, violations := noJournalViolations(t, parseDoltCallGraph(t, noJournalGuardFixture), mutators)
+	want := "memories.fixtureNoJournalProbe runs on a NoJournal transaction helper but calls memories.fixtureHopOne,"
+	if len(violations) != 1 || !strings.HasPrefix(violations[0], want) {
+		t.Fatalf("violations = %q, want exactly one starting %q", violations, want)
+	}
+}
+
+// noJournalViolations reports every function that runs on a NoJournal
+// transaction helper and calls a journaling mutator or a package function that
+// reaches one, with the callers it checked.
+//
+// The reach follows every call but one: an edge into recheckBlockedAfterCommit.
+// That post-commit recheck journals on a locked transaction of its own
+// (withRetryTx), opened after the caller's transaction has committed, so it
+// never writes on the unlocked one; following it would mark retryWriteTx, and
+// through it every NoJournal helper.
+func noJournalViolations(t *testing.T, g doltCallGraph, mutators map[string]bool) (map[string]bool, []string) {
+	t.Helper()
+	const postCommitRecheck = "DoltStore.recheckBlockedAfterCommit"
+	reaches := map[string]bool{}
+	for key, f := range g {
+		if f.callsAnyOf(mutators) {
+			reaches[key] = true
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for key, f := range g {
+			if reaches[key] {
+				continue
+			}
+			for callee := range f.callees {
+				if callee != postCommitRecheck && reaches[callee] {
+					reaches[key], changed = true, true
+					break
+				}
+			}
+		}
+	}
+	for _, helper := range []string{"withRetryTxNoJournal", "withWriteTxNoJournal", "retryWriteTx", "commitWriteTx"} {
+		if reaches["DoltStore."+helper] {
+			t.Fatalf("the transaction plumbing %s reads as journaling — the reach analysis is following a call it should not, and would flag every NoJournal caller", helper)
+		}
+	}
+	noJournal := map[string]bool{"withRetryTxNoJournal": true, "withWriteTxNoJournal": true}
+	checked := map[string]bool{}
+	var violations []string
+	for key, f := range g {
+		if !f.callsAnyOf(noJournal) {
+			continue
+		}
+		checked[key] = true
+		var bad []string
+		for _, c := range f.calls {
+			if mutators[c] {
+				bad = append(bad, c)
+			}
+		}
+		for callee := range f.callees {
+			if callee != postCommitRecheck && reaches[callee] {
+				bad = append(bad, callee)
+			}
+		}
+		for _, c := range bad {
+			violations = append(violations, fmt.Sprintf("%s runs on a NoJournal transaction helper but calls %s, which can record a journal event — use withRetryTx/withWriteTx so it takes the journal writer lock", key, c))
+		}
+	}
+	sort.Strings(violations)
+	return checked, violations
+}
+
+// doltCallGraph is this package's non-test functions, keyed like journalscan
+// ("Recv.Name", or "Name" for a free function).
+type doltCallGraph map[string]*doltFunc
+
+type doltFunc struct {
+	calls   []string        // every called name, bare or selector, as journalscan records them
+	callees map[string]bool // keys of the package functions the body calls or takes as a value
+}
+
+func (f *doltFunc) callsAnyOf(set map[string]bool) bool {
+	for _, c := range f.calls {
+		if set[c] {
+			return true
+		}
+	}
+	return false
+}
+
+// parseDoltCallGraph type-checks this package's non-test files, plus any
+// fixture sources, and resolves each reference to a package function by type:
+// m.store.withRetryTxNoJournal is DoltStore's method and rows.Close() is
+// *sql.Rows', not issueOperations.Close. Standard-library imports are checked
+// from GOROOT source; every other import is refused, and go/types gives it an
+// empty package and carries on, so every type this package declares and every
+// stdlib type still resolves.
+//
+// Where the type is not known, the edge is kept, by bare name, to every
+// package method of that name:
+//   - a selector on a value of another module's type (issueops.BlockedRecheck,
+//     ...), whose type the refused import left unknown;
+//   - an interface method, which may dispatch to any package type.
+//
+// Not followed at all: calls through a func-typed value (a variable, field or
+// parameter), whose target is decided at run time. A NoJournal body's own
+// closure is part of its caller's body, so it is checked; a method or function
+// passed as a value is an edge like a call.
+func parseDoltCallGraph(t *testing.T, fixtures ...string) doltCallGraph {
+	t.Helper()
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse dolt package: %v", err)
+	}
+	var files []*ast.File
+	for _, file := range pkgs["dolt"].Files {
+		files = append(files, file)
+	}
+	for i, src := range fixtures {
+		file, err := parser.ParseFile(fset, fmt.Sprintf("fixture%d.go", i), src, 0)
+		if err != nil {
+			t.Fatalf("parse fixture %d: %v", i, err)
+		}
+		files = append(files, file)
+	}
+	info := &gotypes.Info{
+		Uses:       map[*ast.Ident]gotypes.Object{},
+		Selections: map[*ast.SelectorExpr]*gotypes.Selection{},
+	}
+	conf := gotypes.Config{
+		Importer: stdlibImporter{importer.ForCompiler(fset, "source", nil)},
+		Error:    func(error) {}, // the refused imports; resolution goes on without them
+	}
+	pkg, _ := conf.Check("dolt", fset, files, info)
+
+	g := doltCallGraph{}
+	byName := map[string][]string{} // method name -> package method keys
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			key := funcDeclKey(fn)
+			if fn.Recv != nil {
+				byName[fn.Name.Name] = append(byName[fn.Name.Name], key)
+			}
+			g[key] = &doltFunc{callees: map[string]bool{}}
+		}
+	}
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			f := g[funcDeclKey(fn)]
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				switch node := n.(type) {
+				case *ast.CallExpr:
+					switch fun := node.Fun.(type) {
+					case *ast.Ident:
+						f.calls = append(f.calls, fun.Name)
+					case *ast.SelectorExpr:
+						f.calls = append(f.calls, fun.Sel.Name)
+					}
+				case *ast.SelectorExpr:
+					if info.Uses[node.Sel] != nil || info.Selections[node] != nil {
+						return true
+					}
+					if x, ok := node.X.(*ast.Ident); ok {
+						if _, ok := info.Uses[x].(*gotypes.PkgName); ok {
+							return true // a qualified identifier of another package
+						}
+					}
+					for _, callee := range byName[node.Sel.Name] {
+						f.callees[callee] = true
+					}
+				case *ast.Ident:
+					target, ok := info.Uses[node].(*gotypes.Func)
+					if !ok {
+						return true
+					}
+					sig := target.Type().(*gotypes.Signature)
+					if sig.Recv() == nil {
+						if target.Pkg() == pkg {
+							f.callees[target.Name()] = true
+						}
+						return true
+					}
+					recv := sig.Recv().Type()
+					if ptr, ok := recv.(*gotypes.Pointer); ok {
+						recv = ptr.Elem()
+					}
+					if gotypes.IsInterface(recv) {
+						for _, callee := range byName[target.Name()] {
+							f.callees[callee] = true
+						}
+						return true
+					}
+					if named, ok := recv.(*gotypes.Named); ok && target.Pkg() == pkg {
+						f.callees[named.Obj().Name()+"."+target.Name()] = true
+					}
+				}
+				return true
+			})
+		}
+	}
+	return g
+}
+
+// funcDeclKey keys fn the way journalscan.ParsePackage does.
+func funcDeclKey(fn *ast.FuncDecl) string {
+	if fn.Recv != nil && len(fn.Recv.List) > 0 {
+		return journalscan.ReceiverTypeName(fn.Recv.List[0].Type) + "." + fn.Name.Name
+	}
+	return fn.Name.Name
+}
+
+// stdlibImporter checks standard-library imports from source and refuses
+// every other path (see parseDoltCallGraph).
+type stdlibImporter struct{ src gotypes.Importer }
+
+func (i stdlibImporter) Import(path string) (*gotypes.Package, error) {
+	if first, _, _ := strings.Cut(path, "/"); strings.Contains(first, ".") {
+		return nil, fmt.Errorf("%s: not a standard-library package", path)
+	}
+	return i.src.Import(path)
 }
 
 // TestJournalWriterLock_NonJournaledWritesSkipAHeldLock pins the audit end to
