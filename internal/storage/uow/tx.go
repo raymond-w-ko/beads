@@ -87,7 +87,9 @@ func RunTxResultWithin[T any](ctx context.Context, p UnitOfWorkProvider, maxElap
 	bo.MaxElapsedTime = maxElapsed
 
 	err := backoff.Retry(func() error {
-		uw, err := p.NewUOW(ctx)
+		// The one route that commits journaled writes: queue it behind the
+		// other journaled writers (lockJournalWriter).
+		uw, err := p.NewUOW(withJournalWriter(ctx))
 		if err != nil {
 			if isSerializationError(err) {
 				return err

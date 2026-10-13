@@ -448,15 +448,17 @@ func (s *DoltStore) verifiedReadyClaim(ctx context.Context, actor string, write 
 // (see issueops.lease). Deliberately NO DOLT_ADD/DOLT_COMMIT: the leases
 // table is dolt_ignored, so a heartbeat mints no commit and no history — this
 // is the whole point of bd-lrgn1 (fleet heartbeats were the dominant source
-// of unbounded reachable history). Wrapped in withRetryTx so a heartbeat that
-// loses Dolt's optimistic merge to a concurrent reclaim/close on the same
-// lease row is replayed against a fresh snapshot rather than surfaced.
+// of unbounded reachable history). Wrapped in withRetryTxNoJournal so a
+// heartbeat that loses Dolt's optimistic merge to a concurrent reclaim/close on
+// the same lease row is replayed against a fresh snapshot rather than
+// surfaced; a heartbeat records no journal event, so it never queues behind
+// journaled writers, where its lease could lapse.
 func (s *DoltStore) HeartbeatIssue(ctx context.Context, id, actor string) error {
 	if s.isActiveWisp(ctx, id) {
 		// Wisps are ephemeral and never leased; nothing to heartbeat.
 		return fmt.Errorf("%w: %s is ephemeral", storage.ErrNotClaimable, id)
 	}
-	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+	return s.withRetryTxNoJournal(ctx, func(tx *sql.Tx) error {
 		return issueops.HeartbeatIssueInTx(ctx, tx, id, actor)
 	})
 }
@@ -951,9 +953,10 @@ func (s *DoltStore) DeleteIssuesBySourceRepo(ctx context.Context, sourceRepo str
 	return count, err
 }
 
-// ClearRepoMtime removes the mtime cache entry for a repository.
+// ClearRepoMtime removes the mtime cache entry for a repository. It writes only
+// repo_mtimes and records no journal event, so it takes no journal writer lock.
 func (s *DoltStore) ClearRepoMtime(ctx context.Context, repoPath string) error {
-	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+	return s.withRetryTxNoJournal(ctx, func(tx *sql.Tx) error {
 		return issueops.ClearRepoMtimeInTx(ctx, tx, repoPath)
 	})
 }
@@ -970,9 +973,10 @@ func (s *DoltStore) GetRepoMtime(ctx context.Context, repoPath string) (int64, e
 	return result, err
 }
 
-// SetRepoMtime updates the mtime cache for a repository's data file.
+// SetRepoMtime updates the mtime cache for a repository's data file. Like
+// ClearRepoMtime it records no journal event and takes no journal writer lock.
 func (s *DoltStore) SetRepoMtime(ctx context.Context, repoPath, jsonlPath string, mtimeNs int64) error {
-	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+	return s.withRetryTxNoJournal(ctx, func(tx *sql.Tx) error {
 		return issueops.SetRepoMtimeInTx(ctx, tx, repoPath, jsonlPath, mtimeNs)
 	})
 }

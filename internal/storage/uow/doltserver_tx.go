@@ -22,6 +22,10 @@ type doltServerTx struct {
 	// transaction's unblocking writes record for the post-commit
 	// blocked-state recheck (gastownhall/beads#6716).
 	clearRecheckScope func()
+	// unlockJournal releases the journal writer lock BeginTx took on conn (a
+	// no-op when it took none). It runs on both connection-release paths,
+	// before the connection leaves this tx.
+	unlockJournal func()
 }
 
 var _ Tx = (*doltServerTx)(nil)
@@ -194,6 +198,7 @@ func (t *doltServerTx) rollbackConn(ctx context.Context) error {
 func (t *doltServerTx) releaseConn() {
 	t.releaseJournalScope()
 	t.releaseRecheckScope()
+	t.releaseJournalLock()
 	if t.conn != nil {
 		_ = t.conn.Close()
 		t.conn = nil
@@ -219,6 +224,18 @@ func (t *doltServerTx) releaseRecheckScope() {
 	}
 }
 
+// releaseJournalLock releases the journal writer lock, if BeginTx took one.
+// Idempotent for the same reason as releaseJournalScope. The release is
+// bounded, and when it fails or times out it discards the session itself
+// (issueops.LockJournalWriter), so a session still owning the lock never goes
+// back to the pool; closing the session releases its locks server-side.
+func (t *doltServerTx) releaseJournalLock() {
+	if t.unlockJournal != nil {
+		t.unlockJournal()
+		t.unlockJournal = nil
+	}
+}
+
 // poisonConn discards the pinned session instead of returning it to the pool.
 // A session whose transaction may still be open must never be reused: because
 // go-sql-driver's ResetSession only performs a liveness check (no
@@ -228,6 +245,7 @@ func (t *doltServerTx) releaseRecheckScope() {
 func (t *doltServerTx) poisonConn() {
 	t.releaseJournalScope()
 	t.releaseRecheckScope()
+	t.releaseJournalLock()
 	if t.conn == nil {
 		return
 	}
