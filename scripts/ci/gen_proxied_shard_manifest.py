@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Regenerate .github/scripts/proxied-cmd-test-shards.txt by cost-balancing.
 
-Cost proxy for each top-level TestProxiedServer* function is its bd-init count
+Discovery must stay in step with proxied-test-shard.sh: both select the
+TestProxiedServer* and TestServerMode* entry points, which share the
+requireSharedProxiedServer gate and the shared dolt sql-server.
+
+Cost proxy for each such top-level function is its bd-init count
 (newSharedProxiedProject occurrences) — inits dominate proxied wall-time. Tests
 are packed into TOTAL shards longest-processing-time-first so the heaviest shard
 is minimized. Prints the manifest to stdout.
@@ -13,7 +17,7 @@ import re
 import sys
 
 TOTAL = int(sys.argv[1]) if len(sys.argv) > 1 else 15
-func_re = re.compile(r'^func (TestProxiedServer[A-Za-z0-9_]+)\(')
+func_re = re.compile(r'^func (Test(?:ProxiedServer|ServerMode)[A-Za-z0-9_]+)\(')
 
 costs = {}
 for path in glob.glob('cmd/bd/*_test.go'):
@@ -51,8 +55,25 @@ out.append('#')
 out.append(f'# {TOTAL}-shard split, bin-packed longest-processing-time-first by')
 out.append('# estimated cost (bd-init count; per-init migration chains dominate).')
 out.append('# Regenerate with scripts/ci/gen_proxied_shard_manifest.py after adding,')
-out.append('# splitting, or reweighting TestProxiedServer* functions. Newly-added')
-out.append('# tests not listed here hash-distribute via proxied-test-shard.sh.')
+out.append('# splitting, or reweighting TestProxiedServer*/TestServerMode*')
+out.append('# functions. Newly-added tests not listed here hash-distribute via')
+out.append('# proxied-test-shard.sh.')
+out.append('#')
+out.append('# This file is generated: notes added here are erased by the next')
+out.append('# regeneration. Add them to the generator instead. Known blind spots')
+out.append('# of the cost proxy (it counts inits, not the work done per init):')
+out.append('#')
+out.append('#   TestProxiedServerListSortRetiresTheWalk is the most expensive')
+out.append('#   entry and one of the cheapest-looking: off a single init it seeds')
+out.append('#   1400 rows and walks the listing three ways. It is the measurement')
+out.append('#   behind the claim that sort=priority retires the client-side walk,')
+out.append('#   so it has to run on PRs.')
+out.append('#')
+out.append('#   TestProxiedServerServeReadParity is the CLI/HTTP read parity')
+out.append('#   oracle, the behavioural half of the anti-drift claim. It being in')
+out.append('#   this lane, and this lane being required by the PR Risk CI gate,')
+out.append('#   is what makes that claim enforced on PRs rather than asserted in')
+out.append('#   a doc comment.')
 out.append('')
 for i in range(TOTAL):
     for name in sorted(shards[i]):

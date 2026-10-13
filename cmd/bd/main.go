@@ -1656,6 +1656,11 @@ var rootCmd = &cobra.Command{
 			// Bulk loads outlive the pool's 10s fast-fail on every server
 			// pause (wy-sbgucn); explicit env/config settings still win.
 			PoolReadTimeoutFallback: bulkLoadPoolReadTimeout(cmd),
+			// Classification-only read (GH#804), never strict --readonly or a
+			// preview: the store is genuinely writable underneath, so the
+			// lazy defer-wake sweep may still run (be-vbhpf).
+			// A migration freeze also disqualifies it (dc-6jaq): the sweep is a write.
+			ClassifiedRead: classifiedReadOpen(policy.readOnly, readonlyMode, previewMode, commandFreeze.Frozen()),
 		}
 
 		// Load config to get database name and server connection settings.
