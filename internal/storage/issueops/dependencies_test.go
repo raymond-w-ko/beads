@@ -209,6 +209,40 @@ func TestCycleReachabilityQueryMultipleTablesTraversesUniqueNodes(t *testing.T) 
 	}
 }
 
+func TestAncestorQuerySingleTableJoinsDirectly(t *testing.T) {
+	query := ancestorQuery([]string{"wisp_dependencies"})
+	if !strings.Contains(query, "JOIN wisp_dependencies d ON d.issue_id = a.node AND d.type = 'parent-child'") {
+		t.Fatalf("query does not join wisp_dependencies directly on parent-child edges:\n%s", query)
+	}
+	if strings.Contains(query, "JOIN (SELECT") {
+		t.Fatalf("single-table ancestry query should not materialize a derived dependency table:\n%s", query)
+	}
+	if strings.Contains(query, "UNION ALL") || strings.Contains(query, "depth") {
+		t.Fatalf("ancestry query should traverse unique nodes, not enumerate paths:\n%s", query)
+	}
+}
+
+func TestAncestorQueryMultipleTablesTraversesUniqueNodes(t *testing.T) {
+	query := ancestorQuery([]string{"dependencies", "wisp_dependencies"})
+	if strings.Contains(query, "UNION ALL") || strings.Contains(query, "depth") {
+		t.Fatalf("multi-table ancestry query should traverse unique nodes, not enumerate paths:\n%s", query)
+	}
+	// CheckBlockingHierarchyInTx runs this probe twice per blocking edge, so a
+	// revert to one derived `JOIN (SELECT ... UNION ...)` costs what it cost the
+	// cycle query: an unindexed rescan of both tables per recursion step.
+	for _, table := range []string{"dependencies", "wisp_dependencies"} {
+		if !strings.Contains(query, "JOIN "+table+" d ON d.issue_id = a.node AND d.type = 'parent-child'") {
+			t.Fatalf("query does not join %s directly on issue_id:\n%s", table, query)
+		}
+	}
+	if strings.Contains(query, "JOIN (SELECT") {
+		t.Fatalf("multi-table ancestry query must not materialize a derived dependency table:\n%s", query)
+	}
+	if !strings.Contains(query, DepTargetExpr) {
+		t.Fatalf("query does not resolve depends_on_id via DepTargetExpr:\n%s", query)
+	}
+}
+
 // TestReplaceDependencyTargetRekeysCascadedRows pins the half of a rename the
 // rewrite above cannot see. fk_dep_issue_target carries ON UPDATE CASCADE and
 // updateIssueIDInTx renames the issues row first, so depends_on_issue_id already

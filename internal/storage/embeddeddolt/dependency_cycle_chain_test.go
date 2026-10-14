@@ -17,10 +17,12 @@ import (
 // (issueops.cycleReachabilityQuery, isAncestorInTx). These tests pin that the
 // rewritten probes still traverse a deep chain end to end: they refuse the
 // edge that closes it and admit the edges that do not. The shape tests in
-// issueops guard the query form; a graph this small cannot show the old
-// per-step materialization cost, so nothing here is timed.
+// issueops guard the query form of both probes; a graph this small cannot show
+// the old per-step materialization cost, so nothing here is timed.
 
-func createChainIssues(t *testing.T, store *embeddeddolt.EmbeddedDoltStore, prefix string, n int) []string {
+// createChainIssues creates n issues; with alternateWisps the odd indexes are
+// wisps, so every chain edge has one wisp end.
+func createChainIssues(t *testing.T, store *embeddeddolt.EmbeddedDoltStore, prefix string, n int, alternateWisps bool) []string {
 	t.Helper()
 	ctx := t.Context()
 
@@ -33,6 +35,7 @@ func createChainIssues(t *testing.T, store *embeddeddolt.EmbeddedDoltStore, pref
 			Status:    types.StatusOpen,
 			Priority:  2,
 			IssueType: types.TypeTask,
+			Ephemeral: alternateWisps && i%2 == 1,
 		}
 		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
 			t.Fatalf("create issue %s: %v", ids[i], err)
@@ -43,10 +46,11 @@ func createChainIssues(t *testing.T, store *embeddeddolt.EmbeddedDoltStore, pref
 
 func TestAddDependencyCycleProbeTraversesLongBlocksChain(t *testing.T) {
 	skipUnlessEmbeddedDolt(t)
-	store := newTestEnv(t, "cyc").store
+	te := newTestEnv(t, "cyc")
+	store := te.store
 
 	const chainLen = 60
-	ids := createChainIssues(t, store, "cyc", chainLen+1)
+	ids := createChainIssues(t, store, "cyc", chainLen+1, true)
 	chain, fresh := ids[:chainLen], ids[chainLen]
 	head, tail := chain[0], chain[chainLen-1]
 
@@ -54,11 +58,18 @@ func TestAddDependencyCycleProbeTraversesLongBlocksChain(t *testing.T) {
 
 	// head blocks chain[1] blocks ... blocks tail: each issue depends on the
 	// one before it, so the probe from tail must walk all 59 edges to reach head.
+	// Issues and wisps alternate, so the walk crosses the wisp_dependencies
+	// branch on every other hop and the dependencies branch on the rest.
 	for i := 1; i < chainLen; i++ {
 		dep := &types.Dependency{IssueID: chain[i], DependsOnID: chain[i-1], Type: types.DepBlocks}
 		if err := store.AddDependency(ctx, dep, "tester"); err != nil {
 			t.Fatalf("add chain edge %s -> %s: %v", chain[i], chain[i-1], err)
 		}
+	}
+	var wispEdges int
+	te.queryScalar(t, ctx, "SELECT COUNT(*) FROM wisp_dependencies", nil, &wispEdges)
+	if wispEdges != chainLen/2 {
+		t.Fatalf("precondition: wisp_dependencies has %d rows, want %d (one per wisp-sourced chain edge)", wispEdges, chainLen/2)
 	}
 
 	if err := store.AddDependency(ctx, &types.Dependency{
@@ -88,7 +99,7 @@ func TestBlockingHierarchyProbeTraversesDeepParentChain(t *testing.T) {
 	store := newTestEnv(t, "hier").store
 
 	const depth = 30
-	ids := createChainIssues(t, store, "hier", depth+1)
+	ids := createChainIssues(t, store, "hier", depth+1, false)
 	root, leaf := ids[0], ids[depth]
 
 	ctx := t.Context()

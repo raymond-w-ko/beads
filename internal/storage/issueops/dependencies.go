@@ -552,8 +552,19 @@ func CheckBlockingHierarchyInTx(ctx context.Context, tx DBTX, dep *types.Depende
 // and cousins in the same hierarchy do not match). Uses UNION distinct
 // recursion so diamond/cyclic parentage terminates by unique reachable node.
 func isAncestorInTx(ctx context.Context, tx DBTX, node, candidate string, depTables []string) (bool, error) {
-	// One recursive branch per table, joined directly on issue_id, for the
-	// reason cycleReachabilityQuery gives: a derived UNION cannot use an index.
+	query := ancestorQuery(depTables)
+	var n int
+	if err := tx.QueryRowContext(ctx, query, node, candidate).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// ancestorQuery builds isAncestorInTx's probe: one recursive branch per table,
+// joined directly on issue_id, for the reason cycleReachabilityQuery gives: a
+// derived UNION cannot use an index. CheckBlockingHierarchyInTx runs it twice
+// per blocking edge, so the derived form would cost depth x |E| per edge.
+func ancestorQuery(depTables []string) string {
 	branches := make([]string, 0, len(depTables))
 	for _, t := range depTables {
 		branches = append(branches, fmt.Sprintf(`
@@ -562,18 +573,13 @@ func isAncestorInTx(ctx context.Context, tx DBTX, node, candidate string, depTab
 			JOIN %s d ON d.issue_id = a.node AND d.type = 'parent-child'`, DepTargetExpr, t))
 	}
 	//nolint:gosec // G201: depTables are fixed dependency table names from cycleDetectionTables/opts.
-	query := fmt.Sprintf(`
+	return fmt.Sprintf(`
 		WITH RECURSIVE ancestors(node) AS (
 			SELECT ?
 			UNION%s
 		)
 		SELECT COUNT(*) FROM ancestors WHERE node = ?
 	`, strings.Join(branches, "\n			UNION"))
-	var n int
-	if err := tx.QueryRowContext(ctx, query, node, candidate).Scan(&n); err != nil {
-		return false, err
-	}
-	return n > 0, nil
 }
 
 func DeleteWispFromDependenciesInTx(ctx context.Context, tx *sql.Tx, wispID string) error {
