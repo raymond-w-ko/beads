@@ -93,6 +93,14 @@ echo 'Updated text' | bd update <id> --description=-
 Use [engdocs/TESTING.md](engdocs/TESTING.md) for the canonical commands,
 test-design guidance, and PR-readiness gates.
 
+## Checks
+
+- Full check: `./scripts/test.sh`, about 17 minutes on a loaded host (cmd/bd dominates; `-p 4`). Same tests as `make test`, without the coverage profile.
+- Scoped check: `./scripts/test.sh <package>...`, for the packages of one change (for example `./scripts/test.sh ./internal/storage/issueops`); `-run`, `-skip`, `-v` pass through.
+- Full check in a worktree: yes
+- Worktree setup: none
+- Both tiers need the default cgo build (`GOFLAGS=-tags=gms_pure_go` from `.buildflags`). Never a bare `go test`: `scripts/test.sh` enters a hermetic environment (temp HOME, no `BEADS_*`/`BD_*` from the caller, Dolt-service tests skipped unless `BEADS_TEST_ENV_RUN_DOLT=1`). The remote-only build's cmd/bd tests run only inside a network namespace (see bd-h37).
+
 ## Non-Interactive Shell Commands
 
 **ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
