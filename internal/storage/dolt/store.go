@@ -1313,7 +1313,15 @@ func (s *DoltStore) commitWriteTx(ctx context.Context, lock writeLock, fn func(t
 	// Runs before release: Conn.Close waits for an open Tx, so a panicking fn
 	// would otherwise hang there instead of propagating. A no-op after Commit.
 	defer func() { _ = tx.Rollback() }()
-	clearJournalScope := s.scopeEventsJournalTransaction(tx)
+	// An unlocked tx is scoped so that an emit in its body fails with
+	// issueops.ErrJournalUnlockedTx instead of allocating a seq outside the
+	// journal writer lock, or skipping silently as an unscoped tx would.
+	var clearJournalScope func()
+	if lock == journaledWrite {
+		clearJournalScope = s.scopeEventsJournalTransaction(tx)
+	} else {
+		clearJournalScope = issueops.ScopeUnlockedJournalTransaction(tx)
+	}
 	defer clearJournalScope()
 	clearRecheckScope := issueops.ScopeBlockedRecheckTransaction(tx)
 	defer clearRecheckScope()

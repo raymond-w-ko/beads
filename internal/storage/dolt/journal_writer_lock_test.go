@@ -3,6 +3,7 @@ package dolt
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/importer"
@@ -197,6 +198,40 @@ func TestCommitWriteTx_PanicRollsBackAndPropagates(t *testing.T) {
 			}
 			if got := store.db.Stats().InUse; got != 0 {
 				t.Fatalf("a panicking write body left %d session(s) in use, want the session released", got)
+			}
+		})
+	}
+}
+
+// TestWithRetryTxNoJournal_EmitFailsAndCommitsNothing pins the runtime half of
+// the NoJournal guard (bd-vk5w): a journal emit inside a NoJournal body returns
+// issueops.ErrJournalUnlockedTx before any SQL — no seq allocated on
+// bd_events_seq outside the writer lock, no journal row — and the write rolls
+// back without a retry. sqlmock fails the statements it was not told to expect.
+func TestWithRetryTxNoJournal_EmitFailsAndCommitsNothing(t *testing.T) {
+	for _, journal := range []bool{true, false} {
+		t.Run(fmt.Sprintf("journal=%v", journal), func(t *testing.T) {
+			store, mock := newJournalLockMockStore(t, true, journal)
+			mock.ExpectBegin()
+			mock.ExpectExec(regexp.QuoteMeta("UPDATE config SET")).WillReturnResult(sqlmock.NewResult(0, 1))
+			mock.ExpectRollback()
+
+			calls := 0
+			err := store.withRetryTxNoJournal(context.Background(), func(tx *sql.Tx) error {
+				calls++
+				if _, err := tx.ExecContext(context.Background(), "UPDATE config SET value = 'x'"); err != nil {
+					return err
+				}
+				return issueops.RecordEventInTx(context.Background(), tx, issueops.EventUpdate, "bd-nj-emit", "actor")
+			})
+			if !errors.Is(err, issueops.ErrJournalUnlockedTx) {
+				t.Fatalf("emit in a NoJournal body = %v, want issueops.ErrJournalUnlockedTx", err)
+			}
+			if calls != 1 {
+				t.Fatalf("NoJournal body ran %d times, want once: the emit failure must not be retried", calls)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("NoJournal emit SQL: %v", err)
 			}
 		})
 	}
