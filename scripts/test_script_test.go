@@ -88,6 +88,26 @@ func TestTestScriptPrebuiltBinaryContract(t *testing.T) {
 		commands := runTestScriptWithFakeGo(t, callerBinary)
 		assertFakeGoCommands(t, commands, "test")
 	})
+
+	// The launch probe asserts the routing: bare bd, from the first PATH
+	// entry, is the caller's binary even though it is not named bd.
+	t.Run("hooks reach a caller binary of another basename through bare bd", func(t *testing.T) {
+		callerDir := filepath.Join(t.TempDir(), "ci build artifacts")
+		if err := os.MkdirAll(callerDir, 0o755); err != nil {
+			t.Fatalf("create caller fixture root: %v", err)
+		}
+		callerBinary := filepath.Join(callerDir, "bd-linux-gms-pure"+nativeExecutableSuffix())
+		copyCurrentTestExecutable(t, callerBinary)
+
+		runTestScriptWithFakeGo(t, callerBinary)
+		entries, err := os.ReadDir(callerDir)
+		if err != nil {
+			t.Fatalf("read caller directory: %v", err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("caller directory holds %d entries after the run, want only the caller binary", len(entries))
+		}
+	})
 }
 
 // TestTestScriptPrebuiltBinaryLaunchProbe is selected only by the fake go test
@@ -111,6 +131,24 @@ func TestTestScriptPrebuiltBinaryLaunchProbe(t *testing.T) {
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("launch exported prebuilt binary through os/exec: %v\n%s", err, output)
+	}
+
+	// Installed hooks run bare bd: it must come from the first PATH entry and
+	// be the selected binary, whatever that binary is named.
+	bare, err := exec.LookPath("bd")
+	if err != nil {
+		t.Fatalf("bare bd does not resolve on the test PATH: %v", err)
+	}
+	if !sameTestScriptFile(bare, expected) {
+		t.Fatalf("bare bd resolves to %q, want the selected binary %q", bare, expected)
+	}
+	first := filepath.SplitList(os.Getenv("PATH"))[0]
+	if !sameTestScriptFile(filepath.Dir(bare), first) {
+		t.Fatalf("bare bd resolves from %q, want the first PATH entry %q", filepath.Dir(bare), first)
+	}
+	output, err = exec.Command(bare, "-test.run=^$").CombinedOutput()
+	if err != nil {
+		t.Fatalf("launch bare bd through os/exec: %v\n%s", err, output)
 	}
 }
 
