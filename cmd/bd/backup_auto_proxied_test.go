@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/localdolt"
 	"github.com/steveyegge/beads/internal/storage/uow"
 )
 
@@ -31,7 +32,9 @@ func (f *fakeMaintenanceProvider) Close(context.Context) error { return nil }
 // registers a server-side backup remote, which on a server bd does not own is
 // global to every client of it — the storm the explicit verbs refuse by design
 // — so an implicit trigger must not get further than the explicit one. An
-// unreadable sidecar resolves to the unknown topology and fails closed.
+// unreadable sidecar resolves to the unknown topology and fails closed. A
+// remote-only build refuses backup sync on managed-local too, so there no
+// case gets a backend.
 //
 // Cannot be parallel: mutates the proxiedServerMode and uowProvider globals.
 func TestProxiedAutoBackupBackendFollowsLocality(t *testing.T) {
@@ -62,9 +65,10 @@ func TestProxiedAutoBackupBackendFollowsLocality(t *testing.T) {
 				uowProvider = nil
 			}
 
+			wantBackend := tc.wantBackend && !localdolt.Disabled()
 			backend, ok := autoBackupBackendForCommand()
-			if ok != tc.wantBackend {
-				t.Fatalf("autoBackupBackendForCommand() ok = %v, want %v", ok, tc.wantBackend)
+			if ok != wantBackend {
+				t.Fatalf("autoBackupBackendForCommand() ok = %v, want %v", ok, wantBackend)
 			}
 			if !ok {
 				return

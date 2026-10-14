@@ -50,6 +50,7 @@ func hermeticInitEnv(homeDir string, extra ...string) []string {
 // unmodified CheckRemoteSafety directly and tested nothing about this fix
 // (both its cases are already in TestCheckRemoteSafety_GuardMatrix).
 func TestInitReinitLocalConfiguredRemoteWithoutDoltDataSucceeds(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	bdBin := buildBDForInitTests(t)
 
 	bareDir := filepath.Join(t.TempDir(), "bare.git")
@@ -88,6 +89,7 @@ func TestInitReinitLocalConfiguredRemoteWithoutDoltDataSucceeds(t *testing.T) {
 // Regression: #5136 broke TestE2E_InitDoltMetadataRoundtrip (Main-lane only,
 // so its PR ran green) exactly this way.
 func TestInitFreshWithUnreachableGitOriginSucceeds(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	bdBin := buildBDForInitTests(t)
 
 	workDir := t.TempDir()

@@ -115,6 +115,7 @@ func createDepsExtractID(t *testing.T, out string) string {
 }
 
 func TestCreateDepsAtomicity(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	bd := buildBDForInitTests(t)
 	dir := t.TempDir()
 	runCreateDepsBD(t, bd, dir, "init", "--backend", "dolt", "--prefix", "test",

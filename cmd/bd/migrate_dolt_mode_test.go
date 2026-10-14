@@ -108,6 +108,7 @@ func proxiedAssetNames() []string {
 }
 
 func TestMigrateToProxiedServer_FlipsMode(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	beadsDir := migrateModeWorkspace(t, configfile.DoltModeServer)
 
 	for _, n := range serverAssetNames() {
@@ -167,6 +168,7 @@ func TestMigrateToProxiedServer_InvalidRootIdentityShapesFailClosed(t *testing.T
 }
 
 func TestMigrateToProxiedServer_DryRunWritesNothing(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	beadsDir := migrateModeWorkspace(t, configfile.DoltModeServer)
 	touchFile(t, filepath.Join(beadsDir, "dolt-server.log"))
 
@@ -263,6 +265,7 @@ func TestMigrateToProxiedServer_AlreadyProxiedRejectsBadSidecar(t *testing.T) {
 }
 
 func TestMigrateToProxiedServer_StaleSidecarFailsClosed(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	rootCases := []struct {
 		name string
 		info *configfile.ProxiedServerClientInfo
@@ -370,6 +373,7 @@ func TestMigrateToServer_RejectsNonProxiedMode(t *testing.T) {
 }
 
 func TestMigrateMode_RefusesWhenLockHeld(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	beadsDir := migrateModeWorkspace(t, configfile.DoltModeServer)
 
 	held, err := util.TryLock(filepath.Join(beadsDir, migrateLockFileName))
@@ -421,6 +425,7 @@ func TestMigrateToServer_RefusesWhenLifecycleLockHeld(t *testing.T) {
 }
 
 func TestMigrateMode_DryRunIgnoresLock(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	beadsDir := migrateModeWorkspace(t, configfile.DoltModeServer)
 	held, err := util.TryLock(filepath.Join(beadsDir, migrateLockFileName))
 	require.NoError(t, err)
@@ -430,6 +435,7 @@ func TestMigrateMode_DryRunIgnoresLock(t *testing.T) {
 }
 
 func TestMigrateMode_ReleasesLockAfterSuccess(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	beadsDir := migrateModeWorkspace(t, configfile.DoltModeServer)
 	require.NoError(t, runMigrateToProxiedServer(false, 0, false))
 
@@ -698,6 +704,7 @@ func TestMigrateToProxiedServer_AlreadyProxiedRefusesHeldLockAsTyped(t *testing.
 }
 
 func TestMigrateToProxiedServer_RetryAfterCheckpointFault(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	beadsDir := migrateModeWorkspace(t, configfile.DoltModeServer)
 	t.Setenv("BEADS_MIGRATION_FAIL_PHASE", string(migrateTargetConfigured))
 	require.Error(t, runMigrateToProxiedServer(false, 0, false))
@@ -721,6 +728,7 @@ func TestMigrateToProxiedServer_RetryAfterCheckpointFault(t *testing.T) {
 // because the rebuild is gated on phase == migratePrepared, re-supplying the
 // original value cannot repair it afterwards.
 func TestMigrateToProxiedServer_ResumeReplaysRecordedIdleTimeout(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	for _, tc := range []struct {
 		name   string
 		resume time.Duration
@@ -769,6 +777,7 @@ func TestMigrateJournal_UnknownPhaseFailsClosed(t *testing.T) {
 }
 
 func TestMigrateToProxiedServer_AllCheckpointFaultsRetry(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	for _, phase := range []migratePhase{migratePrepared, migrateTargetConfigured, migrateOldControlsRetired, migrateVerified, migrateCommitted} {
 		t.Run(string(phase), func(t *testing.T) {
 			beadsDir := migrateModeWorkspace(t, configfile.DoltModeServer)

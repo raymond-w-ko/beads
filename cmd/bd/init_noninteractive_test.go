@@ -132,6 +132,7 @@ func TestIsNonInteractiveInitPrecedence(t *testing.T) {
 }
 
 func TestInitNonInteractiveAutoExportDefaultOffAndOptIn(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	bd := buildBDForInitTests(t)
 	dir := t.TempDir()
 

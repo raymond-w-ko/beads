@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/localdolt"
 )
 
 // TestProxiedRestoreFailureMessage pins the one distinction the operator acts
@@ -87,21 +88,30 @@ var backupFamilyPaths = []string{
 // somebody else's filesystem, so honoring the command would either fail at the
 // point of use or — much worse — succeed and write the backup somewhere the
 // operator cannot see. That is why these stay refused with Reason=design.
+//
+// A remote-only build owns no Dolt server, so there managed-local is refused
+// like every other topology, with the same design refusal (backupRefusal).
 func TestProxiedBackupHonoredOnlyOnManagedLocal(t *testing.T) {
+	refusedTopologies := []ProxyTopology{
+		ProxyTopologyExternalTCP, ProxyTopologyExternalUnix,
+		ProxyTopologyTeamServer, ProxyTopologyUnknown,
+	}
+	if localdolt.Disabled() {
+		refusedTopologies = append([]ProxyTopology{ProxyTopologyManagedLocal}, refusedTopologies...)
+	}
 	for _, path := range backupFamilyPaths {
 		row, ok := LookupCapabilityRow(path, "")
 		if !ok {
 			t.Fatalf("%q has no registry row", path)
 		}
 
-		if got := row.ruleFor(ProxyTopologyManagedLocal); got.Outcome != ProxyOutcomeHonored {
-			t.Errorf("%q on managed-local: outcome %q, want honored", path, got.Outcome)
+		if !localdolt.Disabled() {
+			if got := row.ruleFor(ProxyTopologyManagedLocal); got.Outcome != ProxyOutcomeHonored {
+				t.Errorf("%q on managed-local: outcome %q, want honored", path, got.Outcome)
+			}
 		}
 
-		for _, topology := range []ProxyTopology{
-			ProxyTopologyExternalTCP, ProxyTopologyExternalUnix,
-			ProxyTopologyTeamServer, ProxyTopologyUnknown,
-		} {
+		for _, topology := range refusedTopologies {
 			got := row.ruleFor(topology)
 			if got.Outcome != ProxyOutcomeRefused {
 				t.Errorf("%q on %s: outcome %q, want refused", path, topology, got.Outcome)
@@ -134,7 +144,21 @@ func TestProxiedBackupGateRefusesByTopology(t *testing.T) {
 
 	for _, sub := range []string{"init", "sync", "remove", "status", "restore"} {
 		t.Run(sub, func(t *testing.T) {
-			if err := validateProxyRegistryBeforeProvider(newBackupCmd(sub), ProxyTopologyManagedLocal); err != nil {
+			if localdolt.Disabled() {
+				// Remote-only build: no server of its own to back up, so the
+				// gate gives managed-local the design refusal.
+				t.Setenv("BD_JSON_ENVELOPE", "")
+				oldJSON := jsonOutput
+				jsonOutput = true
+				t.Cleanup(func() { jsonOutput = oldJSON })
+				var err error
+				out := captureStdout(t, func() error {
+					err = validateProxyRegistryBeforeProvider(newBackupCmd(sub), ProxyTopologyManagedLocal)
+					return nil
+				})
+				assertExitCode(t, err, 1)
+				assertBackupDesignRefusalJSON(t, "backup "+sub, out)
+			} else if err := validateProxyRegistryBeforeProvider(newBackupCmd(sub), ProxyTopologyManagedLocal); err != nil {
 				t.Fatalf("managed-local: gate refused %q: %v", sub, err)
 			}
 			err := validateProxyRegistryBeforeProvider(newBackupCmd(sub), ProxyTopologyExternalTCP)
@@ -142,6 +166,29 @@ func TestProxiedBackupGateRefusesByTopology(t *testing.T) {
 				t.Fatalf("external-tcp: gate permitted %q", sub)
 			}
 		})
+	}
+}
+
+// assertBackupDesignRefusalJSON checks the JSON a backup-family refusal
+// prints: the frozen code, the design reason and the frozen message prefix.
+func assertBackupDesignRefusalJSON(t *testing.T, path, out string) {
+	t.Helper()
+	var refusal struct {
+		Error  string `json:"error"`
+		Code   string `json:"code"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(out), &refusal); err != nil {
+		t.Fatalf("%q refusal is not JSON: %v\n%s", path, err, out)
+	}
+	if refusal.Code != "proxy.backup.unsupported" {
+		t.Errorf("%q refusal code %q, want the frozen proxy.backup.unsupported", path, refusal.Code)
+	}
+	if refusal.Reason != string(ProxyReasonDesign) {
+		t.Errorf("%q refusal reason %q, want design", path, refusal.Reason)
+	}
+	if !strings.HasPrefix(refusal.Error, path+" is not supported in proxied-server mode") {
+		t.Errorf("%q refusal message %q dropped the frozen prefix", path, refusal.Error)
 	}
 }
 

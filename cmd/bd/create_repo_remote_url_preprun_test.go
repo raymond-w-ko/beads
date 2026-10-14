@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/localdolt"
 )
 
 // TestCreateRemoteRepoSkipsLocalDatabaseGuard is a regression test for a gap
@@ -58,7 +60,8 @@ func TestCreateRemoteRepoSkipsLocalDatabaseGuard(t *testing.T) {
 	// Hide the `dolt` CLI so remotecache.Ensure fails fast and
 	// deterministically in CGO-enabled builds, without attempting a real network
 	// call. Pure-Go builds can fail earlier when the remote cache store tries to
-	// use embedded Dolt, which is also downstream of the guard under test.
+	// use embedded Dolt, and remote-only builds when the remote cache refuses
+	// local Dolt; both are also downstream of the guard under test.
 	emptyPathDir := t.TempDir()
 	t.Setenv("PATH", emptyPathDir)
 
@@ -98,6 +101,12 @@ func TestCreateRemoteRepoSkipsLocalDatabaseGuard(t *testing.T) {
 		t.Fatalf("guard was not bypassed for remote --repo: got the pre-fix error.\nOutput:\n%s", combined)
 	}
 
+	if localdolt.Disabled() {
+		if !strings.Contains(combined, "remote cache: "+localdolt.ErrDisabled.Error()) {
+			t.Fatalf("expected the remote cache to refuse local Dolt in a remote-only build, got:\n%s", combined)
+		}
+		return
+	}
 	if !strings.Contains(combined, "dolt CLI not found") &&
 		!strings.Contains(combined, "embedded Dolt requires a CGO build") {
 		t.Fatalf("expected downstream remote-cache/open failure, got:\n%s", combined)

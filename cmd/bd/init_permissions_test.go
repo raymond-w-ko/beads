@@ -58,6 +58,7 @@ func buildBDForInitPermissionTests(t *testing.T) string {
 // fail later (e.g. no Dolt server), but the permission fix happens early
 // enough that the assertion is valid regardless of exit code.
 func TestInitRepairsPermissiveBeadsDir(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	bdBin := buildBDForInitPermissionTests(t)
 
 	repoDir := newGitRepo(t)
@@ -110,6 +111,7 @@ func TestInitRepairsPermissiveBeadsDir(t *testing.T) {
 // TestInitPreservesSecureBeadsDir verifies that bd init does NOT touch a
 // .beads/ directory that already has secure permissions (0700).
 func TestInitPreservesSecureBeadsDir(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	bdBin := buildBDForInitPermissionTests(t)
 
 	repoDir := newGitRepo(t)

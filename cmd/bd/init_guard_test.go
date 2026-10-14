@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/testutil"
 )
 
 func TestInitGuardServerMessage(t *testing.T) {
@@ -173,8 +176,16 @@ func TestInitGuard_FreshCloneWithMetadataJSON(t *testing.T) {
 		}
 
 		// No dolt/ directory — simulates fresh clone with gitignored dolt/.
-		// No server running — simulates machine B with no local server.
-		err := checkExistingBeadsDataAt(beadsDir, "myproject")
+		// No server running — simulates machine B with no local server. Pin
+		// the endpoint to a just-closed loopback port: the guard probes the
+		// server in-process, and the compiled-in default host is a real one.
+		port, err := testutil.FindFreePort()
+		if err != nil {
+			t.Fatalf("find free port: %v", err)
+		}
+		t.Setenv("BEADS_DOLT_SERVER_HOST", "127.0.0.1")
+		t.Setenv("BEADS_DOLT_SERVER_PORT", strconv.Itoa(port))
+		err = checkExistingBeadsDataAt(beadsDir, "myproject")
 		if err != nil {
 			t.Errorf("fresh clone with metadata.json should allow init, got: %v", err)
 		}

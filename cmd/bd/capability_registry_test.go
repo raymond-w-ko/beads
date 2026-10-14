@@ -75,6 +75,11 @@ func TestProxyCapabilityRegistryCoversCommandTree(t *testing.T) {
 	}
 }
 
+// cgoOnlyCommandPaths holds registry paths whose commands this build does not
+// compile; capability_registry_nocgo_test.go fills it. Their rows are policy
+// for the cgo build, not stale.
+var cgoOnlyCommandPaths = map[string]bool{}
+
 // TestProxyCapabilityRegistryHasNoStaleRows is the other direction: a row whose
 // command no longer exists is policy for nothing, and would hide the renamed
 // command's own missing row behind a green test.
@@ -82,7 +87,7 @@ func TestProxyCapabilityRegistryHasNoStaleRows(t *testing.T) {
 	tree := walkCommandPaths(rootCmd)
 	var stale []string
 	for _, row := range proxyCapabilityRegistry {
-		if _, ok := tree[row.Path]; !ok {
+		if _, ok := tree[row.Path]; !ok && !cgoOnlyCommandPaths[row.Path] {
 			stale = append(stale, row.display())
 		}
 	}

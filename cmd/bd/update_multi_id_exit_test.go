@@ -74,6 +74,7 @@ func runBDMultiID(t *testing.T, bd, dir string, args ...string) (stdout, stderr 
 // database in a temp dir.
 func setupMultiIDUpdateDB(t *testing.T) (bd, dir string) {
 	t.Helper()
+	skipIfLocalDoltDisabled(t)
 	bd = buildBDForInitTests(t)
 	dir = t.TempDir()
 	runGitForBootstrapTest(t, dir, "init", "-q")

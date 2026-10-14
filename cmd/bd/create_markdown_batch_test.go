@@ -23,6 +23,7 @@ func writeMarkdownPlan(t *testing.T, dir, name, body string) string {
 }
 
 func TestCreateFromMarkdownFile(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	bd := buildBDForInitTests(t)
 	dir := t.TempDir()
 	runCreateDepsBD(t, bd, dir, "init", "--backend", "dolt", "--prefix", "test",

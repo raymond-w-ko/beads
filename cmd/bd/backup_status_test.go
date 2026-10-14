@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/localdolt"
 )
 
 func TestBackupStatusSizeErrorRespectsOutputMode(t *testing.T) {
@@ -165,12 +166,14 @@ func TestBackupStatusIncludesAvailableDatabaseSize(t *testing.T) {
 // owns the dolt process on a managed-local workspace and can honor the command
 // there, while an external one is still refused — and a refused command must
 // not go on to measure anything, because the directory it would measure belongs
-// to a server on another host.
+// to a server on another host. A remote-only build owns no Dolt server, so
+// there managed-local gets the design refusal without measuring too.
 func TestBackupStatusProxiedGuardFollowsLocality(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		sidecar     string
 		wantMeasure bool
+		wantRefusal bool // assert the refusal's JSON contract
 	}{
 		{
 			name:        "external topology is refused without measuring",
@@ -180,7 +183,8 @@ func TestBackupStatusProxiedGuardFollowsLocality(t *testing.T) {
 		{
 			name:        "managed local is honored and measures",
 			sidecar:     `{}`,
-			wantMeasure: true,
+			wantMeasure: !localdolt.Disabled(),
+			wantRefusal: localdolt.Disabled(),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -197,14 +201,21 @@ func TestBackupStatusProxiedGuardFollowsLocality(t *testing.T) {
 			}
 
 			cmd := newBackupStatusTestRoot(sizeDatabase)
-			cmd.SetArgs([]string{"backup", "status"})
-			_, _, err := executeBackupStatusCommand(t, cmd)
+			args := []string{"backup", "status"}
+			if tc.wantRefusal {
+				args = append(args, "--json")
+			}
+			cmd.SetArgs(args)
+			stdout, _, err := executeBackupStatusCommand(t, cmd)
 			if tc.wantMeasure {
 				if err != nil {
 					t.Fatalf("backup status on managed-local: %v", err)
 				}
 			} else {
 				assertExitCode(t, err, 1)
+			}
+			if tc.wantRefusal {
+				assertBackupDesignRefusalJSON(t, "backup status", stdout)
 			}
 			if measured != tc.wantMeasure {
 				t.Fatalf("size provider called = %v, want %v", measured, tc.wantMeasure)

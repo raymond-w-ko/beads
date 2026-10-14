@@ -120,6 +120,7 @@ func runBDMigrationFreezeWithEnv(t *testing.T, bd, dir string, extraEnv []string
 // keys on the freeze marker file, not on any orchestrator structure around it.
 func setupMigrationFreezeWorkspaceIn(t *testing.T, dir string) (bd string) {
 	t.Helper()
+	skipIfLocalDoltDisabled(t)
 	bd = buildBDForInitTests(t)
 	runGitForBootstrapTest(t, dir, "init", "-q")
 	runGitForBootstrapTest(t, dir, "config", "core.hooksPath", ".git/hooks")
@@ -748,6 +749,7 @@ func TestLabelAddBlockedDuringMigrationFreeze(t *testing.T) {
 // previews being re-blocked at the per-command chokepoint, which for import is
 // exactly that call and nothing else.
 func TestImportBlockedDuringMigrationFreeze(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	for _, tc := range []struct {
 		name string
 		args []string
@@ -802,6 +804,7 @@ func TestImportBlockedDuringMigrationFreeze(t *testing.T) {
 // `BD_DEBUG=1 bd list` — exit 0, but the "auto-migrate:" line appeared and
 // .local_version was rewritten to the current version anyway.
 func TestAutoMigrateSkippedDuringMigrationFreeze(t *testing.T) {
+	skipIfLocalDoltDisabled(t)
 	tests := []struct {
 		name        string
 		args        []string
