@@ -117,7 +117,8 @@ func BuildIssueDetails(ctx context.Context, src DetailSource, issue *types.Issue
 	details := types.NewIssueDetails(*issue)
 
 	details.Labels, _ = src.Labels(ctx, id, isWisp)
-	details.Dependencies, _ = src.Dependencies(ctx, id, isWisp)
+	deps, _ := src.Dependencies(ctx, id, isWisp)
+	details.Dependencies = withRelations(deps)
 
 	// Aggregate counts - O(1) queries, no row materialization.
 	dependentCount, _ := src.CountDependents(ctx, id, isWisp)
@@ -159,7 +160,7 @@ func BuildIssueDetails(ctx context.Context, src DetailSource, issue *types.Issue
 	}
 
 	// After the Parent scan, which reads DependencyType and ID off the full rows.
-	// Builds a new slice: the source owns the one it returned and may cache it.
+	// Builds a new slice; shallowDep keeps the Relation withRelations set.
 	if opts.BriefDeps && details.Dependencies != nil {
 		brief := make([]*types.IssueWithDependencyMetadata, 0, len(details.Dependencies))
 		for _, dep := range details.Dependencies {
@@ -174,6 +175,26 @@ func BuildIssueDetails(ctx context.Context, src DetailSource, issue *types.Issue
 	return details, nil
 }
 
+// withRelations copies the outgoing dependency rows and names each edge's role
+// from the shown issue's end (it is the rows' issue_id). The rows are copied
+// because the source owns the ones it returned and may cache them.
+func withRelations(deps []*types.IssueWithDependencyMetadata) []*types.IssueWithDependencyMetadata {
+	if deps == nil {
+		return nil
+	}
+	out := make([]*types.IssueWithDependencyMetadata, 0, len(deps))
+	for _, dep := range deps {
+		if dep == nil {
+			out = append(out, nil)
+			continue
+		}
+		row := *dep
+		row.Relation = row.DependencyType.Relation(true)
+		out = append(out, &row)
+	}
+	return out
+}
+
 // shallowDep keeps the identity-and-shape fields callers consume and drops the
 // free-form text, which is the shape collectDependents settled on in be-4d36f2.
 func shallowDep(item *types.IssueWithDependencyMetadata) *types.IssueWithDependencyMetadata {
@@ -186,6 +207,7 @@ func shallowDep(item *types.IssueWithDependencyMetadata) *types.IssueWithDepende
 			Title:     item.Issue.Title,
 		},
 		DependencyType: item.DependencyType,
+		Relation:       item.Relation,
 	}
 }
 
@@ -210,7 +232,10 @@ func collectDependents(ctx context.Context, src DetailSource, id string, isWisp 
 		if item == nil {
 			continue
 		}
-		out = append(out, shallowDep(item))
+		row := shallowDep(item)
+		// The shown issue is the edge's target (depends_on_id) here.
+		row.Relation = row.DependencyType.Relation(false)
+		out = append(out, row)
 	}
 	if err := iter.Err(); err != nil {
 		return nil, fmt.Errorf("iter dependents %s: %w", id, err)
