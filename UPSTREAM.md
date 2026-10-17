@@ -43,6 +43,7 @@ Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator select
 | cab3d5cb3 (AGENTS.md part) | everturn checks |
 | e017d0679 | fork glossary |
 | 5a5b110a5 | everturn query indexes on issues (closed_at, status+closed_at) via a Go ensure step, not a numbered migration; upstream offer undecided (operator, 2026-10-17) |
+| de06bf888 | everturn audit index: STORED generated column everturn_action on issues and wisps plus idx_issues_everturn_action, via the same Go ensure step; upstream offer undecided (operator, 2026-10-17) |
 
 ## How to refresh
 
