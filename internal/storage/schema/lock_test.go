@@ -254,6 +254,7 @@ func TestMigrateUpSeedsIgnorePatternsWhenNoWorkNeeded(t *testing.T) {
 	expectContentHashColumnExists(mock)
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_types", "count", 1)
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_statuses", "count", 1)
+	expectForkIndexesPresent(mock)
 	// The seed inserted rows and no migration pass follows to commit them, so
 	// MigrateUp must commit the heal itself, scoped and labeled.
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD('dolt_ignore')")).
@@ -300,6 +301,7 @@ func TestMigrateUpSkipsSeedCommitWhenNothingChanged(t *testing.T) {
 	expectContentHashColumnExists(mock)
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_types", "count", 1)
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_statuses", "count", 1)
+	expectForkIndexesPresent(mock)
 
 	applied, err := MigrateUp(context.Background(), db)
 	if err != nil {
@@ -446,6 +448,7 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 		WillReturnRows(sqlmock.NewRows([]string{"hash"}))
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_types", "count", 1)
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_statuses", "count", 1)
+	expectForkIndexesPresent(mock)
 	// rekeyDependencyIDs probes whether each edge table has an id column; this
 	// mocked world has no such table, so both probes return 0 and the re-key
 	// no-ops without scanning/updating rows.

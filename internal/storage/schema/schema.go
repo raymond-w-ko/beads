@@ -593,6 +593,9 @@ func AllMigrationsSQL() string {
 		fmt.Fprintf(&b, "\nINSERT IGNORE INTO %s (version, content_hash) VALUES (%d, '%s');\n",
 			mainSource.cursorTable, f.version, hex.EncodeToString(sum[:]))
 	}
+	// The fork indexes are no numbered migration (see fork_indexes.go), but the
+	// fresh bundle must still carry them so it matches the runtime schema.
+	b.WriteString(forkIndexesSQL())
 	return b.String()
 }
 
@@ -801,6 +804,13 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, seedChanged bool) (
 		return applied, fmt.Errorf("backfill custom tables: %w", err)
 	}
 
+	// Fork-only indexes (fork_indexes.go): DDL like mainColumnAdded, so a
+	// change is staged and committed by this pass.
+	forkIndexesAdded, err := ensureForkIndexes(ctx, db, dirtyBefore)
+	if err != nil {
+		return applied, fmt.Errorf("fork indexes: %w", err)
+	}
+
 	// #4259: rewrite any per-clone-random dependency ids (minted by 0043's
 	// DEFAULT (UUID()) before this fix) to the deterministic key, so independently
 	// migrated clones converge to byte-identical, merge-safe dependencies. Runs
@@ -876,7 +886,7 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, seedChanged bool) (
 		return applied, fmt.Errorf("unstaging ignored migration tables: %w", err)
 	}
 
-	if applied == 0 && !backfilled && appliedIgnored == 0 && !mainColumnAdded && !ignoredColumnAdded {
+	if applied == 0 && !backfilled && appliedIgnored == 0 && !mainColumnAdded && !ignoredColumnAdded && !forkIndexesAdded {
 		return applied, nil
 	}
 	changedDirtyTables, err := changedDirtyTableSignatures(ctx, db, dirtyBeforeSignatures)
@@ -935,7 +945,13 @@ func migrationWorkNeeded(ctx context.Context, db DBConn) (bool, error) {
 	if !hasIgnoredHash {
 		return true, nil
 	}
-	return needsBackfilledCustomStatusesCustomTypes(ctx, db)
+	needsBackfill, err := needsBackfilledCustomStatusesCustomTypes(ctx, db)
+	if err != nil || needsBackfill {
+		return needsBackfill, err
+	}
+	// The fork indexes add no pending version, so without this an at-latest
+	// database returns at the top of the pass and never gets them.
+	return needsForkIndexes(ctx, db)
 }
 
 func committableDirtyTables(ctx context.Context, db DBConn) (map[string]dirtyTableState, error) {
