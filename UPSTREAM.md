@@ -42,6 +42,7 @@ Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator select
 | c9ba431a6 | test Dolt server for the remote-only build |
 | cab3d5cb3 (AGENTS.md part) | everturn checks |
 | e017d0679 | fork glossary |
+| 5a5b110a5 | everturn query indexes on issues (closed_at, status+closed_at) via a Go ensure step, not a numbered migration; upstream offer undecided (operator, 2026-10-17) |
 
 ## How to refresh
 
