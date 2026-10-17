@@ -448,7 +448,6 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 		WillReturnRows(sqlmock.NewRows([]string{"hash"}))
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_types", "count", 1)
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_statuses", "count", 1)
-	expectForkIndexesPresent(mock)
 	// rekeyDependencyIDs probes whether each edge table has an id column; this
 	// mocked world has no such table, so both probes return 0 and the re-key
 	// no-ops without scanning/updating rows.
@@ -477,6 +476,8 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", latestIgnored)
 	expectIgnoredSentinelProbes(mock, true)
 	expectDoltStatusRows(mock)
+	// The fork step runs after the ignored series and its unstage read above.
+	expectForkIndexesPresent(mock)
 	expectDoltStatusRows(mock)
 	mock.ExpectQuery("(?s)SELECT t\\.TABLE_NAME\\s+FROM INFORMATION_SCHEMA\\.TABLES t").
 		WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("schema_migrations"))

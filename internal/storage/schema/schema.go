@@ -804,13 +804,6 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, seedChanged bool) (
 		return applied, fmt.Errorf("backfill custom tables: %w", err)
 	}
 
-	// Fork-only indexes (fork_indexes.go): DDL like mainColumnAdded, so a
-	// change is staged and committed by this pass.
-	forkIndexesAdded, err := ensureForkIndexes(ctx, db, dirtyBefore)
-	if err != nil {
-		return applied, fmt.Errorf("fork indexes: %w", err)
-	}
-
 	// #4259: rewrite any per-clone-random dependency ids (minted by 0043's
 	// DEFAULT (UUID()) before this fix) to the deterministic key, so independently
 	// migrated clones converge to byte-identical, merge-safe dependencies. Runs
@@ -884,6 +877,14 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, seedChanged bool) (
 	}
 	if err := unstageIgnoredTables(ctx, db); err != nil {
 		return applied, fmt.Errorf("unstaging ignored migration tables: %w", err)
+	}
+
+	// Fork-only columns and indexes (fork_indexes.go): DDL like mainColumnAdded,
+	// so a change is staged and committed by this pass. After the ignored
+	// series, so a fresh database already has wisps for its column.
+	forkIndexesAdded, err := ensureForkIndexes(ctx, db, dirtyBefore)
+	if err != nil {
+		return applied, fmt.Errorf("fork indexes: %w", err)
 	}
 
 	if applied == 0 && !backfilled && appliedIgnored == 0 && !mainColumnAdded && !ignoredColumnAdded && !forkIndexesAdded {

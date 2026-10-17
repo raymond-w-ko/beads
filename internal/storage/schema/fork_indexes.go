@@ -34,11 +34,44 @@ import (
 // probed by name first, and a racing opener's duplicate counts as success).
 // Keep it that way.
 //
-// Only issues is indexed, and no column is added, so issues/wisps column
-// parity is untouched. A functional index for the everturn metadata action
-// lookup is deliberately absent: Dolt 2.2.0 rejects any functional index on a
-// table with an ON UPDATE column (issues.updated_at), and it also rejects one
-// that mixes an expression with a column.
+// The everturn audit lookups filter JSON_EXTRACT(metadata, '$.everturn.action'),
+// often with created_at. They read through a STORED generated column,
+// everturn_action, and an ordinary index on (everturn_action, created_at),
+// not a functional index: Dolt 2.2.0, the fleet's version, rejects any
+// functional index on a table with an ON UPDATE column (issues.updated_at) and
+// one that mixes an expression with a column. Queries must name the column
+// (WHERE everturn_action = ?); Dolt uses the index only then, not for the raw
+// JSON expression. The column is on issues AND wisps, so the two tables keep
+// column parity (TestSchemaParityIssuesVsWisps); only issues is indexed.
+// Columns are added before indexes, since an index needs its column.
+//
+// STORED, not VIRTUAL: on Dolt 2.2.0 a VIRTUAL column breaks the issue upsert
+// (issueops INSERT ... ON DUPLICATE KEY UPDATE col = VALUES(col)) for an
+// existing row, VALUES() shifting by one column ("'task' is not a valid value
+// for 'int'"). Adding a STORED column rewrites every row once, under the
+// migration lock. LEFT(..., 255): without it, a write whose action renders
+// longer than the VARCHAR(255) (a long string, or an object) is rejected; with
+// it the stored value is truncated to 255 characters and the write succeeds.
+
+type forkColumn struct{ Table, Name, DDL string } // DDL: the whole ALTER TABLE ADD COLUMN statement
+
+const everturnActionColumnDef = "everturn_action VARCHAR(255) GENERATED ALWAYS AS (LEFT(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.everturn.action')), 255)) STORED"
+
+var forkColumns = []forkColumn{
+	{
+		Table: "issues",
+		Name:  "everturn_action",
+		DDL:   "ALTER TABLE issues ADD COLUMN " + everturnActionColumnDef,
+	},
+	{
+		// wisps is clone-local (dolt_ignore'd) and missing on a fresh database
+		// until the ignored series creates it; the fresh CLI bundle creates no
+		// wisps, so forkIndexesSQL leaves this one out.
+		Table: "wisps",
+		Name:  "everturn_action",
+		DDL:   "ALTER TABLE wisps ADD COLUMN " + everturnActionColumnDef,
+	},
+}
 
 type forkIndex struct{ Table, Name, DDL string } // DDL: the whole ALTER TABLE statement
 
@@ -60,13 +93,33 @@ var forkIndexes = []forkIndex{
 		Name:  "idx_issues_status_closed_at",
 		DDL:   "ALTER TABLE issues ADD INDEX idx_issues_status_closed_at (status, closed_at)",
 	},
+	{
+		Table: "issues",
+		Name:  "idx_issues_everturn_action",
+		DDL:   "ALTER TABLE issues ADD INDEX idx_issues_everturn_action (everturn_action, created_at)",
+	},
 }
 
-// needsForkIndexes reports whether any listed index is missing. It runs on
-// every open (migrationWorkNeeded, alreadyConverged), so it reads one
-// SHOW INDEX per table: an INFORMATION_SCHEMA.STATISTICS query costs ~20ms on
-// a server hosting many databases, SHOW INDEX under 1ms.
+// needsForkIndexes reports whether any listed column or index is missing. A
+// column on a table that does not exist yet does not count. It runs on every
+// open (migrationWorkNeeded, alreadyConverged), so it reads one SHOW COLUMNS
+// and one SHOW INDEX per table: an INFORMATION_SCHEMA query costs ~20ms on a
+// server hosting many databases, a SHOW under 1ms.
 func needsForkIndexes(ctx context.Context, db DBConn) (bool, error) {
+	columns := make(map[string]map[string]bool)
+	for _, col := range forkColumns {
+		names, ok := columns[col.Table]
+		if !ok {
+			var err error
+			if names, err = forkTableColumnNames(ctx, db, col.Table); err != nil {
+				return false, err
+			}
+			columns[col.Table] = names
+		}
+		if names != nil && !names[col.Name] {
+			return true, nil
+		}
+	}
 	present := make(map[string]map[string]bool)
 	for _, idx := range forkIndexes {
 		names, ok := present[idx.Table]
@@ -82,6 +135,45 @@ func needsForkIndexes(ctx context.Context, db DBConn) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// forkTableColumnNames returns the column names on table, read with one
+// SHOW COLUMNS, or nil when the table does not exist.
+func forkTableColumnNames(ctx context.Context, db DBConn, table string) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, "SHOW COLUMNS FROM `"+table+"`")
+	if err != nil {
+		if dberrors.IsTableNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("listing columns on %s: %w", table, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("listing columns on %s: %w", table, err)
+	}
+	// SHOW COLUMNS returns Field, Type, Null, Key, Default, Extra (and possibly
+	// more on some servers); scan every column into RawBytes and read the first
+	// ("Field"), which is the column name.
+	cells := make([]sql.RawBytes, len(cols))
+	dest := make([]any, len(cols))
+	for i := range cells {
+		dest[i] = &cells[i]
+	}
+	names := make(map[string]bool)
+	for rows.Next() {
+		if err := rows.Scan(dest...); err != nil {
+			return nil, fmt.Errorf("listing columns on %s: %w", table, err)
+		}
+		if len(cells) > 0 {
+			names[string(cells[0])] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("listing columns on %s: %w", table, err)
+	}
+	return names, nil
 }
 
 // forkTableIndexNames returns the index names on table, read with one
@@ -129,18 +221,64 @@ func forkTableIndexNames(ctx context.Context, db DBConn, table string) (map[stri
 	return names, nil
 }
 
-// ensureForkIndexes adds every missing index. It returns changed=true when it
-// ran any DDL. When table "issues" is in dirtyBefore it skips without error
-// (the next open retries) so the changed-signature guard cannot trip.
+// ensureForkIndexes adds every missing column, then every missing index. It
+// returns changed=true when it ran any DDL. A table in dirtyBefore is skipped
+// without error (the next open retries) so the changed-signature guard cannot
+// trip, and a column on a table that does not exist yet is skipped too.
+//
+// dirtyBefore is the committable map (committableDirtyTables), so the skip is
+// for committable tables only: a dolt_ignored table such as wisps is changed
+// even when dirty. That is deliberate. wisps is clone-local, never staged or
+// committed, so the changed-signature guard and the staging commit the skip
+// protects never see it; and a wisps that stays dirty indefinitely would keep
+// needsForkIndexes true, putting every open on the locked migration path.
 func ensureForkIndexes(ctx context.Context, db DBConn, dirtyBefore map[string]dirtyTableState) (changed bool, err error) {
-	present := make(map[string]map[string]bool)
 	skipped := make(map[string]bool)
-	for _, idx := range forkIndexes {
-		if _, dirty := dirtyBefore[idx.Table]; dirty {
-			if !skipped[idx.Table] {
-				log.Printf("schema migration skipping fork indexes on %s: table has uncommitted changes; the next open retries", idx.Table)
-				skipped[idx.Table] = true
+	// skipDirty reports a committable table with uncommitted changes; a
+	// dolt_ignored table is never in dirtyBefore (see above).
+	skipDirty := func(table string) bool {
+		if _, dirty := dirtyBefore[table]; !dirty {
+			return false
+		}
+		if !skipped[table] {
+			log.Printf("schema migration skipping fork indexes on %s: table has uncommitted changes; the next open retries", table)
+			skipped[table] = true
+		}
+		return true
+	}
+
+	columns := make(map[string]map[string]bool)
+	for _, col := range forkColumns {
+		if skipDirty(col.Table) {
+			continue
+		}
+		names, ok := columns[col.Table]
+		if !ok {
+			if names, err = forkTableColumnNames(ctx, db, col.Table); err != nil {
+				return changed, err
 			}
+			columns[col.Table] = names
+		}
+		if names == nil || names[col.Name] {
+			continue
+		}
+		if _, execErr := db.ExecContext(ctx, col.DDL); execErr != nil {
+			// Same race as the indexes below: re-probe, do not match wording.
+			exists, err := schemaColumnExists(ctx, db, col.Table, col.Name)
+			if err != nil {
+				return changed, err
+			}
+			if !exists {
+				return changed, fmt.Errorf("adding %s.%s: %w", col.Table, col.Name, execErr)
+			}
+			continue
+		}
+		changed = true
+	}
+
+	present := make(map[string]map[string]bool)
+	for _, idx := range forkIndexes {
+		if skipDirty(idx.Table) {
 			continue
 		}
 		names, ok := present[idx.Table]
@@ -170,9 +308,18 @@ func ensureForkIndexes(ctx context.Context, db DBConn, dirtyBefore map[string]di
 	return changed, nil
 }
 
-// forkIndexesSQL returns the DDL statements, each ending in ";\n", for the fresh bundle.
+// forkIndexesSQL returns the DDL statements, each ending in ";\n", for the
+// fresh bundle: the issues columns, then the indexes. The bundle creates no
+// wisps, so the wisps column is left to the runtime step.
 func forkIndexesSQL() string {
 	var b strings.Builder
+	for _, col := range forkColumns {
+		if col.Table != "issues" {
+			continue
+		}
+		b.WriteString(col.DDL)
+		b.WriteString(";\n")
+	}
 	for _, idx := range forkIndexes {
 		b.WriteString(idx.DDL)
 		b.WriteString(";\n")
