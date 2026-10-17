@@ -1,6 +1,6 @@
 # Upstream
 
-This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-17 at fork main 9d6725a8d, upstream/main a3e1b24e2.
+This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-17 at fork main f85b6a3bf, upstream/main ae693ef7c.
 
 ## Posted
 
@@ -9,17 +9,19 @@ This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `r
 | PR | [#7570](https://github.com/gastownhall/beads/pull/7570) | test: isolate Dolt credentials and agent settings in the test env | cab3d5cb3 (test-env.sh part) | pr/test-env-unset-agent-vars | open, approved by a collaborator, waits for a maintainer Bazel run |
 | PR | [#7571](https://github.com/gastownhall/beads/pull/7571) | fix(dolt): roll back write transactions on panic | de6dd59f7 (Rollback part) | pr/commit-write-tx-panic-rollback | open, approved by a collaborator, waits for a maintainer Bazel run |
 | PR | [#7575](https://github.com/gastownhall/beads/pull/7575) | test(scripts): route test hooks to the prebuilt bd | ac1f166a1, a8716a50d (coreutils PATH part) | pr/test-hooks-prebuilt-bd | open, approved by a collaborator, waits for a maintainer Bazel run |
-| Issue comment | [#6117](https://github.com/gastownhall/beads/issues/6117#issuecomment-6200787940) | write transactions span the whole command (Dolt 1213) | 8b5f85b1a, de6dd59f7, 9be18c2b9 (described only) | - | issue open, no reply |
+| Issue comment | [#6117](https://github.com/gastownhall/beads/issues/6117#issuecomment-6200787940) | write transactions span the whole command (Dolt 1213) | 8b5f85b1a, de6dd59f7, 9be18c2b9 (now PR #7645) | - | issue open, no reply |
+| PR | [#7633](https://github.com/gastownhall/beads/pull/7633) | fix(dolt): server-mode bd ready must not wake defers under a migration freeze (follow-up to #6424) | 5d08ebcce (fork addition only) | pr/classified-read-freeze | open |
+| PR | [#7645](https://github.com/gastownhall/beads/pull/7645) | fix(storage): queue journaled writers behind a server lock | 8b5f85b1a, de6dd59f7 (NoJournal guard part), 9be18c2b9 | pr/journal-writer-lock (commit 93607809a on origin) | open; rebased onto upstream #7244 delete fence; Bazel lane not run locally |
+| Issue | [#7632](https://github.com/gastownhall/beads/issues/7632) | bd show --json: say the direction of a dependency edge in words (relation beside dependency_type) | 9d6725a8d (described only) | - | issue open, no reply |
+| Issue | [#7634](https://github.com/gastownhall/beads/issues/7634) | Embedded mode: bd ready wakes expired defers and commits while MIGRATION-FREEZE is set | - (fork-only gap, not fixed) | - | issue open, no reply |
 
-Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator selection), bd-8irlo (this status).
+Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator selection), bd-8irlo (this status), bd-hpall (PR C), bd-zzheg (this update).
 
 ## Not posted yet
 
 | Fork commits | What | Plan |
 |--------------|------|------|
-| 8b5f85b1a, de6dd59f7 (NoJournal guard), 9be18c2b9 | journal writer lock (GET_LOCK on bd_events_seq) | PR rebased on upstream #7244; draft bd-7ucf, held for operator confirmation |
-| 5d08ebcce (fork addition only) | defer-wake sweep must not run during a migration freeze | small PR on top of upstream #6424 |
-| 9d6725a8d | `relation` field on bd show --json dependency rows | PR (feature) |
+| 9d6725a8d | `relation` field on bd show --json dependency rows | issue #7632 open; PR draft bd-bglro waits for the answer |
 | ac1f166a1 (Bazel half) | test-bd launcher in tools/bazel/test_env.sh | addition to #7575 or a follow-up PR |
 | da73d6e70 / dependency_cycle_chain_test.go | deep-chain cycle test | optional test-only PR, not approved |
 
