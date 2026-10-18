@@ -14,6 +14,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count the same metadata-scoped set `bd list` returns without fetching every
   row.
 
+### Changed
+
+- **A journal emit inside a NoJournal write transaction now fails** with
+  `issueops.ErrJournalUnlockedTx` instead of being skipped, so a journaled
+  write can no longer slip onto a transaction that does not take the journal
+  writer lock.
+
+### Fixed
+
+- **Journaled writes in server mode queue instead of aborting each other**
+  ([#6117](https://github.com/gastownhall/beads/issues/6117)). Every write
+  that records a journal event now waits for a per-database server lock
+  before its transaction begins, instead of losing its commit on
+  `bd_events_seq` with a serialization failure and replaying. A holder that
+  goes silent for 30 s (a client that froze mid-write) is reclaimed, so it
+  cannot block the other writers until the server's idle cut.
+
 ## [1.3.1] - 2026-09-30
 
 First stable release of the 1.3.1 patch line. It ships the same code as
