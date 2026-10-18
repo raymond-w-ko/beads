@@ -1,6 +1,6 @@
 # Upstream
 
-This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-18 at fork main e2ad197c1, upstream/main ae693ef7c.
+This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-18 at fork main 4564f722b, upstream/main ae693ef7c.
 
 ## Posted
 
@@ -11,7 +11,7 @@ This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `r
 | PR | [#7575](https://github.com/gastownhall/beads/pull/7575) | test(scripts): route test hooks to the prebuilt bd | ac1f166a1, a8716a50d (coreutils PATH part) | pr/test-hooks-prebuilt-bd | open, approved by a collaborator, waits for a maintainer Bazel run |
 | Issue comment | [#6117](https://github.com/gastownhall/beads/issues/6117#issuecomment-6200787940) | write transactions span the whole command (Dolt 1213) | 8b5f85b1a, de6dd59f7, 9be18c2b9 (now PR #7645) | - | issue open, no reply |
 | PR | [#7633](https://github.com/gastownhall/beads/pull/7633) | fix(dolt): server-mode bd ready must not wake defers under a migration freeze (follow-up to #6424) | 5d08ebcce (fork addition only), e2ad197c1 (frozen defer-wake subtest) | pr/classified-read-freeze (commit c248768b8) | open, test commit pushed 2026-10-18 |
-| PR | [#7645](https://github.com/gastownhall/beads/pull/7645) | fix(storage): queue journaled writers behind a server lock | 8b5f85b1a, de6dd59f7 (NoJournal guard part), 9be18c2b9 | pr/journal-writer-lock (commit 93607809a on origin) | open; rebased onto upstream #7244 delete fence; Bazel lane not run locally |
+| PR | [#7645](https://github.com/gastownhall/beads/pull/7645) | fix(storage): queue journaled writers behind a server lock | 8b5f85b1a, de6dd59f7 (NoJournal guard part), 9be18c2b9, 4564f722b (silent-holder reclaim) | pr/journal-writer-lock (commit 98b8160ac on origin) | open; rebased onto upstream #7244 delete fence; reclaim commit pushed 2026-10-18; Bazel lane not run locally |
 | Issue | [#7632](https://github.com/gastownhall/beads/issues/7632) | bd show --json: say the direction of a dependency edge in words (relation beside dependency_type) | 9d6725a8d (described only) | - | issue open, no reply |
 | Issue | [#7634](https://github.com/gastownhall/beads/issues/7634) | Embedded mode: bd ready wakes expired defers and commits while MIGRATION-FREEZE is set | - (fork-only gap, not fixed) | - | issue open, no reply |
 
