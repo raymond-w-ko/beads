@@ -1,6 +1,6 @@
 # Upstream
 
-This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-18 at fork main af8e68bc7, upstream/main 9c6f6e15c.
+This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-18 at fork main 1ce4c8625, upstream/main 9c6f6e15c.
 
 ## Posted
 
@@ -11,11 +11,11 @@ This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `r
 | PR | [#7575](https://github.com/gastownhall/beads/pull/7575) | test(scripts): route test hooks to the prebuilt bd | ac1f166a1, a8716a50d (coreutils PATH part) | pr/test-hooks-prebuilt-bd | open, approved by a collaborator, waits for a maintainer Bazel run |
 | Issue comment | [#6117](https://github.com/gastownhall/beads/issues/6117#issuecomment-6200787940) | write transactions span the whole command (Dolt 1213) | 8b5f85b1a, de6dd59f7, 9be18c2b9 (now PR #7645) | - | issue open, no reply |
 | PR | [#7633](https://github.com/gastownhall/beads/pull/7633) | fix(dolt): server-mode bd ready must not wake defers under a migration freeze (follow-up to #6424) | 5d08ebcce (fork addition only), e2ad197c1 (frozen defer-wake subtest) | pr/classified-read-freeze (commit c248768b8) | open, test commit pushed 2026-10-18 |
-| PR | [#7645](https://github.com/gastownhall/beads/pull/7645) | fix(storage): queue journaled writers behind a server lock | 8b5f85b1a, de6dd59f7 (NoJournal guard part), 9be18c2b9, 4564f722b (silent-holder reclaim), af8e68bc7 (lock-order tests), b7f64b747 (uow recheck release) | pr/journal-writer-lock (commit 432be3a37 on origin) | open; fix round pushed 2026-10-18 answering bee-ghosttrack's changes-requested (lock-order tests, uow recheck release, description corrections); awaiting re-review; Bazel lane not run locally |
+| PR | [#7645](https://github.com/gastownhall/beads/pull/7645) | fix(storage): queue journaled writers behind a server lock | 8b5f85b1a, de6dd59f7 (NoJournal guard part), 9be18c2b9, 4564f722b (silent-holder reclaim), af8e68bc7 (lock-order tests), b7f64b747 (uow recheck release), 1ce4c8625 (live-test isolation) | pr/journal-writer-lock (commit 2bad88f11 on origin) | open; fix round pushed 2026-10-18 answering bee-ghosttrack's changes-requested (lock-order tests, uow recheck release, description corrections); awaiting re-review; Bazel lane not run locally; test-isolation commit pushed 2026-10-18 |
 | Issue | [#7632](https://github.com/gastownhall/beads/issues/7632) | bd show --json: say the direction of a dependency edge in words (relation beside dependency_type) | 9d6725a8d (described only) | - | issue open, no reply |
 | Issue | [#7634](https://github.com/gastownhall/beads/issues/7634) | Embedded mode: bd ready wakes expired defers and commits while MIGRATION-FREEZE is set | - (fork-only gap, not fixed) | - | issue open, no reply |
 
-Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator selection), bd-8irlo (this status), bd-hpall (PR C), bd-zzheg (this update), bd-ag0kx, bd-ke5hc, bd-yxtwb, bd-0efhc (PR #7645 fix round).
+Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator selection), bd-8irlo (this status), bd-hpall (PR C), bd-zzheg (this update), bd-ag0kx, bd-ke5hc, bd-yxtwb, bd-0efhc (PR #7645 fix round), bd-ppay0, bd-mo505, bd-a4g6y (PR #7645 test isolation).
 
 ## Not posted yet
 
