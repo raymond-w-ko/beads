@@ -117,12 +117,20 @@ func TestListRelatedIssuesProjectsTheWholeRequest(t *testing.T) {
 // the ROLE's promise and the handler is a projection that may not sort or
 // reshape it, so the fixture is handed to the fake in the order the role would
 // answer and compared position by position.
+//
+// The role word is the role's too: it fills `relation` from the request's
+// direction, and the handler passes it through, so the fake rows carry the
+// incoming words the role sets for direction=in.
 func TestListRelatedIssuesAnswersTheRolesRowsInOrder(t *testing.T) {
-	ts, _ := newRelatedServer(t, []*issueops.RelatedIssue{
+	rows := []*issueops.RelatedIssue{
 		relatedNeighbor("bd-a", types.DepBlocks),
 		relatedNeighbor("bd-b", types.DepParentChild),
 		relatedNeighbor("bd-c", types.DepRelated),
-	})
+	}
+	for _, row := range rows {
+		row.Relation = row.DependencyType.Relation(false)
+	}
+	ts, _ := newRelatedServer(t, rows)
 
 	resp := ts.get(t, "/v0/beads/issues/bd-anchor/related?direction=in")
 	if resp.StatusCode != http.StatusOK {
@@ -137,6 +145,7 @@ func TestListRelatedIssuesAnswersTheRolesRowsInOrder(t *testing.T) {
 			ID             *string `json:"id"`
 			Title          *string `json:"title"`
 			DependencyType *string `json:"dependency_type"`
+			Relation       *string `json:"relation"`
 			// Not a member of this element, and asserted as an ABSENCE below:
 			// see TestListRelatedIssuesCarriesNoRevision.
 			Revision *int64 `json:"revision"`
@@ -165,6 +174,10 @@ func TestListRelatedIssuesAnswersTheRolesRowsInOrder(t *testing.T) {
 		// is the one member this element adds to a plain issue.
 		if *got.ID != want.id || *got.DependencyType != want.depType {
 			t.Errorf("item %d = {%q %q}, want {%q %q}", i, *got.ID, *got.DependencyType, want.id, want.depType)
+		}
+		wantRelation := types.DependencyType(want.depType).Relation(false)
+		if got.Relation == nil || *got.Relation != wantRelation {
+			t.Errorf("item %d relation = %v, want %q: %s", i, got.Relation, wantRelation, raw)
 		}
 	}
 }

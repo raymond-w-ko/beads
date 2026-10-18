@@ -71,6 +71,6 @@ func (r *issueRelations) Related(ctx context.Context, request publicops.RelatedR
 		// implementations narrow and order through one function; passing
 		// filter.Types down would put the narrowing in the query on one side
 		// and in Go on the other.
-		return storageissueops.FinishRelatedPage(items, request.Types), nil
+		return storageissueops.FinishRelatedPage(items, request), nil
 	})
 }

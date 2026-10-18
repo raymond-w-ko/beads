@@ -37,7 +37,7 @@
     },
     "envelope/dep_list": {
       "cmd": "bd dep list corpus-root --json",
-      "sha256": "7ca29f4821b5f845601d3c38c4b1832085369eaf968a7b586f860aefbd6c2d39"
+      "sha256": "16f3bc882335613b138a5755ee7e0fc06eb00055dd924025ca65163026ef1edb"
     },
     "envelope/dep_remove": {
       "cmd": "bd dep remove corpus-root corpus-dep --json",
@@ -105,7 +105,7 @@
     },
     "flat/dep_list": {
       "cmd": "bd dep list corpus-root --json",
-      "sha256": "646844cfd6ce88a4f31429245f0dedeeef612e9565ecdf0154d8e278f5a0a970"
+      "sha256": "df95523ded3f3697ad94c0c31ed417cd9e02e1ebd1affab11789fef5bc7baa16"
     },
     "flat/dep_remove": {
       "cmd": "bd dep remove corpus-root corpus-dep --json",

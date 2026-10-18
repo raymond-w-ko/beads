@@ -306,20 +306,54 @@ func TestFinishRelatedPagePinsTheOrder(t *testing.T) {
 		related("bd-5", publicops.DepParentChild),
 	}
 
-	got := FinishRelatedPage(items, nil)
+	got := FinishRelatedPage(items, publicops.RelatedRequest{Direction: publicops.RelationOut})
 	want := []string{"bd-1/blocks", "bd-1/related", "bd-5/parent-child", "bd-9/blocks"}
 	if keys := relatedKeys(got); !equalStrings(keys, want) {
 		t.Fatalf("FinishRelatedPage() order = %v, want %v", keys, want)
 	}
 
-	filtered := FinishRelatedPage(items, []types.DependencyType{publicops.DepBlocks})
+	filtered := FinishRelatedPage(items, publicops.RelatedRequest{
+		Direction: publicops.RelationOut,
+		Types:     []types.DependencyType{publicops.DepBlocks},
+	})
 	want = []string{"bd-1/blocks", "bd-9/blocks"}
 	if keys := relatedKeys(filtered); !equalStrings(keys, want) {
 		t.Fatalf("FinishRelatedPage(blocks) = %v, want %v", keys, want)
 	}
 
-	if empty := FinishRelatedPage(nil, nil); empty == nil {
+	if empty := FinishRelatedPage(nil, publicops.RelatedRequest{Direction: publicops.RelationOut}); empty == nil {
 		t.Fatal("FinishRelatedPage(nil) = nil, want an empty slice so a marshalled answer is [] and not null")
+	}
+}
+
+// TestFinishRelatedPageFillsTheRelationFromTheDirection pins that a Relations
+// row carries the same role word the detail view's dependencies/dependents
+// rows do: the request's direction says which end of the edge the anchor is.
+func TestFinishRelatedPageFillsTheRelationFromTheDirection(t *testing.T) {
+	cases := []struct {
+		direction publicops.RelationDirection
+		depType   types.DependencyType
+		want      string
+	}{
+		{publicops.RelationOut, publicops.DepBlocks, publicops.DepBlocks.Relation(true)},
+		{publicops.RelationIn, publicops.DepBlocks, publicops.DepBlocks.Relation(false)},
+		{publicops.RelationOut, publicops.DepParentChild, publicops.DepParentChild.Relation(true)},
+		{publicops.RelationIn, publicops.DepParentChild, publicops.DepParentChild.Relation(false)},
+		{publicops.RelationOut, "custom-edge", "custom-edge"},
+		{publicops.RelationIn, "custom-edge", "custom-edge_inbound"},
+	}
+	for _, tc := range cases {
+		items := []*types.IssueWithDependencyMetadata{{
+			Issue:          types.Issue{ID: "bd-1"},
+			DependencyType: tc.depType,
+		}}
+		got := FinishRelatedPage(items, publicops.RelatedRequest{Direction: tc.direction})
+		if len(got) != 1 || got[0].Relation != tc.want {
+			t.Fatalf("FinishRelatedPage(%s, %s) relation = %+v, want %q", tc.direction, tc.depType, got, tc.want)
+		}
+	}
+	if out, in := publicops.DepBlocks.Relation(true), publicops.DepBlocks.Relation(false); out == in {
+		t.Fatalf("blocks relation words do not differ by direction: %q", out)
 	}
 }
 

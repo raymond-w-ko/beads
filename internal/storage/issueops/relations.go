@@ -65,7 +65,7 @@ func ExecuteRelated(ctx context.Context, tx DBTX, request publicops.RelatedReque
 	if err != nil {
 		return nil, err
 	}
-	return FinishRelatedPage(items, request.Types), nil
+	return FinishRelatedPage(items, request), nil
 }
 
 // RequireIssueOrWispInTx refuses an id that names neither an issue nor a wisp,
@@ -101,14 +101,20 @@ func RequireIssueOrWispInTx(ctx context.Context, tx DBTX, id string) error {
 // sequence, so their natural order tracks which plane a neighbor happens to
 // live on — stable enough to look deliberate and not stable enough to rely on.
 //
+// Every row it keeps gets its Relation, the role word read from the anchor's
+// end: request.Direction says which end that is (out: the anchor is the
+// edge's issue_id), so the row carries the same word the detail view's
+// dependencies/dependents rows do.
+//
 // The result is never nil, so a caller that marshals it emits an empty array
 // rather than null.
-func FinishRelatedPage(items []*types.IssueWithDependencyMetadata, depTypes []types.DependencyType) []*types.IssueWithDependencyMetadata {
+func FinishRelatedPage(items []*types.IssueWithDependencyMetadata, request publicops.RelatedRequest) []*types.IssueWithDependencyMetadata {
 	out := make([]*types.IssueWithDependencyMetadata, 0, len(items))
-	allowed := make(map[types.DependencyType]struct{}, len(depTypes))
-	for _, depType := range depTypes {
+	allowed := make(map[types.DependencyType]struct{}, len(request.Types))
+	for _, depType := range request.Types {
 		allowed[depType] = struct{}{}
 	}
+	outgoing := request.Direction != publicops.RelationIn
 	for _, item := range items {
 		if item == nil {
 			continue
@@ -118,6 +124,7 @@ func FinishRelatedPage(items []*types.IssueWithDependencyMetadata, depTypes []ty
 				continue
 			}
 		}
+		item.Relation = item.DependencyType.Relation(outgoing)
 		out = append(out, item)
 	}
 	sort.SliceStable(out, func(i, j int) bool {

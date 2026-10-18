@@ -6761,8 +6761,10 @@ components:
             `duplicated_by` under `dependents`; likewise `depends_on`/`blocks`,
             `parent`/`children`, `superseded_by`/`supersedes`. A custom type
             reads `<type>` outgoing and `<type>_inbound` incoming.
-            `GET /v0/beads/issues/{id}` fills it; `RelatedIssues.items`
-            leaves it empty for now.
+            `GET /v0/beads/issues/{id}` fills it, and so does
+            `RelatedIssues.items`, from the request's `direction`: `out` reads
+            the outgoing words (as under `dependencies`), `in` the incoming
+            ones (as under `dependents`).
 
     TreeNode:
       type: object
@@ -8484,7 +8486,9 @@ components:
 
 
             Each element is a full issue plus `dependency_type`, the type of the
-            edge that led to it — the same element
+            edge that led to it, and `relation`, that edge's role word read
+            from this issue's end per `direction` — the same element, with the
+            same two members filled the same way, that
             `GET /v0/beads/issues/{id}` carries under `dependencies` and
             `dependents`, so the two surfaces are one compatibility domain.
 
