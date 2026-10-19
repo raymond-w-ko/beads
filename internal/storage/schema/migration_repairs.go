@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 
+	"github.com/steveyegge/beads/internal/storage/dberrors"
 	"github.com/steveyegge/beads/internal/storage/depid"
 )
 
@@ -684,26 +686,100 @@ func wispDependenciesSplitTargetBackfillSQL() []string {
 	}
 }
 
-func schemaTableExists(ctx context.Context, db DBConn, table string) (bool, error) {
-	var count int
-	if err := db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
-		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
-	`, table).Scan(&count); err != nil {
-		return false, err
+// schemaIdentPattern bounds the table and column names the SHOW probes below
+// splice into their statement text. Every caller passes a package constant;
+// the guard keeps a future caller from turning a name into SQL.
+var schemaIdentPattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
+func checkSchemaIdent(kind, name string) error {
+	if !schemaIdentPattern.MatchString(name) {
+		return fmt.Errorf("invalid %s name %q", kind, name)
 	}
-	return count > 0, nil
+	return nil
 }
 
-func schemaColumnExists(ctx context.Context, db DBConn, table, column string) (bool, error) {
-	var count int
-	if err := db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
-		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
-	`, table, column).Scan(&count); err != nil {
+// schemaTableExists reports whether table is present in the current database.
+//
+// It probes with SHOW TABLES LIKE rather than INFORMATION_SCHEMA.TABLES: Dolt
+// does not push the TABLE_SCHEMA predicate down, so the INFORMATION_SCHEMA scan
+// walks every database the login can see (seconds on a busy server) and fails
+// with "no root value found in session" if one of them is dropped mid-scan.
+// SHOW TABLES returns zero rows, not an error, for a missing table, so it is
+// still a statement that always SUCCEEDS (be-bv7x). '_' is a LIKE wildcard, so
+// the returned name is compared exactly.
+func schemaTableExists(ctx context.Context, db DBConn, table string) (bool, error) {
+	if err := checkSchemaIdent("table", table); err != nil {
 		return false, err
 	}
-	return count > 0, nil
+	//nolint:gosec // G202: table matched schemaIdentPattern above.
+	rows, err := db.QueryContext(ctx, "SHOW TABLES LIKE '"+table+"'")
+	if err != nil {
+		return false, err
+	}
+	return showFirstColumnHas(rows, table)
+}
+
+// schemaColumnExists reports whether table.column is present in the current
+// database; a missing table reports false. It probes with SHOW COLUMNS for the
+// same reason schemaTableExists uses SHOW TABLES (see hasContentHashColumn).
+//
+// SHOW COLUMNS FAILS on a missing table, and a failing statement can pin a
+// pooled Dolt session to a stale catalog snapshot (be-bv7x), so the table is
+// probed first with schemaTableExists, which always succeeds.
+func schemaColumnExists(ctx context.Context, db DBConn, table, column string) (bool, error) {
+	if err := checkSchemaIdent("table", table); err != nil {
+		return false, err
+	}
+	if err := checkSchemaIdent("column", column); err != nil {
+		return false, err
+	}
+	tableExists, err := schemaTableExists(ctx, db, table)
+	if err != nil {
+		return false, err
+	}
+	if !tableExists {
+		return false, nil
+	}
+	//nolint:gosec // G202: table and column matched schemaIdentPattern above.
+	rows, err := db.QueryContext(ctx, "SHOW COLUMNS FROM `"+table+"` LIKE '"+column+"'")
+	if err != nil {
+		// The table was dropped between the two probes; the old
+		// INFORMATION_SCHEMA probe returned count 0 for a missing table.
+		if dberrors.IsTableNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return showFirstColumnHas(rows, column)
+}
+
+// showFirstColumnHas drains a SHOW result set and reports whether any row's
+// first cell equals want exactly. SHOW TABLES returns one column and SHOW
+// COLUMNS at least six, so every column is scanned into RawBytes.
+func showFirstColumnHas(rows *sql.Rows, want string) (bool, error) {
+	defer func() { _ = rows.Close() }()
+	cols, err := rows.Columns()
+	if err != nil {
+		return false, err
+	}
+	cells := make([]sql.RawBytes, len(cols))
+	dest := make([]any, len(cols))
+	for i := range cells {
+		dest[i] = &cells[i]
+	}
+	found := false
+	for rows.Next() {
+		if err := rows.Scan(dest...); err != nil {
+			return false, err
+		}
+		if len(cells) > 0 && string(cells[0]) == want {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return found, nil
 }
 
 // schemaHasPrimaryKey reports whether table currently carries a PRIMARY KEY

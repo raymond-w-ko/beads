@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -14,18 +15,17 @@ import (
 	"github.com/steveyegge/beads/internal/storage/schema"
 )
 
-// expectCursorProbe mocks the information_schema existence probe that
+// expectCursorProbe mocks the SHOW TABLES existence probe that
 // migrationSource.currentVersion issues before it ever reads the cursor
 // table. The probe was added by be-bv7x so a not-yet-created cursor table
-// never poisons the pooled Dolt session with a failing statement.
+// never poisons the pooled Dolt session with a failing statement: one row
+// naming the table when it exists, none when it does not.
 func expectCursorProbe(mock sqlmock.Sqlmock, table string, exists bool) {
-	present := 0
+	rows := sqlmock.NewRows([]string{"Tables_in_db"})
 	if exists {
-		present = 1
+		rows.AddRow(table)
 	}
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM information_schema\.tables`).
-		WithArgs(table).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(present))
+	mock.ExpectQuery(regexp.QuoteMeta("SHOW TABLES LIKE '" + table + "'")).WillReturnRows(rows)
 }
 
 func expectVersionQuery(mock sqlmock.Sqlmock, version int) {

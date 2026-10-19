@@ -101,8 +101,7 @@ func TestMigrateUpReturnsDirtyTablesErrorForPreExistingDirtyTable(t *testing.T) 
 	// not an aux table anyway, so it stays in dirtyBefore.
 	expectCursorProbe(mock, "ignored_schema_migrations", false)
 	for range auxRekeyPasses {
-		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
-			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+		expectTableProbe(mock, "local_metadata", false)
 	}
 
 	// pendingMigrationDirtyTables re-reads the current version and finds
@@ -339,9 +338,7 @@ func TestEnsureIssuesRigColumnsAddsOnlyMissing(t *testing.T) {
 	// #4502: issues tables bootstrapped before the rig/agent columns landed
 	// in 0001 reach v52 without them; the 0053 pre-repair must add exactly
 	// the missing ones. Simulate hook_bead present, the other five absent.
-	countQuery := `SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS`
-	mock.ExpectQuery(countQuery).WithArgs("issues", "hook_bead").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
+	expectColumnProbe(mock, "issues", "hook_bead", true)
 	for _, col := range []struct{ name, ddl string }{
 		{"role_bead", "ALTER TABLE issues ADD COLUMN role_bead VARCHAR\\(255\\) DEFAULT ''"},
 		{"agent_state", "ALTER TABLE issues ADD COLUMN agent_state VARCHAR\\(32\\) DEFAULT ''"},
@@ -349,8 +346,7 @@ func TestEnsureIssuesRigColumnsAddsOnlyMissing(t *testing.T) {
 		{"role_type", "ALTER TABLE issues ADD COLUMN role_type VARCHAR\\(32\\) DEFAULT ''"},
 		{"rig", "ALTER TABLE issues ADD COLUMN rig VARCHAR\\(255\\) DEFAULT ''"},
 	} {
-		mock.ExpectQuery(countQuery).WithArgs("issues", col.name).
-			WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+		expectColumnProbe(mock, "issues", col.name, false)
 		mock.ExpectExec(col.ddl).WillReturnResult(sqlmock.NewResult(0, 0))
 	}
 
@@ -370,22 +366,17 @@ func TestEnsureWispDependenciesSplitTargetsAddsMissingAndBackfills(t *testing.T)
 	}
 	defer db.Close()
 
-	tableQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES.*TABLE_NAME = \?`
-	columnQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS.*TABLE_NAME = \? AND COLUMN_NAME = \?`
-	mock.ExpectQuery(tableQuery).WithArgs("wisp_dependencies").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
+	expectTableProbe(mock, "wisp_dependencies", true)
 	ddlByColumn := map[string]string{
 		"depends_on_issue_id": "ALTER TABLE wisp_dependencies ADD COLUMN depends_on_issue_id VARCHAR\\(255\\) NULL",
 		"depends_on_wisp_id":  "ALTER TABLE wisp_dependencies ADD COLUMN depends_on_wisp_id VARCHAR\\(255\\) NULL",
 		"depends_on_external": "ALTER TABLE wisp_dependencies ADD COLUMN depends_on_external VARCHAR\\(255\\) NULL",
 	}
 	for _, col := range []string{"depends_on_issue_id", "depends_on_wisp_id", "depends_on_external"} {
-		mock.ExpectQuery(columnQuery).WithArgs("wisp_dependencies", col).
-			WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+		expectColumnProbe(mock, "wisp_dependencies", col, false)
 		mock.ExpectExec(ddlByColumn[col]).WillReturnResult(sqlmock.NewResult(0, 0))
 	}
-	mock.ExpectQuery(columnQuery).WithArgs("wisp_dependencies", "depends_on_id").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
+	expectColumnProbe(mock, "wisp_dependencies", "depends_on_id", true)
 	for _, update := range []string{
 		`UPDATE wisp_dependencies SET depends_on_external = depends_on_id`,
 		`UPDATE wisp_dependencies wd JOIN wisps w ON w\.id = wd\.depends_on_id`,
@@ -433,12 +424,9 @@ func TestPreMigrationRepairDispatchesMain47ToWispTableRepair(t *testing.T) {
 	}
 	defer db.Close()
 
-	tableQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES.*TABLE_NAME = \?`
-	mock.ExpectQuery(tableQuery).WithArgs("wisps").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	expectTableProbe(mock, "wisps", false)
 	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS wisps`).WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectQuery(tableQuery).WithArgs("wisp_dependencies").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	expectTableProbe(mock, "wisp_dependencies", false)
 	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS wisp_dependencies`).WillReturnResult(sqlmock.NewResult(0, 0))
 
 	if err := mainSource.preMigrationRepair(context.Background(), db, 47); err != nil {
@@ -479,8 +467,6 @@ func TestRunMigrationsSnapshotsDirtyTablesBeforeRepairSoRepairMutationsCommitAto
 	defer db.Close()
 
 	dirtyStatusQuery := `(?s)SELECT s\.table_name, s\.staged\s+FROM dolt_status s\s+WHERE NOT EXISTS`
-	tableQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES.*TABLE_NAME = \?`
-	columnQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS.*TABLE_NAME = \? AND COLUMN_NAME = \?`
 
 	// 1. The "before" snapshot: this step's own repair has not run yet, so
 	// nothing is dirty.
@@ -491,13 +477,10 @@ func TestRunMigrationsSnapshotsDirtyTablesBeforeRepairSoRepairMutationsCommitAto
 	// exec), ensureWispDependenciesSplitTargets (table absent, no-op), then
 	// ensureDependenciesIDColumn actually mutating `dependencies`.
 	for _, col := range []string{"hook_bead", "role_bead", "agent_state", "last_activity", "role_type", "rig"} {
-		mock.ExpectQuery(columnQuery).WithArgs("issues", col).
-			WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
+		expectColumnProbe(mock, "issues", col, true)
 	}
-	mock.ExpectQuery(tableQuery).WithArgs("wisp_dependencies").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
-	mock.ExpectQuery(columnQuery).WithArgs("dependencies", "id").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	expectTableProbe(mock, "wisp_dependencies", false)
+	expectColumnProbe(mock, "dependencies", "id", false)
 	mock.ExpectExec(`ALTER TABLE dependencies ADD COLUMN id CHAR\(36\) NULL`).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery(`(?s)SELECT issue_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external\s+FROM dependencies\s+WHERE id IS NULL`).
@@ -556,12 +539,9 @@ func TestEnsureWispTablesForMigration0047CreatesMissingTables(t *testing.T) {
 	// #4695/#4176: a clone whose main cursor arrives at 0047 with the wisp
 	// tables entirely absent (dolt_ignore'd, never synced) must have them
 	// created at the canonical shape before 0047's frozen recompute runs.
-	tableQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES.*TABLE_NAME = \?`
-	mock.ExpectQuery(tableQuery).WithArgs("wisps").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	expectTableProbe(mock, "wisps", false)
 	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS wisps \(`).WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectQuery(tableQuery).WithArgs("wisp_dependencies").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	expectTableProbe(mock, "wisp_dependencies", false)
 	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS wisp_dependencies \(`).WillReturnResult(sqlmock.NewResult(0, 0))
 
 	if err := ensureWispTablesForMixedBlockedRecompute(context.Background(), db); err != nil {
@@ -580,26 +560,19 @@ func TestEnsureWispTablesForMigration0047DelegatesSplitTargetRepairWhenWispDepen
 	}
 	defer db.Close()
 
-	tableQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES.*TABLE_NAME = \?`
-	columnQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS.*TABLE_NAME = \? AND COLUMN_NAME = \?`
 	// wisps already exists: skip creating it.
-	mock.ExpectQuery(tableQuery).WithArgs("wisps").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
+	expectTableProbe(mock, "wisps", true)
 	// wisp_dependencies already exists too: delegate to the same split-target
 	// repair migration 0053 relies on, rather than recreating it.
-	mock.ExpectQuery(tableQuery).WithArgs("wisp_dependencies").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
-	mock.ExpectQuery(tableQuery).WithArgs("wisp_dependencies").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
+	expectTableProbe(mock, "wisp_dependencies", true)
+	expectTableProbe(mock, "wisp_dependencies", true)
 	for _, col := range []string{"depends_on_issue_id", "depends_on_wisp_id", "depends_on_external"} {
-		mock.ExpectQuery(columnQuery).WithArgs("wisp_dependencies", col).
-			WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
+		expectColumnProbe(mock, "wisp_dependencies", col, true)
 	}
 	// The legacy source column is already gone: a prior pass finished the
 	// backfill (or this database never had it), so there is nothing left to
 	// re-run and the repair no-ops here.
-	mock.ExpectQuery(columnQuery).WithArgs("wisp_dependencies", "depends_on_id").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	expectColumnProbe(mock, "wisp_dependencies", "depends_on_id", false)
 
 	if err := ensureWispTablesForMixedBlockedRecompute(context.Background(), db); err != nil {
 		t.Fatalf("ensureWispTablesForMixedBlockedRecompute: %v", err)
@@ -628,16 +601,12 @@ func TestPreMigrationRepairDispatchesIgnored15ToWispIsBlockedRepair(t *testing.T
 	}
 	defer db.Close()
 
-	tableQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES.*TABLE_NAME = \?`
-	columnQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS.*TABLE_NAME = \? AND COLUMN_NAME = \?`
 	indexQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.STATISTICS.*TABLE_NAME = \? AND INDEX_NAME = \?`
 
 	// wisps exists (id/status present) but is_blocked never landed, and its
 	// index is missing too.
-	mock.ExpectQuery(tableQuery).WithArgs("wisps").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
-	mock.ExpectQuery(columnQuery).WithArgs("wisps", "is_blocked").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	expectTableProbe(mock, "wisps", true)
+	expectColumnProbe(mock, "wisps", "is_blocked", false)
 	mock.ExpectExec(`ALTER TABLE wisps ADD COLUMN is_blocked TINYINT\(1\) NOT NULL DEFAULT 0`).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery(indexQuery).WithArgs("wisps", "idx_wisps_is_blocked").
@@ -673,9 +642,7 @@ func TestEnsureWispIsBlockedForRecomputeNoopsWhenWispsAbsent(t *testing.T) {
 	// disagree) always materializes wisps before the pass advances this far.
 	// This test exercises the repair function in isolation and is not a
 	// claim that 0007/0015 tolerate a missing wisps table.
-	tableQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES.*TABLE_NAME = \?`
-	mock.ExpectQuery(tableQuery).WithArgs("wisps").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	expectTableProbe(mock, "wisps", false)
 
 	if err := ensureWispIsBlockedForRecompute(context.Background(), db); err != nil {
 		t.Fatalf("ensureWispIsBlockedForRecompute: %v", err)
@@ -697,13 +664,9 @@ func TestEnsureWispIsBlockedForRecomputeNoopsWhenAlreadyPresent(t *testing.T) {
 	// already has both the column and its index, so the repair issues no
 	// ALTER or CREATE INDEX -- matching ignored/0006's own guard being a
 	// no-op here.
-	tableQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES.*TABLE_NAME = \?`
-	columnQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS.*TABLE_NAME = \? AND COLUMN_NAME = \?`
 	indexQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.STATISTICS.*TABLE_NAME = \? AND INDEX_NAME = \?`
-	mock.ExpectQuery(tableQuery).WithArgs("wisps").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
-	mock.ExpectQuery(columnQuery).WithArgs("wisps", "is_blocked").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
+	expectTableProbe(mock, "wisps", true)
+	expectColumnProbe(mock, "wisps", "is_blocked", true)
 	mock.ExpectQuery(indexQuery).WithArgs("wisps", "idx_wisps_is_blocked").
 		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
 
@@ -769,7 +732,7 @@ const (
 // returned sqlmock.Sqlmock is exposed via (*wispIsBlockedDriftDB).
 // expectationsWereMet so callers can assert it was fully consumed -- but
 // only after confirming runMigrations itself succeeded, since an
-// unregistered repair never issues the three INFORMATION_SCHEMA probes
+// unregistered repair never issues the three schema probes
 // below and would otherwise report a second, unrelated "unmet
 // expectations" failure on top of the real one.
 func newWispIsBlockedDriftDB(t *testing.T, migrationFile string, wantCursorVersion int) *wispIsBlockedDriftDB {
@@ -781,13 +744,9 @@ func newWispIsBlockedDriftDB(t *testing.T, migrationFile string, wantCursorVersi
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	tableQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES.*TABLE_NAME = \?`
-	columnQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS.*TABLE_NAME = \? AND COLUMN_NAME = \?`
 	indexQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.STATISTICS.*TABLE_NAME = \? AND INDEX_NAME = \?`
-	mock.ExpectQuery(tableQuery).WithArgs("wisps").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
-	mock.ExpectQuery(columnQuery).WithArgs("wisps", "is_blocked").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	expectTableProbe(mock, "wisps", true)
+	expectColumnProbe(mock, "wisps", "is_blocked", false)
 	mock.ExpectQuery(indexQuery).WithArgs("wisps", "idx_wisps_is_blocked").
 		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
 
@@ -810,8 +769,10 @@ func (d *wispIsBlockedDriftDB) QueryRowContext(ctx context.Context, query string
 	return d.real.QueryRowContext(ctx, query, args...)
 }
 
-func (d *wispIsBlockedDriftDB) QueryContext(context.Context, string, ...any) (*sql.Rows, error) {
-	panic("wispIsBlockedDriftDB: QueryContext not expected on the ignored pre-repair path")
+// QueryContext carries the SHOW TABLES / SHOW COLUMNS existence probes to the
+// sqlmock expectations registered in newWispIsBlockedDriftDB.
+func (d *wispIsBlockedDriftDB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return d.real.QueryContext(ctx, query, args...)
 }
 
 func (d *wispIsBlockedDriftDB) ExecContext(_ context.Context, query string, args ...any) (sql.Result, error) {
@@ -853,7 +814,7 @@ func (d *wispIsBlockedDriftDB) ExecContext(_ context.Context, query string, args
 	}
 }
 
-// expectationsWereMet asserts the three INFORMATION_SCHEMA probe expectations
+// expectationsWereMet asserts the three schema probe expectations
 // registered in newWispIsBlockedDriftDB were consumed. Callers check this
 // only once runMigrations has already returned nil: an unregistered repair
 // (the RED half of the red-green proof below) never issues those probes at
@@ -961,9 +922,7 @@ func TestEnsureDependenciesIDColumnNoopWhenAlreadyFullyBackfilledAndKeyed(t *tes
 	// matches no rows), and id is already the primary key. Column presence
 	// alone must not short-circuit re-verification (#3/#6 re-entry), but a
 	// database that has already fully converged still does no work.
-	columnQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS.*TABLE_NAME = \? AND COLUMN_NAME = \?`
-	mock.ExpectQuery(columnQuery).WithArgs("dependencies", "id").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
+	expectColumnProbe(mock, "dependencies", "id", true)
 	mock.ExpectQuery(`(?s)SELECT issue_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external\s+FROM dependencies\s+WHERE id IS NULL`).
 		WillReturnRows(sqlmock.NewRows([]string{"issue_id", "depends_on_issue_id", "depends_on_wisp_id", "depends_on_external"}))
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM dependencies WHERE id IS NULL`).
@@ -995,9 +954,7 @@ func TestEnsureDependenciesIDColumnBackfillsMissingIDsDeterministically(t *testi
 	// rekey pass use, and restore id as the PRIMARY KEY (0043's exact
 	// canonical shape -- not just a plain NOT NULL column, see #4690's
 	// duplication risk without a key).
-	columnQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS.*TABLE_NAME = \? AND COLUMN_NAME = \?`
-	mock.ExpectQuery(columnQuery).WithArgs("dependencies", "id").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	expectColumnProbe(mock, "dependencies", "id", false)
 	mock.ExpectExec(`ALTER TABLE dependencies ADD COLUMN id CHAR\(36\) NULL`).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -1051,9 +1008,7 @@ func TestEnsureDependenciesIDColumnDropsExistingPrimaryKeyBeforeAddingID(t *test
 	// table carries only one PRIMARY KEY, so the existing one must be
 	// dropped before id can become it; the uk_dep_* natural-identity unique
 	// keys (0043) enforce the real uniqueness regardless.
-	columnQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS.*TABLE_NAME = \? AND COLUMN_NAME = \?`
-	mock.ExpectQuery(columnQuery).WithArgs("dependencies", "id").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
+	expectColumnProbe(mock, "dependencies", "id", true)
 	mock.ExpectQuery(`(?s)SELECT issue_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external\s+FROM dependencies\s+WHERE id IS NULL`).
 		WillReturnRows(sqlmock.NewRows([]string{"issue_id", "depends_on_issue_id", "depends_on_wisp_id", "depends_on_external"}))
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM dependencies WHERE id IS NULL`).
@@ -1092,9 +1047,7 @@ func TestEnsureDependenciesIDColumnFailsClearlyOnTargetlessRowInsteadOfBrickingN
 	// actionable error instead of leaving id NULL under a column callers
 	// assume is NOT NULL, or letting a blind MODIFY ... NOT NULL abort with a
 	// generic, confusing "column cannot be null" error.
-	columnQuery := `(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS.*TABLE_NAME = \? AND COLUMN_NAME = \?`
-	mock.ExpectQuery(columnQuery).WithArgs("dependencies", "id").
-		WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+	expectColumnProbe(mock, "dependencies", "id", false)
 	mock.ExpectExec(`ALTER TABLE dependencies ADD COLUMN id CHAR\(36\) NULL`).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
@@ -2384,16 +2337,16 @@ func (m *mockDB) QueryRowContext(_ context.Context, _ string, _ ...any) *sql.Row
 	panic("not called")
 }
 
-// wispsAbsentDB extends mockDB's blind-success ExecContext / panicking
-// QueryContext with TWO answerable QueryRowContext queries, same pattern:
-// the ignored/7 and ignored/15 pre-migration repairs (both dispatch to
-// ensureWispIsBlockedForRecompute) each probe whether wisps exists before
-// touching it, and *sql.Row has no public constructor outside a real
-// database/sql driver -- mockDB itself cannot fake a scan result. A small
-// embedded sqlmock answers exactly those two queries with "table absent"
-// (0), so the repair takes its early no-op branch on both firings; any
-// OTHER QueryRowContext this pass might issue still surfaces loudly, via
-// sqlmock's own unmet/unexpected-call error rather than a silent success.
+// wispsAbsentDB extends mockDB's blind-success ExecContext with TWO
+// answerable queries, same pattern: the ignored/7 and ignored/15
+// pre-migration repairs (both dispatch to ensureWispIsBlockedForRecompute)
+// each probe whether wisps exists before touching it, and *sql.Rows has no
+// public constructor outside a real database/sql driver -- mockDB itself
+// cannot fake a result. A small embedded sqlmock answers exactly those two
+// SHOW TABLES probes with "table absent" (no rows), so the repair takes its
+// early no-op branch on both firings; any OTHER query this pass might issue
+// still surfaces loudly, via sqlmock's own unmet/unexpected-call error rather
+// than a silent success.
 type wispsAbsentDB struct {
 	mockDB
 	real *sql.DB
@@ -2412,9 +2365,7 @@ func newWispsAbsentDB(t *testing.T) *wispsAbsentDB {
 	// ExpectedQuery.Times, so the same expectation is set up twice instead of
 	// asking for a repeat count.
 	for i := 0; i < 2; i++ {
-		mock.ExpectQuery(`(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES.*TABLE_NAME = \?`).
-			WithArgs("wisps").
-			WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
+		expectTableProbe(mock, "wisps", false)
 	}
 	t.Cleanup(func() {
 		if err := mock.ExpectationsWereMet(); err != nil {
@@ -2426,6 +2377,10 @@ func newWispsAbsentDB(t *testing.T) *wispsAbsentDB {
 
 func (w *wispsAbsentDB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
 	return w.real.QueryRowContext(ctx, query, args...)
+}
+
+func (w *wispsAbsentDB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return w.real.QueryContext(ctx, query, args...)
 }
 
 func TestRunMigrationsStderrOutput(t *testing.T) {
@@ -2444,7 +2399,7 @@ func TestRunMigrationsStderrOutput(t *testing.T) {
 
 	// Bounded below migration 40: migrations 40/41 carry preMigrationRepairs and
 	// CALL DOLT_* bodies that issue real queries via mockDB.QueryRowContext /
-	// QueryContext, and the repairs at 47 and 53 issue real INFORMATION_SCHEMA
+	// QueryContext, and the repairs at 47 and 53 issue real SHOW TABLES/COLUMNS
 	// probes (see TestPreMigrationRepairScopedToMain0047 /
 	// TestPreMigrationRepairScopedToMain0053) — none of which the panic-stub mock
 	// supports. This test only exercises the stderr lines, not the repair or

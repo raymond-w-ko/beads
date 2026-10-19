@@ -2184,7 +2184,11 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 	// >=), so without this guard a writable open would proceed and later queries
 	// would fail with cryptic unknown-column errors instead of a clear
 	// "upgrade bd" message (the stale-binary incident behind #4135/#4137).
-	if err := schema.CheckForwardDrift(ctx, db); err != nil {
+	// It runs under withRetry like every other open-time query: a concurrent
+	// DROP DATABASE elsewhere on the server can fail the probe with a transient
+	// 1105 "no root value found in session". A *SchemaSkewError is not
+	// retryable, so a real skew still surfaces on the first attempt.
+	if err := store.withRetry(ctx, func() error { return schema.CheckForwardDrift(ctx, db) }); err != nil {
 		return nil, err
 	}
 

@@ -234,9 +234,8 @@ func TestPrintGlobalDatabaseConsentHint(t *testing.T) {
 // does not describe.
 func expectRemoteBackedSharedProbe(mock sqlmock.Sqlmock) {
 	for i := 0; i < 2; i++ {
-		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM information_schema\.tables`).
-			WithArgs("schema_migrations").
-			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+		mock.ExpectQuery(`SHOW TABLES LIKE 'schema_migrations'`).
+			WillReturnRows(sqlmock.NewRows([]string{"Tables_in_db"}).AddRow("schema_migrations"))
 		mock.ExpectQuery(`SELECT COALESCE\(MAX\(version\), 0\) FROM schema_migrations`).
 			WillReturnRows(sqlmock.NewRows([]string{"version"}).AddRow(1))
 	}

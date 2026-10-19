@@ -173,9 +173,7 @@ func TestInitSchemaConvergenceProbeRunsWithNoSessionDatabase(t *testing.T) {
 	// migrationWorkNeeded's first question, reached only because the probe put
 	// the session on the database itself. The cursor is far behind this
 	// binary, so there is real work and the fast path declines.
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM information_schema\.tables`).
-		WithArgs("schema_migrations").
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	expectCursorProbe(mock, "schema_migrations", true)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT COALESCE(MAX(version), 0) FROM schema_migrations")).
 		WillReturnRows(sqlmock.NewRows([]string{"version"}).AddRow(1))
 

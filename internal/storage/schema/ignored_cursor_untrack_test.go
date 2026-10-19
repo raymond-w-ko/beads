@@ -89,13 +89,7 @@ func expectIgnoreResolution(mock sqlmock.Sqlmock, qualifier, table string, match
 
 // expectSchemaTableExists mocks the shared be-bv7x existence probe.
 func expectSchemaTableExists(mock sqlmock.Sqlmock, table string, exists bool) {
-	n := 0
-	if exists {
-		n = 1
-	}
-	mock.ExpectQuery(`(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
-		WithArgs(table).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(n))
+	expectTableProbe(mock, table, exists)
 }
 
 // expectCursorCopyColumns mocks the per-column shape read that decides which
@@ -103,13 +97,7 @@ func expectSchemaTableExists(mock sqlmock.Sqlmock, table string, exists bool) {
 // actually has, counting from the front (a pre-#4259 lineage has 2).
 func expectCursorCopyColumns(mock sqlmock.Sqlmock, table string, present int) string {
 	for i, column := range cursorTableColumns {
-		n := 0
-		if i < present {
-			n = 1
-		}
-		mock.ExpectQuery(`(?s)SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS`).
-			WithArgs(table, column).
-			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(n))
+		expectColumnProbe(mock, table, column, i < present)
 	}
 	return strings.Join(cursorTableColumns[:present], ", ")
 }

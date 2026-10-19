@@ -227,7 +227,7 @@ func (p *depPlan) execute(ctx context.Context, db DBConn) (bool, error) {
 func planDependencyTableRekey(ctx context.Context, db DBConn, table string) (*depPlan, error) {
 	// Skip cleanly if the table or its id column isn't present (e.g. an older or
 	// partial schema where the surrogate key was never added): nothing to re-key.
-	hasID, err := columnExists(ctx, db, table, "id")
+	hasID, err := schemaColumnExists(ctx, db, table, "id")
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", table, err)
 	}
@@ -447,16 +447,4 @@ func orderDependencyRekeys(table string, candidates []depRekey, byCurrentID map[
 		}
 	}
 	return ordered, nil
-}
-
-// columnExists reports whether table.column is present in the current schema.
-func columnExists(ctx context.Context, db DBConn, table, column string) (bool, error) {
-	var count int
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
-		 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
-		table, column).Scan(&count); err != nil {
-		return false, err
-	}
-	return count > 0, nil
 }

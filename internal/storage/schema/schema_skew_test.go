@@ -3,6 +3,7 @@ package schema
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -288,5 +289,106 @@ func TestIsSchemaSkewError_OtherError(t *testing.T) {
 	err := errors.New("some unrelated error")
 	if IsSchemaSkewError(err) {
 		t.Error("IsSchemaSkewError(non-SchemaSkewError) = true, want false")
+	}
+}
+
+// queryRecordingConn records every statement sent through it, so a test can
+// prove a statement was NOT sent: sqlmock alone forgets an unexpected query
+// when the caller swallows the error.
+type queryRecordingConn struct {
+	DBConn
+	queries []string
+}
+
+func (c *queryRecordingConn) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	c.queries = append(c.queries, query)
+	return c.DBConn.ExecContext(ctx, query, args...)
+}
+
+func (c *queryRecordingConn) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	c.queries = append(c.queries, query)
+	return c.DBConn.QueryContext(ctx, query, args...)
+}
+
+func (c *queryRecordingConn) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	c.queries = append(c.queries, query)
+	return c.DBConn.QueryRowContext(ctx, query, args...)
+}
+
+// TestCurrentVersionProbesWithShowTables pins the open-time cursor probe to
+// SHOW TABLES LIKE. An INFORMATION_SCHEMA.TABLES scan is not pushed down to
+// the current database on Dolt: it walks every database on the server
+// (seconds on a busy one) and fails with 1105 "no root value found in
+// session" when another session drops a database mid-scan.
+func TestCurrentVersionProbesWithShowTables(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		present bool
+		want    int
+	}{
+		{"cursor table present", true, LatestVersion()},
+		{"cursor table absent", false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock.New: %v", err)
+			}
+			defer db.Close()
+
+			expectCursorProbe(mock, "schema_migrations", tc.present)
+			if tc.present {
+				expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", tc.want)
+			}
+
+			conn := &queryRecordingConn{DBConn: db}
+			got, err := CurrentVersion(context.Background(), conn)
+			if err != nil {
+				t.Fatalf("CurrentVersion: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("CurrentVersion = %d, want %d", got, tc.want)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet expectations: %v", err)
+			}
+			if len(conn.queries) == 0 || !strings.HasPrefix(conn.queries[0], "SHOW TABLES LIKE ") {
+				t.Fatalf("first statement = %q, want a SHOW TABLES LIKE probe", conn.queries)
+			}
+			for _, q := range conn.queries {
+				if strings.Contains(strings.ToLower(q), "information_schema") {
+					t.Fatalf("CurrentVersion issued an information_schema query: %q", q)
+				}
+			}
+		})
+	}
+}
+
+// TestSchemaProbesRejectNonIdentifierNames: the SHOW probes splice the name
+// into the statement text, so anything but [A-Za-z0-9_] is refused before a
+// statement is sent.
+func TestSchemaProbesRejectNonIdentifierNames(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	conn := &queryRecordingConn{DBConn: db}
+	if _, err := schemaTableExists(ctx, conn, "issues' OR '1"); err == nil {
+		t.Error("schemaTableExists accepted a quoted table name")
+	}
+	if _, err := schemaColumnExists(ctx, conn, "issues`", "id"); err == nil {
+		t.Error("schemaColumnExists accepted a backquoted table name")
+	}
+	if _, err := schemaColumnExists(ctx, conn, "issues", "id%"); err == nil {
+		t.Error("schemaColumnExists accepted a LIKE pattern as a column name")
+	}
+	if len(conn.queries) != 0 {
+		t.Fatalf("rejected names still reached the database: %q", conn.queries)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
 	}
 }

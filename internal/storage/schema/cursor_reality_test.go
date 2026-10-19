@@ -11,7 +11,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 )
 
-// stubSentinelTables replaces the INFORMATION_SCHEMA probe with a fixed answer
+// stubSentinelTables replaces the SHOW TABLES probe with a fixed answer
 // for the duration of a test, following the issueRowCounter seam convention in
 // this package. The DBConn is never touched, so these run with no database.
 func stubSentinelTables(t *testing.T, present map[string]bool, probeErr error) *[]string {
@@ -633,8 +633,7 @@ func TestMigrationWorkNeededWhenWispTablesAbsent(t *testing.T) {
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion())
 	expectCursorProbe(mock, "ignored_schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", LatestIgnoredVersion())
-	mock.ExpectQuery(regexp.QuoteMeta("FROM INFORMATION_SCHEMA.TABLES")).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	expectTableProbe(mock, ignoredSource.sentinelTables[0], false)
 
 	needed, err := migrationWorkNeeded(context.Background(), db)
 	if err != nil {
@@ -663,18 +662,16 @@ func TestMigrationWorkNeededWhenLeaseGrantedNodeAbsent(t *testing.T) {
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion())
 	expectCursorProbe(mock, "ignored_schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", LatestIgnoredVersion())
-	for range ignoredSource.sentinelTables {
-		mock.ExpectQuery(regexp.QuoteMeta("FROM INFORMATION_SCHEMA.TABLES")).
-			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	for _, table := range ignoredSource.sentinelTables {
+		expectTableProbe(mock, table, true)
 	}
 	// The floored-table sentinels probe the same way and must all corroborate
 	// too, ahead of the column probe below.
-	for range ignoredSource.sentinelFlooredTables {
-		mock.ExpectQuery(regexp.QuoteMeta("FROM INFORMATION_SCHEMA.TABLES")).
-			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	for _, st := range ignoredSource.sentinelFlooredTables {
+		expectTableProbe(mock, st.table, true)
 	}
-	mock.ExpectQuery(regexp.QuoteMeta("FROM INFORMATION_SCHEMA.COLUMNS")).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	column := ignoredSource.sentinelColumns[0]
+	expectColumnProbe(mock, column.table, column.column, false)
 
 	needed, err := migrationWorkNeeded(context.Background(), db)
 	if err != nil {
@@ -685,6 +682,53 @@ func TestMigrationWorkNeededWhenLeaseGrantedNodeAbsent(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet ordered sentinel probes: %v", err)
+	}
+}
+
+// TestMigrationWorkNeededWhenLeasesTableAbsent is the released-lineage shape
+// (v1.1.x/v1.2.x top the ignored series at 0011, before ignored/0012 creates
+// leases) on the same open-time path. The column sentinel must read the missing
+// table as absent WITHOUT sending SHOW COLUMNS: that statement fails on a
+// missing table, and a failing statement can pin the pooled Dolt session to a
+// stale catalog snapshot (be-bv7x).
+func TestMigrationWorkNeededWhenLeasesTableAbsent(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectCursorProbe(mock, "schema_migrations", true)
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion())
+	expectCursorProbe(mock, "ignored_schema_migrations", true)
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", LatestIgnoredVersion())
+	for _, table := range ignoredSource.sentinelTables {
+		expectTableProbe(mock, table, true)
+	}
+	for _, st := range ignoredSource.sentinelFlooredTables {
+		expectTableProbe(mock, st.table, true)
+	}
+	column := ignoredSource.sentinelColumns[0]
+	if column.table != "leases" {
+		t.Fatalf("first column sentinel is on %q, want leases", column.table)
+	}
+	expectColumnProbeTableAbsent(mock, column.table)
+
+	conn := &queryRecordingConn{DBConn: db}
+	needed, err := migrationWorkNeeded(context.Background(), conn)
+	if err != nil {
+		t.Fatalf("migrationWorkNeeded: %v", err)
+	}
+	if !needed {
+		t.Fatal("migrationWorkNeeded = false with an at-latest cursor and no leases table; ignored 0012/0016 would never replay")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet ordered sentinel probes: %v", err)
+	}
+	for _, q := range conn.queries {
+		if strings.HasPrefix(q, "SHOW COLUMNS") {
+			t.Fatalf("a SHOW COLUMNS probe was sent for a missing table: %q", q)
+		}
 	}
 }
 
@@ -716,8 +760,7 @@ func TestMigrateAppliesUnderContradictedCursor(t *testing.T) {
 	// The guarded read: cursor claims at-latest, sentinel probe contradicts it.
 	expectCursorProbe(mock, "ignored_schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", LatestIgnoredVersion())
-	mock.ExpectQuery(regexp.QuoteMeta("FROM INFORMATION_SCHEMA.TABLES")).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	expectTableProbe(mock, ignoredSource.sentinelTables[0], false)
 
 	// The proof: the applier reaches ignored/0001's SQL. Fail it distinctively
 	// rather than mocking the whole series.
@@ -768,18 +811,16 @@ func TestMigrateStartsAboveTheFloorUnderColumnContradiction(t *testing.T) {
 	// corroborate it, and only the leases column does not.
 	expectCursorProbe(mock, "ignored_schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", LatestIgnoredVersion())
-	for range ignoredSource.sentinelTables {
-		mock.ExpectQuery(regexp.QuoteMeta("FROM INFORMATION_SCHEMA.TABLES")).
-			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	for _, table := range ignoredSource.sentinelTables {
+		expectTableProbe(mock, table, true)
 	}
 	// The floored-table sentinels probe the same way and must all corroborate
 	// too, ahead of the column probe below.
-	for range ignoredSource.sentinelFlooredTables {
-		mock.ExpectQuery(regexp.QuoteMeta("FROM INFORMATION_SCHEMA.TABLES")).
-			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	for _, st := range ignoredSource.sentinelFlooredTables {
+		expectTableProbe(mock, st.table, true)
 	}
-	mock.ExpectQuery(regexp.QuoteMeta("FROM INFORMATION_SCHEMA.COLUMNS")).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	column := ignoredSource.sentinelColumns[0]
+	expectColumnProbe(mock, column.table, column.column, false)
 
 	boom := errors.New("stop here: the applier resumed above the floor")
 	mock.ExpectExec(".*").WillReturnError(boom)

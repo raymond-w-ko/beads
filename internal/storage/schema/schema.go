@@ -1404,20 +1404,19 @@ func (m migrationSource) currentVersion(ctx context.Context, db DBConn) (int, er
 	// pinned to its pre-statement catalog snapshot, so a bare SELECT against a
 	// not-yet-created cursor table poisons the pooled connection: tables
 	// created afterwards on other connections stay invisible to this one for
-	// the rest of its life in the pool (be-bv7x).
-	var cursorExists int
-	if err := db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?",
-		m.cursorTable,
-	).Scan(&cursorExists); err != nil {
+	// the rest of its life in the pool (be-bv7x). SHOW TABLES LIKE returns
+	// zero rows for a missing table, and unlike an INFORMATION_SCHEMA scan it
+	// reads only the current database (see schemaTableExists).
+	cursorExists, err := schemaTableExists(ctx, db, m.cursorTable)
+	if err != nil {
 		return 0, fmt.Errorf("probing %s existence: %w", m.cursorTable, err)
 	}
-	if cursorExists == 0 {
+	if !cursorExists {
 		return 0, nil
 	}
 
 	var current int
-	err := db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM "+m.cursorTable).Scan(&current)
+	err = db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM "+m.cursorTable).Scan(&current)
 	if err != nil && err != sql.ErrNoRows {
 		if dberrors.IsTableNotExist(err) {
 			return 0, nil
@@ -1516,14 +1515,7 @@ func (m migrationSource) cursorRealityFloor(ctx context.Context, db DBConn) (int
 // issueRowCounter is: it lets the cursor-reality tests exercise the real
 // decision without a live database.
 var sentinelTableExists = func(ctx context.Context, db DBConn, table string) (bool, error) {
-	var n int
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
-		 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
-		table).Scan(&n); err != nil {
-		return false, err
-	}
-	return n > 0, nil
+	return schemaTableExists(ctx, db, table)
 }
 
 var sentinelColumnExists = schemaColumnExists

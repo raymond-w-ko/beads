@@ -259,8 +259,7 @@ func TestRekeyAuxRowIDsRunsAllTablesWhenMarkerPending(t *testing.T) {
 // row-read that returns both the pass's in-flight sentinel and the #4380
 // drift record.
 func expectAuxRekeyState(mock sqlmock.Sqlmock, resume bool, drifted ...string) {
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	expectTableProbe(mock, "local_metadata", true)
 	rows := sqlmock.NewRows([]string{"key", "value"})
 	if resume {
 		rows.AddRow(auxRekeyPassInitial.sentinelKey, "1")
@@ -308,8 +307,7 @@ func expectClearAuxRekeySentinel(mock sqlmock.Sqlmock) {
 // (e.g. rekeyAuxRowIDsAllPasses, which runs every pass in auxRekeyPasses off
 // the same shared drift record — see auxRowRekeyDriftedKey).
 func expectAuxRekeyStateForPass(mock sqlmock.Sqlmock, pass auxRekeyPass, resume bool, drifted ...string) {
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	expectTableProbe(mock, "local_metadata", true)
 	rows := sqlmock.NewRows([]string{"key", "value"})
 	if resume {
 		rows.AddRow(pass.sentinelKey, "1")
@@ -424,7 +422,7 @@ func TestRekeyAuxRowIDsKeepsSentinelOnFailure(t *testing.T) {
 	expectAuxRekeyState(mock, false)
 	expectSetAuxRekeySentinel(mock)
 	// First table probe fails; no DELETE of the sentinel may follow.
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS`).
+	mock.ExpectQuery(`SHOW TABLES LIKE '\w+'`).
 		WillReturnError(errors.New("boom"))
 
 	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial); err == nil {

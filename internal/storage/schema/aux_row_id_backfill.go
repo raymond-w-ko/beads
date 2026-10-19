@@ -122,14 +122,11 @@ func (s auxRekeyState) pending() bool { return s.resume || len(s.drifted) > 0 }
 // into the migration commit.
 func readAuxRekeyState(ctx context.Context, db DBConn, sentinelKeys ...string) (auxRekeyState, error) {
 	var state auxRekeyState
-	var tableCount int
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
-		 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'local_metadata'`,
-	).Scan(&tableCount); err != nil {
+	present, err := schemaTableExists(ctx, db, "local_metadata")
+	if err != nil {
 		return state, err
 	}
-	if tableCount == 0 {
+	if !present {
 		return state, nil
 	}
 	placeholders := make([]string, 0, len(sentinelKeys)+1)
@@ -559,7 +556,7 @@ func rekeyAuxRowTable(ctx context.Context, db DBConn, t auxRekeyTable) (bool, er
 	// Skip cleanly if the table or its id column isn't present (older or partial
 	// schema): nothing to re-key. After MigrateUp's main pass the id column is
 	// CHAR(36) on any schema this runs against (0037 precedes the marker).
-	hasID, err := columnExists(ctx, db, t.name, "id")
+	hasID, err := schemaColumnExists(ctx, db, t.name, "id")
 	if err != nil {
 		return false, err
 	}

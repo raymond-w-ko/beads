@@ -405,8 +405,7 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", latestIgnored)
 	expectIgnoredSentinelProbes(mock, true)
 	for range auxRekeyPasses {
-		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
-			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+		expectTableProbe(mock, "local_metadata", false)
 	}
 	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS schema_migrations").
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -418,13 +417,9 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 		// then the local wisp_dependencies table; this mocked world has all
 		// issue columns and no local wisp_dependencies table, so no ALTERs follow.
 		for _, col := range []string{"hook_bead", "role_bead", "agent_state", "last_activity", "role_type", "rig"} {
-			mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS`).
-				WithArgs("issues", col).
-				WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+			expectColumnProbe(mock, "issues", col, true)
 		}
-		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
-			WithArgs("wisp_dependencies").
-			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+		expectTableProbe(mock, "wisp_dependencies", false)
 	}
 	// Per-step commit (#4566) snapshots the working set before the migration
 	// runs so it can force-stage only the tables this step newly dirties.
@@ -463,8 +458,7 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", latestIgnored)
 	expectIgnoredSentinelProbes(mock, true)
 	for range auxRekeyPasses {
-		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
-			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+		expectTableProbe(mock, "local_metadata", false)
 	}
 	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS ignored_schema_migrations").
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -490,15 +484,56 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 		WillReturnRows(sqlmock.NewRows([]string{"hash"}))
 }
 
-// expectColumnExists mocks the INFORMATION_SCHEMA.COLUMNS probe still used by
-// the dependency/aux id-column re-key paths (dep_id_backfill.go).
+// expectColumnExists mocks the id-column probe the dependency/aux re-key
+// paths issue (dep_id_backfill.go, aux_row_id_backfill.go) on whichever table
+// they are re-keying. schemaColumnExists probes the table first: absent is
+// modelled as a missing table (no SHOW COLUMNS follows); present answers the
+// SHOW TABLES probe with every table those paths re-key, since the helper does
+// not know which one is asked, and the exact-name compare picks it out.
 func expectColumnExists(mock sqlmock.Sqlmock, present bool) {
-	n := 0
-	if present {
-		n = 1
+	tables := sqlmock.NewRows([]string{"Tables_in_db"})
+	if !present {
+		mock.ExpectQuery(`SHOW TABLES LIKE '\w+'`).WillReturnRows(tables)
+		return
 	}
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS`).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(n))
+	for _, table := range depRekeyTables {
+		tables.AddRow(table)
+	}
+	for _, t := range auxRekeyTables {
+		tables.AddRow(t.name)
+	}
+	mock.ExpectQuery(`SHOW TABLES LIKE '\w+'`).WillReturnRows(tables)
+	mock.ExpectQuery("SHOW COLUMNS FROM `\\w+` LIKE 'id'").WillReturnRows(showColumnsRows("id"))
+}
+
+// expectTableProbe mocks the SHOW TABLES LIKE existence probe schemaTableExists
+// issues: one row naming the table when it exists, none when it does not.
+func expectTableProbe(mock sqlmock.Sqlmock, table string, exists bool) {
+	rows := sqlmock.NewRows([]string{"Tables_in_db"})
+	if exists {
+		rows.AddRow(table)
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("SHOW TABLES LIKE '" + table + "'")).WillReturnRows(rows)
+}
+
+// expectColumnProbe mocks the two statements schemaColumnExists issues for
+// table.column on an existing table: the SHOW TABLES probe, then SHOW COLUMNS.
+// exists says whether the column is there; for a missing table use
+// expectColumnProbeTableAbsent.
+func expectColumnProbe(mock sqlmock.Sqlmock, table, column string, exists bool) {
+	expectTableProbe(mock, table, true)
+	rows := showColumnsRows()
+	if exists {
+		rows = showColumnsRows(column)
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("SHOW COLUMNS FROM `" + table + "` LIKE '" + column + "'")).WillReturnRows(rows)
+}
+
+// expectColumnProbeTableAbsent mocks schemaColumnExists on a missing table:
+// the SHOW TABLES probe finds nothing and no SHOW COLUMNS, which would fail,
+// is sent.
+func expectColumnProbeTableAbsent(mock sqlmock.Sqlmock, table string) {
+	expectTableProbe(mock, table, false)
 }
 
 // expectContentHashColumnExists mocks the idempotent ensureContentHashColumn
@@ -515,18 +550,12 @@ func expectScalar(mock sqlmock.Sqlmock, query, column string, value any) {
 		WillReturnRows(sqlmock.NewRows([]string{column}).AddRow(value))
 }
 
-// expectCursorProbe mocks the information_schema existence probe that
+// expectCursorProbe mocks the SHOW TABLES existence probe that
 // migrationSource.currentVersion issues before it ever reads the cursor
 // table. The probe was added by be-bv7x so a not-yet-created cursor table
 // never poisons the pooled Dolt session with a failing statement.
 func expectCursorProbe(mock sqlmock.Sqlmock, table string, exists bool) {
-	present := 0
-	if exists {
-		present = 1
-	}
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM information_schema\.tables`).
-		WithArgs(table).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(present))
+	expectTableProbe(mock, table, exists)
 }
 
 func expectDoltStatusRows(mock sqlmock.Sqlmock) {
@@ -579,8 +608,7 @@ func expectDirtyGuardRefusal(t *testing.T, mock sqlmock.Sqlmock) {
 	// dirtyBefore and still trips the pending-0062 guard below.
 	expectCursorProbe(mock, "ignored_schema_migrations", false)
 	for range auxRekeyPasses {
-		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
-			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+		expectTableProbe(mock, "local_metadata", false)
 	}
 	// pendingMigrationDirtyTables: cursor read, then pending 0062's SQL
 	// touches `events` -> DirtyTablesError.
@@ -710,27 +738,20 @@ func TestMigrateUpWithLockFreshBootstrapHealResetsAndRetries(t *testing.T) {
 	}
 }
 
-// expectIgnoredSentinelProbes mocks the INFORMATION_SCHEMA lookups
+// expectIgnoredSentinelProbes mocks the SHOW TABLES / SHOW COLUMNS lookups
 // currentVersion issues to confirm a non-zero ignored cursor against the
 // schema it claims (gh 5033). They fire only for a non-zero cursor, in
 // ignoredSource's table then floored-table then column sentinel order.
 func expectIgnoredSentinelProbes(mock sqlmock.Sqlmock, present bool) {
-	count := 0
-	if present {
-		count = 1
-	}
-	for range ignoredSource.sentinelTables {
-		mock.ExpectQuery(regexp.QuoteMeta("FROM INFORMATION_SCHEMA.TABLES")).
-			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(count))
+	for _, table := range ignoredSource.sentinelTables {
+		expectTableProbe(mock, table, present)
 	}
 	if present {
-		for range ignoredSource.sentinelFlooredTables {
-			mock.ExpectQuery(regexp.QuoteMeta("FROM INFORMATION_SCHEMA.TABLES")).
-				WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+		for _, st := range ignoredSource.sentinelFlooredTables {
+			expectTableProbe(mock, st.table, true)
 		}
-		for range ignoredSource.sentinelColumns {
-			mock.ExpectQuery(regexp.QuoteMeta("FROM INFORMATION_SCHEMA.COLUMNS")).
-				WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+		for _, column := range ignoredSource.sentinelColumns {
+			expectColumnProbe(mock, column.table, column.column, true)
 		}
 	}
 }
