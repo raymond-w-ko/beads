@@ -24,7 +24,8 @@ Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator select
 | 9d6725a8d | `relation` field on bd show --json dependency rows | issue #7632 open; PR draft bd-bglro waits for the answer |
 | ac1f166a1 (Bazel half) | test-bd launcher in tools/bazel/test_env.sh | addition to #7575 or a follow-up PR |
 | da73d6e70 / dependency_cycle_chain_test.go | deep-chain cycle test | optional test-only PR, not approved |
-| (this batch, bead bd-6857j) | SHOW TABLES/COLUMNS probes instead of INFORMATION_SCHEMA; retried open-time drift check (Dolt 1105 under concurrent DROP DATABASE) | candidate upstream PR; operator selects |
+| 7fc83d768 | SHOW TABLES/COLUMNS probes instead of INFORMATION_SCHEMA; retried open-time drift check (Dolt 1105 under concurrent DROP DATABASE) | candidate upstream PR; operator selects |
+| (this batch, bead bd-1g73c) | Comment wording for the two-statement column probe; UPSTREAM.md hash for 7fc83d768 | fork-only (docs) |
 
 ## Already upstream
 

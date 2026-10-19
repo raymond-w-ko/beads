@@ -296,10 +296,12 @@ type schemaSentinelColumn struct {
 	//        — just without the timestamp damage.
 	//   (ii) The migration that creates the column AND the migration that
 	//        creates the table carrying it must both be ABOVE the floor, so the
-	//        replay can still heal both shapes the single INFORMATION_SCHEMA
-	//        COUNT(*) probe collapses: table absent entirely, and table present
-	//        but column-less. A floor above the table's creator would strand
-	//        the table-absent shape in a permanent re-migration loop.
+	//        replay can still heal both shapes the column probe collapses
+	//        (schemaColumnExists: SHOW TABLES LIKE, then SHOW COLUMNS ... LIKE
+	//        only when the table exists): table absent entirely, and table
+	//        present but column-less, both read as absent. A floor above the
+	//        table's creator would strand the table-absent shape in a permanent
+	//        re-migration loop.
 	//
 	// TestSentinelColumnsAreCreatedByTheSeries pins the floor to those two
 	// files, so a future renumbering breaks CI rather than users.
@@ -346,9 +348,10 @@ var (
 		// A historical ignored-v16 ordinal collision can leave the local
 		// leases table present but without the column frozen 0016 adds; a
 		// database materialized out of band can be missing the leases table
-		// altogether. The single COLUMNS probe reads both shapes as absent and
-		// the replay heals both: 0012 re-creates the table, 0016 adds the
-		// column.
+		// altogether. The column probe (schemaColumnExists: SHOW TABLES LIKE,
+		// then SHOW COLUMNS ... LIKE only when the table exists) reads both
+		// shapes as absent and the replay heals both: 0012 re-creates the
+		// table, 0016 adds the column.
 		//
 		// The floor of 11 is what keeps that heal from also being a data loss.
 		// Every released tree (v1.1.0, v1.1.2, v1.2.x) tops the ignored series
