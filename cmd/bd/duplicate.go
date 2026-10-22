@@ -1,11 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -206,13 +208,36 @@ func runSupersede(cmd *cobra.Command, args []string) error {
 				kept = append(kept, row.IssueID)
 				continue
 			}
-			// An identical existing edge is an idempotent re-add, not an error.
-			if err := tx.AddDependency(ctx, &types.Dependency{
-				IssueID:     row.IssueID,
-				DependsOnID: newID,
-				Type:        types.DepBlocks,
-			}, actor); err != nil {
-				return fmt.Errorf("failed to move blocks edge %s -> %s to %s: %w", row.IssueID, oldID, newID, err)
+			// An existing blocks edge to new already does the job; re-adding it
+			// would overwrite its metadata.
+			existing, err := tx.GetDependencyRecords(ctx, row.IssueID)
+			if err != nil {
+				return fmt.Errorf("failed to read dependencies of %s: %w", row.IssueID, err)
+			}
+			hasBlocks := false
+			for _, d := range existing {
+				if d.DependsOnID == newID && d.Type == types.DepBlocks {
+					hasBlocks = true
+					break
+				}
+			}
+			if !hasBlocks {
+				err := tx.AddDependency(ctx, &types.Dependency{
+					IssueID:     row.IssueID,
+					DependsOnID: newID,
+					Type:        types.DepBlocks,
+					Metadata:    row.Metadata,
+				}, actor)
+				// A different edge type to new (relates-to, waits-for, ...)
+				// cannot become blocks: leave the edge on old.
+				var conflict *domain.DependencyTypeConflictError
+				if errors.As(err, &conflict) {
+					kept = append(kept, row.IssueID)
+					continue
+				}
+				if err != nil {
+					return fmt.Errorf("failed to move blocks edge %s -> %s to %s: %w", row.IssueID, oldID, newID, err)
+				}
 			}
 			if err := tx.RemoveDependency(ctx, row.IssueID, oldID, actor); err != nil {
 				return fmt.Errorf("failed to remove blocks edge %s -> %s: %w", row.IssueID, oldID, err)
@@ -259,7 +284,7 @@ func runSupersede(cmd *cobra.Command, args []string) error {
 	if len(moved) > 0 {
 		fmt.Printf("  moved %d blocks edge(s) to %s\n", len(moved), newID)
 	}
-	if keepBlockers && len(kept) > 0 {
+	if len(kept) > 0 {
 		fmt.Printf("  kept %d blocks edge(s) on %s\n", len(kept), oldID)
 	}
 	return nil

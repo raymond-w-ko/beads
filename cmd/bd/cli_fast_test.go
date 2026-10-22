@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -19,6 +20,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/types"
 )
 
 // Fast CLI tests converted from scripttest suite
@@ -1210,6 +1213,161 @@ func TestCLI_Supersede_MovesBlockers(t *testing.T) {
 		}
 		if _, ok := result["kept_blockers"]; ok {
 			t.Errorf("kept_blockers must be absent when empty, got %v", result["kept_blockers"])
+		}
+	})
+
+	// withStore opens dir's database directly, through the CLI's own store
+	// factory, for edge metadata that no bd flag sets or shows.
+	withStore := func(t *testing.T, dir string, fn func(ctx context.Context, s storage.DoltStorage)) {
+		t.Helper()
+		ctx := context.Background()
+		s, err := newDoltStoreFromConfig(ctx, filepath.Join(dir, ".beads"))
+		if err != nil {
+			t.Fatalf("open store: %v", err)
+		}
+		defer s.Close()
+		fn(ctx, s)
+	}
+	addEdgeWithMetadata := func(t *testing.T, dir, from, to, metadata string) {
+		t.Helper()
+		withStore(t, dir, func(ctx context.Context, s storage.DoltStorage) {
+			dep := &types.Dependency{IssueID: from, DependsOnID: to, Type: types.DepBlocks, Metadata: metadata}
+			if err := s.AddDependency(ctx, dep, "test"); err != nil {
+				t.Fatalf("add %s -> %s: %v", from, to, err)
+			}
+		})
+	}
+	// edgeMetadata returns the decoded metadata of the from -> to edge.
+	edgeMetadata := func(t *testing.T, dir, from, to string) interface{} {
+		t.Helper()
+		var got interface{}
+		withStore(t, dir, func(ctx context.Context, s storage.DoltStorage) {
+			deps, err := s.GetDependencyRecords(ctx, from)
+			if err != nil {
+				t.Fatalf("read deps of %s: %v", from, err)
+			}
+			for _, d := range deps {
+				if d.DependsOnID == to {
+					if err := json.Unmarshal([]byte(d.Metadata), &got); err != nil {
+						t.Fatalf("decode metadata %q of %s -> %s: %v", d.Metadata, from, to, err)
+					}
+					return
+				}
+			}
+			t.Fatalf("no edge %s -> %s in %v", from, to, deps)
+		})
+		return got
+	}
+	decode := func(t *testing.T, raw string) interface{} {
+		t.Helper()
+		var v interface{}
+		if err := json.Unmarshal([]byte(raw), &v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+
+	t.Run("conflicting edge to replacement keeps blocker", func(t *testing.T) {
+		tmpDir := setupCLITestDB(t)
+		oldID := create(t, tmpDir, "Old work")
+		newID := create(t, tmpDir, "New work")
+		a := create(t, tmpDir, "Waits on work")
+		runBDInProcess(t, tmpDir, "dep", "add", a, oldID)
+		runBDInProcess(t, tmpDir, "dep", "add", a, newID, "--type", "relates-to")
+
+		out := runBDInProcess(t, tmpDir, "supersede", oldID, "--with", newID, "--json")
+		var result map[string]interface{}
+		if err := json.Unmarshal([]byte(out), &result); err != nil {
+			t.Fatalf("parse supersede output: %v\n%s", err, out)
+		}
+		if result["status"] != "closed" {
+			t.Errorf("expected %s closed, got %v", oldID, result["status"])
+		}
+		kept, _ := result["kept_blockers"].([]interface{})
+		if len(kept) != 1 || kept[0] != a {
+			t.Errorf("expected kept_blockers [%s], got %v", a, result["kept_blockers"])
+		}
+		if moved, _ := result["moved_blockers"].([]interface{}); len(moved) != 0 {
+			t.Errorf("expected no moved blockers, got %v", result["moved_blockers"])
+		}
+
+		deps := depsOf(t, tmpDir, a)
+		if deps[oldID] != "blocks" {
+			t.Errorf("expected %s to stay blocked by %s, got deps %v", a, oldID, deps)
+		}
+		if deps[newID] != "relates-to" {
+			t.Errorf("expected %s -> %s to stay relates-to, got deps %v", a, newID, deps)
+		}
+	})
+
+	t.Run("moved edge keeps its metadata", func(t *testing.T) {
+		tmpDir := setupCLITestDB(t)
+		oldID := create(t, tmpDir, "Old work")
+		newID := create(t, tmpDir, "New work")
+		a := create(t, tmpDir, "Waits on work")
+		addEdgeWithMetadata(t, tmpDir, a, oldID, `{"why":"needs the spec"}`)
+
+		runBDInProcess(t, tmpDir, "supersede", oldID, "--with", newID)
+
+		if got, want := edgeMetadata(t, tmpDir, a, newID), decode(t, `{"why":"needs the spec"}`); !reflect.DeepEqual(got, want) {
+			t.Errorf("metadata of %s -> %s = %v, want %v", a, newID, got, want)
+		}
+		if _, ok := depsOf(t, tmpDir, a)[oldID]; ok {
+			t.Errorf("expected %s to no longer depend on %s", a, oldID)
+		}
+	})
+
+	t.Run("existing blocks edge to replacement keeps its metadata", func(t *testing.T) {
+		tmpDir := setupCLITestDB(t)
+		oldID := create(t, tmpDir, "Old work")
+		newID := create(t, tmpDir, "New work")
+		a := create(t, tmpDir, "Waits on work")
+		addEdgeWithMetadata(t, tmpDir, a, oldID, `{"src":"old"}`)
+		addEdgeWithMetadata(t, tmpDir, a, newID, `{"src":"new"}`)
+
+		out := runBDInProcess(t, tmpDir, "supersede", oldID, "--with", newID, "--json")
+		var result map[string]interface{}
+		if err := json.Unmarshal([]byte(out), &result); err != nil {
+			t.Fatalf("parse supersede output: %v\n%s", err, out)
+		}
+		if moved, _ := result["moved_blockers"].([]interface{}); len(moved) != 1 || moved[0] != a {
+			t.Errorf("expected moved_blockers [%s], got %v", a, result["moved_blockers"])
+		}
+
+		if got, want := edgeMetadata(t, tmpDir, a, newID), decode(t, `{"src":"new"}`); !reflect.DeepEqual(got, want) {
+			t.Errorf("metadata of %s -> %s = %v, want %v", a, newID, got, want)
+		}
+		if _, ok := depsOf(t, tmpDir, a)[oldID]; ok {
+			t.Errorf("expected %s to no longer depend on %s", a, oldID)
+		}
+	})
+
+	t.Run("cycle through replacement rolls back", func(t *testing.T) {
+		tmpDir := setupCLITestDB(t)
+		oldID := create(t, tmpDir, "Old work")
+		newID := create(t, tmpDir, "New work")
+		a := create(t, tmpDir, "Waits on work")
+		runBDInProcess(t, tmpDir, "dep", "add", newID, a)
+		runBDInProcess(t, tmpDir, "dep", "add", a, oldID)
+
+		if _, _, err := runBDInProcessAllowError(t, tmpDir, "supersede", oldID, "--with", newID); err == nil {
+			t.Fatalf("expected supersede to fail on the cycle %s -> %s -> %s", a, newID, a)
+		}
+
+		out := runBDInProcess(t, tmpDir, "show", oldID, "--json")
+		var shown []map[string]interface{}
+		if err := json.Unmarshal([]byte(out), &shown); err != nil || len(shown) == 0 {
+			t.Fatalf("parse show output: %v\n%s", err, out)
+		}
+		if shown[0]["status"] != "open" {
+			t.Errorf("expected %s to stay open, got %v", oldID, shown[0]["status"])
+		}
+		deps := depsOf(t, tmpDir, a)
+		if deps[oldID] != "blocks" {
+			t.Errorf("expected %s -> %s intact, got deps %v", a, oldID, deps)
+		}
+		if _, ok := deps[newID]; ok {
+			t.Errorf("expected no edge %s -> %s after rollback, got deps %v", a, newID, deps)
 		}
 	})
 }
