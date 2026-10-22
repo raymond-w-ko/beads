@@ -877,6 +877,158 @@ func TestCLI_Show_SupersedesIsNotABlocker(t *testing.T) {
 	}
 }
 
+// TestCLI_Supersede_MovesBlockers covers bd supersede moving each inbound
+// blocks edge of the superseded issue to its replacement, so issues that
+// waited on the old issue keep waiting on the new one (bd-r41db).
+func TestCLI_Supersede_MovesBlockers(t *testing.T) {
+	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
+
+	// keepBlockers is a package-level flag variable that survives across
+	// in-process rootCmd.Execute() calls; reset it so each run sees the default.
+	keepFlag := supersedeCmd.Flags().Lookup("keep-blockers")
+	resetKeep := func() {
+		_ = keepFlag.Value.Set("false")
+		keepFlag.Changed = false
+	}
+	resetKeep()
+	t.Cleanup(resetKeep)
+
+	create := func(t *testing.T, dir, title string) string {
+		t.Helper()
+		out := runBDInProcess(t, dir, "create", title, "-p", "1", "--json")
+		var issue map[string]interface{}
+		if err := json.Unmarshal([]byte(out), &issue); err != nil {
+			t.Fatalf("parse create output: %v\n%s", err, out)
+		}
+		return issue["id"].(string)
+	}
+	// depsOf returns issue id -> dependency type for id's outbound edges.
+	depsOf := func(t *testing.T, dir, id string) map[string]string {
+		t.Helper()
+		out := runBDInProcess(t, dir, "show", id, "--json")
+		var shown []map[string]interface{}
+		if err := json.Unmarshal([]byte(out), &shown); err != nil || len(shown) == 0 {
+			t.Fatalf("parse show output: %v\n%s", err, out)
+		}
+		deps := map[string]string{}
+		raw, _ := shown[0]["dependencies"].([]interface{})
+		for _, d := range raw {
+			m := d.(map[string]interface{})
+			deps[m["id"].(string)], _ = m["dependency_type"].(string)
+		}
+		return deps
+	}
+	isReady := func(t *testing.T, dir, id string) bool {
+		t.Helper()
+		out := runBDInProcess(t, dir, "ready", "--json")
+		var ready []map[string]interface{}
+		if err := json.Unmarshal([]byte(out), &ready); err != nil {
+			t.Fatalf("parse ready output: %v\n%s", err, out)
+		}
+		for _, issue := range ready {
+			if issue["id"] == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("moves blocks edge to replacement", func(t *testing.T) {
+		tmpDir := setupCLITestDB(t)
+		oldID := create(t, tmpDir, "Old work")
+		newID := create(t, tmpDir, "New work")
+		a := create(t, tmpDir, "Waits on work")
+		runBDInProcess(t, tmpDir, "dep", "add", a, oldID)
+
+		out := runBDInProcess(t, tmpDir, "supersede", oldID, "--with", newID)
+		if !strings.Contains(out, "moved 1 blocks edge(s) to "+newID) {
+			t.Errorf("expected moved line in output, got: %s", out)
+		}
+
+		deps := depsOf(t, tmpDir, a)
+		if deps[newID] != "blocks" {
+			t.Errorf("expected %s to depend on %s with type blocks, got deps %v", a, newID, deps)
+		}
+		if _, ok := deps[oldID]; ok {
+			t.Errorf("expected %s to no longer depend on %s, got deps %v", a, oldID, deps)
+		}
+		if isReady(t, tmpDir, a) {
+			t.Errorf("%s must not be ready while %s is open", a, newID)
+		}
+	})
+
+	t.Run("keep-blockers leaves edge on superseded issue", func(t *testing.T) {
+		t.Cleanup(resetKeep)
+		tmpDir := setupCLITestDB(t)
+		oldID := create(t, tmpDir, "Old work")
+		newID := create(t, tmpDir, "New work")
+		a := create(t, tmpDir, "Waits on work")
+		runBDInProcess(t, tmpDir, "dep", "add", a, oldID)
+
+		out := runBDInProcess(t, tmpDir, "supersede", oldID, "--with", newID, "--keep-blockers")
+		if !strings.Contains(out, "kept 1 blocks edge(s) on "+oldID) {
+			t.Errorf("expected kept line in output, got: %s", out)
+		}
+		resetKeep()
+
+		deps := depsOf(t, tmpDir, a)
+		if deps[oldID] != "blocks" {
+			t.Errorf("expected %s to still depend on %s with type blocks, got deps %v", a, oldID, deps)
+		}
+		if _, ok := deps[newID]; ok {
+			t.Errorf("expected no edge %s -> %s under --keep-blockers, got deps %v", a, newID, deps)
+		}
+		if !isReady(t, tmpDir, a) {
+			t.Errorf("%s should be ready once %s is closed", a, oldID)
+		}
+	})
+
+	t.Run("replacement blocked by superseded issue keeps its edge", func(t *testing.T) {
+		tmpDir := setupCLITestDB(t)
+		oldID := create(t, tmpDir, "Old work")
+		newID := create(t, tmpDir, "New work")
+		runBDInProcess(t, tmpDir, "dep", "add", newID, oldID)
+
+		out := runBDInProcess(t, tmpDir, "supersede", oldID, "--with", newID, "--json")
+		var result map[string]interface{}
+		if err := json.Unmarshal([]byte(out), &result); err != nil {
+			t.Fatalf("parse supersede output: %v\n%s", err, out)
+		}
+		if moved, _ := result["moved_blockers"].([]interface{}); len(moved) != 0 {
+			t.Errorf("expected no moved blockers, got %v", result["moved_blockers"])
+		}
+
+		deps := depsOf(t, tmpDir, newID)
+		if _, ok := deps[newID]; ok {
+			t.Errorf("replacement must not depend on itself, got deps %v", deps)
+		}
+		if deps[oldID] != "blocks" {
+			t.Errorf("expected %s to keep its blocks edge on %s, got deps %v", newID, oldID, deps)
+		}
+	})
+
+	t.Run("json reports moved blockers", func(t *testing.T) {
+		tmpDir := setupCLITestDB(t)
+		oldID := create(t, tmpDir, "Old work")
+		newID := create(t, tmpDir, "New work")
+		a := create(t, tmpDir, "Waits on work")
+		runBDInProcess(t, tmpDir, "dep", "add", a, oldID)
+
+		out := runBDInProcess(t, tmpDir, "supersede", oldID, "--with", newID, "--json")
+		var result map[string]interface{}
+		if err := json.Unmarshal([]byte(out), &result); err != nil {
+			t.Fatalf("parse supersede output: %v\n%s", err, out)
+		}
+		moved, ok := result["moved_blockers"].([]interface{})
+		if !ok || len(moved) != 1 || moved[0] != a {
+			t.Errorf("expected moved_blockers [%s], got %v", a, result["moved_blockers"])
+		}
+		if _, ok := result["kept_blockers"]; ok {
+			t.Errorf("kept_blockers must be absent when empty, got %v", result["kept_blockers"])
+		}
+	})
+}
+
 func TestCLI_DepRemove(t *testing.T) {
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)

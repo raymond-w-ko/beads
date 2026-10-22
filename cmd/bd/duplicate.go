@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/metrics"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -34,6 +35,10 @@ var supersedeCmd = &cobra.Command{
 The superseded issue is automatically closed with a reference to the replacement.
 Useful for design docs, specs, and evolving artifacts.
 
+Issues blocked by the superseded issue now block on the replacement: each
+inbound blocks edge moves to the replacement, so they wait for it instead.
+Use --keep-blockers to leave those edges on the superseded issue.
+
 Examples:
   bd supersede bd-old --with bd-new    # Mark bd-old as superseded by bd-new`,
 	Args: cobra.ExactArgs(1),
@@ -43,7 +48,12 @@ Examples:
 var (
 	duplicateOf    string
 	supersededWith string
+	keepBlockers   bool
 )
+
+// supersedeBlockerPageSize bounds each page of inbound blocks edges read
+// while moving them to the replacement.
+const supersedeBlockerPageSize = 500
 
 func init() {
 	duplicateCmd.Flags().StringVar(&duplicateOf, "of", "", "Canonical issue ID (required)")
@@ -53,6 +63,7 @@ func init() {
 
 	supersedeCmd.Flags().StringVar(&supersededWith, "with", "", "Replacement issue ID (required)")
 	_ = supersedeCmd.MarkFlagRequired("with") // Only fails if flag missing (caught in tests)
+	supersedeCmd.Flags().BoolVar(&keepBlockers, "keep-blockers", false, "Leave issues blocked by the superseded issue blocked on it instead of the replacement")
 	supersedeCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(supersedeCmd)
 }
@@ -167,32 +178,89 @@ func runSupersede(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("replacement issue not found: %s", newID)
 	}
 
-	// Add a "supersedes" dependency edge (old → new)
-	dep := &types.Dependency{
-		IssueID:     oldID,
-		DependsOnID: newID,
-		Type:        types.DepSupersedes,
-	}
-	if err := store.AddDependency(ctx, dep, actor); err != nil {
-		return fmt.Errorf("failed to add supersede link: %w", err)
-	}
+	// Move each inbound blocks edge of old to new, then add the "supersedes"
+	// edge (old → new) and close old, all in one transaction so a failure
+	// (e.g. a cycle through new) leaves old open with its edges untouched.
+	moved := []string{}
+	var kept []string
+	commitMsg := fmt.Sprintf("bd supersede: %s -> %s", oldID, newID)
+	err = store.RunInTransaction(ctx, commitMsg, func(tx storage.Transaction) error {
+		// Read every page before writing, so removals cannot shift the keyset.
+		var blockers []*types.Dependency
+		afterID := ""
+		for {
+			page, err := tx.GetDependentRecords(ctx, oldID, string(types.DepBlocks), supersedeBlockerPageSize, afterID)
+			if err != nil {
+				return fmt.Errorf("failed to read issues blocked by %s: %w", oldID, err)
+			}
+			blockers = append(blockers, page...)
+			if len(page) < supersedeBlockerPageSize {
+				break
+			}
+			afterID = page[len(page)-1].ID
+		}
 
-	// Close the superseded issue through the lifecycle operation so it records
-	// the complete closure state.
-	if err := store.CloseIssue(ctx, oldID, "", actor, ""); err != nil {
-		return fmt.Errorf("failed to close superseded issue: %w", err)
+		for _, row := range blockers {
+			// Moving new's own edge would make new depend on itself.
+			if keepBlockers || row.IssueID == newID {
+				kept = append(kept, row.IssueID)
+				continue
+			}
+			// An identical existing edge is an idempotent re-add, not an error.
+			if err := tx.AddDependency(ctx, &types.Dependency{
+				IssueID:     row.IssueID,
+				DependsOnID: newID,
+				Type:        types.DepBlocks,
+			}, actor); err != nil {
+				return fmt.Errorf("failed to move blocks edge %s -> %s to %s: %w", row.IssueID, oldID, newID, err)
+			}
+			if err := tx.RemoveDependency(ctx, row.IssueID, oldID, actor); err != nil {
+				return fmt.Errorf("failed to remove blocks edge %s -> %s: %w", row.IssueID, oldID, err)
+			}
+			moved = append(moved, row.IssueID)
+		}
+
+		dep := &types.Dependency{
+			IssueID:     oldID,
+			DependsOnID: newID,
+			Type:        types.DepSupersedes,
+		}
+		if err := tx.AddDependency(ctx, dep, actor); err != nil {
+			return fmt.Errorf("failed to add supersede link: %w", err)
+		}
+
+		// Close the superseded issue through the lifecycle operation so it
+		// records the complete closure state.
+		if err := tx.CloseIssue(ctx, oldID, "", actor, ""); err != nil {
+			return fmt.Errorf("failed to close superseded issue: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	commandDidWrite.Store(true)
 
 	if isJSONOutput() {
-		return outputJSON(map[string]interface{}{
-			"superseded":  oldID,
-			"replacement": newID,
-			"status":      "closed",
-		})
+		result := map[string]interface{}{
+			"superseded":     oldID,
+			"replacement":    newID,
+			"status":         "closed",
+			"moved_blockers": moved,
+		}
+		if len(kept) > 0 {
+			result["kept_blockers"] = kept
+		}
+		return outputJSON(result)
 	}
 
 	fmt.Printf("%s Marked %s as superseded by %s (closed)\n", ui.RenderPass("✓"), oldID, newID)
+	if len(moved) > 0 {
+		fmt.Printf("  moved %d blocks edge(s) to %s\n", len(moved), newID)
+	}
+	if keepBlockers && len(kept) > 0 {
+		fmt.Printf("  kept %d blocks edge(s) on %s\n", len(kept), oldID)
+	}
 	return nil
 }
