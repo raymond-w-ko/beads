@@ -1,6 +1,6 @@
 # Upstream
 
-This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-22 at fork main 94af39eca, upstream/main 882317770.
+This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-22 at fork main f19bcec8f, upstream/main 882317770.
 
 ## Posted
 
@@ -15,7 +15,7 @@ This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `r
 | Issue | [#7632](https://github.com/gastownhall/beads/issues/7632) | bd show --json: say the direction of a dependency edge in words (relation beside dependency_type) | 9d6725a8d (described only) | - | issue open, auto-triaged (gascityinc-sarah); no maintainer reply |
 | Issue | [#7634](https://github.com/gastownhall/beads/issues/7634) | Embedded mode: bd ready wakes expired defers and commits while MIGRATION-FREEZE is set | - (fork-only gap, not fixed) | - | issue open, auto-triaged (gascityinc-sarah); no maintainer reply |
 
-Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator selection), bd-8irlo (this status), bd-hpall (PR C), bd-zzheg (this update), bd-ag0kx, bd-ke5hc, bd-yxtwb, bd-0efhc (PR #7645 fix round), bd-ppay0, bd-mo505, bd-a4g6y (PR #7645 test isolation), bd-e0w55, bd-asr18, bd-s3rkm, bd-r41db, bd-9mhx2 (supersede blockers move).
+Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator selection), bd-8irlo (this status), bd-hpall (PR C), bd-zzheg (this update), bd-ag0kx, bd-ke5hc, bd-yxtwb, bd-0efhc (PR #7645 fix round), bd-ppay0, bd-mo505, bd-a4g6y (PR #7645 test isolation), bd-e0w55, bd-asr18, bd-s3rkm, bd-r41db, bd-9mhx2 (supersede blockers move), bd-1005b, bd-s2cx8 (in-process CLI harness reset).
 
 ## Not posted yet
 
@@ -35,6 +35,7 @@ Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator select
 | 7ac4628bb, da73d6e70 | ba12ffa74 (#7224) |
 | 5d08ebcce (except the freeze check) | 9d646fc88 (#6424) |
 | merge 1a26e3afe and its 35 release commits | tag v1.3.1 |
+| f19bcec8f | ebe3b6bcb (#7185): upstream's `installExecuteIsolation` and `resetCommandFlags` fix the same in-process CLI runner leaks (BEADS_DIR left set, cobra flag state kept between runs); the fork's smaller harness patch is interim and the next upstream merge replaces it |
 
 ## Fork-only
 
