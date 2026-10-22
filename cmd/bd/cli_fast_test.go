@@ -9,11 +9,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // Fast CLI tests converted from scripttest suite
@@ -141,6 +146,88 @@ func createTempDirWithCleanup(t *testing.T) string {
 	return tmpDir
 }
 
+// restoreEnvAfter snapshots the process environment and returns a func that
+// puts it back. The root PersistentPreRunE binds the discovered workspace with
+// os.Setenv("BEADS_DIR", ...) (prepareSelectedCommandContext) and may load
+// .beads/.env; without a restore the next in-process command, in another test's
+// directory, resolves the first test's (since deleted) .beads and fails with
+// "no beads database found".
+func restoreEnvAfter() func() {
+	before := map[string]string{}
+	for _, kv := range os.Environ() {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			before[k] = v
+		}
+	}
+	return func() {
+		for _, kv := range os.Environ() {
+			if k, _, ok := strings.Cut(kv, "="); ok {
+				if _, had := before[k]; !had {
+					_ = os.Unsetenv(k)
+				}
+			}
+		}
+		for k, v := range before {
+			if cur, ok := os.LookupEnv(k); !ok || cur != v {
+				_ = os.Setenv(k, v)
+			}
+		}
+	}
+}
+
+// resetAllCommandFlags puts every flag of every command back to its declared
+// default and clears Changed. Cobra keeps parsed values between in-process
+// rootCmd.Execute() calls, so a flag one command set (--ephemeral, --notes,
+// --title, --set-labels) is still set, and Changed, for the next command.
+// Slice flags are emptied via Replace: Set would append to the old value.
+// Each FlagSet also forgets which flags were set (clearFlagVisitHistory).
+func resetAllCommandFlags(cmd *cobra.Command) {
+	reset := func(f *pflag.Flag) {
+		// Custom Values whose Set appends (close --reason) or refuses a
+		// second call (worktree remove --force/--merged-into) are not reset
+		// by Set(DefValue); their defaults are the zero value, so zero them.
+		switch v := f.Value.(type) {
+		case *closeReasonFlagValue:
+			v.values = nil
+		case *singleWorktreeStringFlag:
+			v.value, v.set = "", false
+		case *singleWorktreeBoolFlag:
+			v.value, v.set = false, false
+		case pflag.SliceValue:
+			_ = v.Replace(nil)
+		default:
+			_ = f.Value.Set(f.DefValue)
+		}
+		f.Changed = false
+	}
+	cmd.Flags().VisitAll(reset)
+	cmd.PersistentFlags().VisitAll(reset)
+	clearFlagVisitHistory(cmd.Flags())
+	clearFlagVisitHistory(cmd.PersistentFlags())
+	for _, sub := range cmd.Commands() {
+		resetAllCommandFlags(sub)
+	}
+}
+
+// clearFlagVisitHistory empties fs's record of the flags set by earlier
+// parses. FlagSet.Visit walks that record (the unexported actual,
+// orderedActual and sortedActual fields), not Flag.Changed, so without this a
+// flag from the previous in-process run still shows up in Visit, e.g. in
+// commandPolicyArgSet, and can pick the wrong proxy capability row.
+// pflag has no public way to clear it while keeping the registered flags
+// (cobra's ResetFlags swaps in new, empty FlagSets), hence reflect and unsafe.
+// Written against github.com/spf13/pflag v1.0.10; panics if those fields move.
+func clearFlagVisitHistory(fs *pflag.FlagSet) {
+	v := reflect.ValueOf(fs).Elem()
+	for _, name := range []string{"actual", "orderedActual", "sortedActual"} {
+		field := v.FieldByName(name)
+		if !field.IsValid() {
+			panic("pflag.FlagSet has no field " + name + "; update clearFlagVisitHistory")
+		}
+		reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().Set(reflect.Zero(field.Type()))
+	}
+}
+
 // runBDInProcess runs bd commands in-process by calling rootCmd.Execute
 // This is ~10-20x faster than exec.Command because it avoids process spawn overhead
 func runBDInProcess(t *testing.T, dir string, args ...string) string {
@@ -171,6 +258,10 @@ func runBDInProcess(t *testing.T, dir string, args ...string) string {
 		os.Stdout = oldStdout
 		os.Stderr = oldStderr
 	}()
+
+	// Undo env the command sets (BEADS_DIR binding, .beads/.env)
+	defer restoreEnvAfter()()
+	resetAllCommandFlags(rootCmd)
 
 	// Set args for rootCmd
 	rootCmd.SetArgs(args)
@@ -217,6 +308,50 @@ func runBDInProcess(t *testing.T, dir string, args ...string) string {
 
 	// Return only stdout (stderr contains warnings that break JSON parsing)
 	return stdout
+}
+
+// TestHarnessResetClearsFlagVisitHistory checks that resetAllCommandFlags
+// leaves no trace of a previous invocation's flags: not in values, not in
+// Changed, and not in FlagSet.Visit, which the proxy capability policy reads
+// (review bd-424e8 of bd-1005b). Needs no database.
+func TestHarnessResetClearsFlagVisitHistory(t *testing.T) {
+	inProcessMutex.Lock()
+	defer inProcessMutex.Unlock()
+	resetAllCommandFlags(rootCmd)
+	t.Cleanup(func() { resetAllCommandFlags(rootCmd) })
+
+	if err := duplicatesCmd.ParseFlags([]string{"--auto-merge", "--dry-run"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := commandPolicyArgSet(duplicatesCmd); got != "--auto-merge --dry-run" {
+		t.Fatalf("preview invocation arg set = %q, want %q", got, "--auto-merge --dry-run")
+	}
+
+	resetAllCommandFlags(rootCmd)
+	if err := duplicatesCmd.ParseFlags([]string{"--auto-merge"}); err != nil {
+		t.Fatal(err)
+	}
+
+	dryRun := duplicatesCmd.Flags().Lookup("dry-run")
+	if dryRun.Value.String() != "false" || dryRun.Changed {
+		t.Errorf("--dry-run after reset: value=%s Changed=%v, want false/false", dryRun.Value, dryRun.Changed)
+	}
+	autoMerge := duplicatesCmd.Flags().Lookup("auto-merge")
+	if autoMerge.Value.String() != "true" || !autoMerge.Changed {
+		t.Errorf("--auto-merge: value=%s Changed=%v, want true/true", autoMerge.Value, autoMerge.Changed)
+	}
+	var visited []string
+	duplicatesCmd.Flags().Visit(func(f *pflag.Flag) { visited = append(visited, f.Name) })
+	if len(visited) != 1 || visited[0] != "auto-merge" {
+		t.Errorf("Visit after reset = %v, want [auto-merge]", visited)
+	}
+	if got := commandPolicyArgSet(duplicatesCmd); got != "--auto-merge" {
+		t.Errorf("previous --dry-run survives reset in policy arg set: %q", got)
+	}
+	row, ok := capabilityRowFor(duplicatesCmd)
+	if !ok || row.Rule.Outcome != ProxyOutcomeRefused {
+		t.Errorf("real merge must be classified as refused after preview, got ok=%v %+v", ok, row.Rule)
+	}
 }
 
 func TestCLI_Ready(t *testing.T) {
@@ -776,6 +911,56 @@ func TestCLI_Close(t *testing.T) {
 	}
 	if closed[0]["close_reason"] != "Done" {
 		t.Errorf("Expected close_reason 'Done', got: %v", closed[0]["close_reason"])
+	}
+}
+
+// TestHarnessResetClearsCustomFlagValues checks that resetAllCommandFlags
+// resets custom flag Values that Set(DefValue) cannot: close --reason appends
+// on every Set, worktree remove --force/--merged-into refuse a second Set.
+func TestHarnessResetClearsCustomFlagValues(t *testing.T) {
+	tmpDir := setupCLITestDB(t)
+	var ids []string
+	for _, title := range []string{"First", "Second", "Third"} {
+		out := runBDInProcess(t, tmpDir, "create", title, "-p", "1", "--json")
+		var issue map[string]interface{}
+		if err := json.Unmarshal([]byte(out), &issue); err != nil {
+			t.Fatalf("create %s: %v\n%s", title, err, out)
+		}
+		ids = append(ids, issue["id"].(string))
+	}
+
+	runBDInProcess(t, tmpDir, "close", ids[0], "--reason", "Done")
+	runBDInProcess(t, tmpDir, "close", ids[1], "--reason", "Other")
+	runBDInProcess(t, tmpDir, "close", ids[2])
+
+	for i, want := range []string{"Done", "Other", "Closed"} {
+		out := runBDInProcess(t, tmpDir, "show", ids[i], "--json")
+		var shown []map[string]interface{}
+		if err := json.Unmarshal([]byte(out), &shown); err != nil {
+			t.Fatalf("show %s: %v\n%s", ids[i], err, out)
+		}
+		if got := shown[0]["close_reason"]; got != want {
+			t.Errorf("close_reason of %s = %v, want %q", ids[i], got, want)
+		}
+	}
+
+	inProcessMutex.Lock()
+	defer inProcessMutex.Unlock()
+	resetAllCommandFlags(rootCmd)
+	t.Cleanup(func() { resetAllCommandFlags(rootCmd) })
+	args := []string{"--force", "--merged-into", "main"}
+	for run := 1; run <= 2; run++ {
+		resetAllCommandFlags(rootCmd)
+		if err := worktreeRemoveCmd.ParseFlags(args); err != nil {
+			t.Fatalf("worktree remove %v, run %d: %v", args, run, err)
+		}
+	}
+	resetAllCommandFlags(rootCmd)
+	if force := worktreeRemoveCmd.Flags().Lookup("force"); force.Value.String() != "false" {
+		t.Errorf("--force after reset = %s, want false", force.Value)
+	}
+	if mergedInto := worktreeRemoveCmd.Flags().Lookup("merged-into"); mergedInto.Value.String() != "" {
+		t.Errorf("--merged-into after reset = %q, want empty", mergedInto.Value)
 	}
 }
 
@@ -1375,6 +1560,9 @@ func runBDInProcessAllowError(t *testing.T, dir string, args ...string) (string,
 		os.Stdout = oldStdout
 		os.Stderr = oldStderr
 	}()
+
+	defer restoreEnvAfter()()
+	resetAllCommandFlags(rootCmd)
 
 	rootCmd.SetArgs(args)
 	os.Args = append([]string{"bd"}, args...)
