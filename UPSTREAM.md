@@ -1,6 +1,6 @@
 # Upstream
 
-This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-22 at fork main 33184bffc, upstream/main 882317770.
+This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-23 at fork main 69709b0d5, upstream/main 882317770.
 
 ## Posted
 
@@ -15,7 +15,7 @@ This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `r
 | Issue | [#7632](https://github.com/gastownhall/beads/issues/7632) | bd show --json: say the direction of a dependency edge in words (relation beside dependency_type) | 9d6725a8d (described only) | - | issue open, auto-triaged (gascityinc-sarah); no maintainer reply |
 | Issue | [#7634](https://github.com/gastownhall/beads/issues/7634) | Embedded mode: bd ready wakes expired defers and commits while MIGRATION-FREEZE is set | - (fork-only gap, not fixed) | - | issue open, auto-triaged (gascityinc-sarah); no maintainer reply |
 
-Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator selection), bd-8irlo (this status), bd-hpall (PR C), bd-zzheg (this update), bd-ag0kx, bd-ke5hc, bd-yxtwb, bd-0efhc (PR #7645 fix round), bd-ppay0, bd-mo505, bd-a4g6y (PR #7645 test isolation), bd-e0w55, bd-asr18, bd-s3rkm, bd-r41db, bd-9mhx2 (supersede blockers move), bd-1005b, bd-s2cx8 (in-process CLI harness reset), bd-hj2hy, bd-bs9rk (supersede conflicting blockers).
+Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator selection), bd-8irlo (this status), bd-hpall (PR C), bd-zzheg (this update), bd-ag0kx, bd-ke5hc, bd-yxtwb, bd-0efhc (PR #7645 fix round), bd-ppay0, bd-mo505, bd-a4g6y (PR #7645 test isolation), bd-e0w55, bd-asr18, bd-s3rkm, bd-r41db, bd-9mhx2 (supersede blockers move), bd-1005b, bd-s2cx8 (in-process CLI harness reset), bd-hj2hy, bd-bs9rk (supersede conflicting blockers), bd-eepnt, bd-mlr3s (conflicting blocker before cycle check), bd-lj1oq, bd-1pocx (stale in-process CLI tests).
 
 ## Not posted yet
 
@@ -26,7 +26,7 @@ Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator select
 | da73d6e70 / dependency_cycle_chain_test.go | deep-chain cycle test | optional test-only PR, not approved |
 | 7fc83d768 | SHOW TABLES/COLUMNS probes instead of INFORMATION_SCHEMA; retried open-time drift check (Dolt 1105 under concurrent DROP DATABASE) | candidate upstream PR; operator selects |
 | 1a7b0e7f8 | Comment wording for the two-statement column probe; UPSTREAM.md hash for 7fc83d768 | fork-only (docs) |
-| 94af39eca, 33184bffc | `bd supersede` moves inbound `blocks` edges to the replacement in one transaction; `--keep-blockers` opts out; JSON `moved_blockers`/`kept_blockers` (asked by everturn, mail bd-wisp-sy63f); 33184bffc keeps a blocker whose edge to the replacement has another type and carries edge metadata on the move | candidate upstream PR; operator selects |
+| 94af39eca, 33184bffc, 9d08d1e9d | `bd supersede` moves inbound `blocks` edges to the replacement in one transaction; `--keep-blockers` opts out; JSON `moved_blockers`/`kept_blockers` (asked by everturn, mail bd-wisp-sy63f); 33184bffc keeps a blocker whose edge to the replacement has another type and carries edge metadata on the move; 9d08d1e9d keeps such a blocker before the cycle check and says so in the help | candidate upstream PR; operator selects |
 
 ## Already upstream
 
@@ -36,6 +36,7 @@ Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator select
 | 5d08ebcce (except the freeze check) | 9d646fc88 (#6424) |
 | merge 1a26e3afe and its 35 release commits | tag v1.3.1 |
 | f19bcec8f | ebe3b6bcb (#7185): upstream's `installExecuteIsolation` and `resetCommandFlags` fix the same in-process CLI runner leaks (BEADS_DIR left set, cobra flag state kept between runs); the fork's smaller harness patch is interim and the next upstream merge replaces it |
+| 69709b0d5 | ebe3b6bcb (#7185): the removed `DryRunWithRigPrefix` subtest and the `--` before flag-like create titles are upstream's hunks; the one-second wait before the `--age 0s` wisp GC call is fork-only until the DATETIME rounding race is fixed upstream |
 
 ## Fork-only
 
