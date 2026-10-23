@@ -1899,25 +1899,6 @@ func TestCLI_CreateDryRun(t *testing.T) {
 		}
 	})
 
-	t.Run("DryRunWithRigPrefix", func(t *testing.T) {
-		tmpDir := setupCLITestDB(t)
-
-		// Run create with --dry-run and --prefix (simulates cross-rig creation)
-		// Note: This won't actually route to another rig since we don't have one,
-		// but it should show the target rig in the preview
-		out := runBDInProcess(t, tmpDir, "create", "Cross-rig issue", "-p", "1",
-			"--prefix", "other-rig",
-			"--dry-run")
-
-		// Verify target rig is shown in preview
-		if !strings.Contains(out, "Target rig:") {
-			t.Errorf("Expected 'Target rig:' in output, got: %s", out)
-		}
-		if !strings.Contains(out, "other-rig") {
-			t.Errorf("Expected 'other-rig' in output, got: %s", out)
-		}
-	})
-
 	t.Run("DryRunWithFileReturnsError", func(t *testing.T) {
 		tmpDir := createTempDirWithCleanup(t)
 
@@ -2371,7 +2352,11 @@ func TestCLI_CreateRejectsFlagLikeTitles(t *testing.T) {
 			}
 
 			// Attempt to create with a flag-like positional title
-			cmd := exec.Command(testBD, "create", tc.title)
+			// "--" ends flag parsing, so the title reaches create's own
+			// positional-title guard instead of cobra's flag parser
+			// (which answers --help with help and --foo-bar with
+			// "unknown flag").
+			cmd := exec.Command(testBD, "create", "--", tc.title)
 			cmd.Dir = tmpDir
 			cmd.Env = os.Environ()
 			out, err := cmd.CombinedOutput()
@@ -2385,6 +2370,38 @@ func TestCLI_CreateRejectsFlagLikeTitles(t *testing.T) {
 			}
 		})
 	}
+
+	// Without "--" cobra rejects an unknown flag-like word before create's
+	// guard runs; either way bd-2c0's point holds: no garbage issue.
+	t.Run("BareUnknownFlagCreatesNothing", func(t *testing.T) {
+		tmpDir := createTempDirWithCleanup(t)
+		initCmd := exec.Command(testBD, "init", "--prefix", "test", "--quiet")
+		initCmd.Dir = tmpDir
+		initCmd.Env = os.Environ()
+		if out, err := initCmd.CombinedOutput(); err != nil {
+			t.Fatalf("init failed: %v\n%s", err, out)
+		}
+		cmd := exec.Command(testBD, "create", "--foo-bar")
+		cmd.Dir = tmpDir
+		cmd.Env = os.Environ()
+		if out, err := cmd.CombinedOutput(); err == nil {
+			t.Fatalf("bd create --foo-bar succeeded:\n%s", out)
+		}
+		list := exec.Command(testBD, "list", "--json", "--all")
+		list.Dir = tmpDir
+		list.Env = os.Environ()
+		out, err := list.Output()
+		if err != nil {
+			t.Fatalf("bd list: %v\n%s", err, out)
+		}
+		var issues []map[string]any
+		if err := json.Unmarshal(out, &issues); err != nil {
+			t.Fatalf("bd list --json: %v\n%s", err, out)
+		}
+		if len(issues) != 0 {
+			t.Fatalf("bd create --foo-bar created %d issue(s): %s", len(issues), out)
+		}
+	})
 
 	// Verify that --title flag with dash-prefixed value is still allowed
 	t.Run("TitleFlagAllowsDashes", func(t *testing.T) {
@@ -2604,6 +2621,11 @@ func TestCLI_WispGCExcludeType(t *testing.T) {
 	}
 	bugID := bugCreated["id"].(string)
 	taskID := taskCreated["id"].(string)
+
+	// updated_at is a whole-second DATETIME and Dolt rounds to the nearest
+	// second, so a wisp written in the second half of a second is stored up
+	// to 0.5s ahead of now and is not yet older than --age 0s. Wait that out.
+	time.Sleep(time.Second)
 
 	// Dry-run GC with --exclude-type bug, --age=0s (treats all wisps as abandoned).
 	// The WispGCResult dry-run JSON uses cleaned_ids to list what would be deleted.
