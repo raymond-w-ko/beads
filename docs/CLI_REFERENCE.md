@@ -2094,6 +2094,9 @@ Useful for design docs, specs, and evolving artifacts.
 Issues blocked by the superseded issue now block on the replacement: each
 inbound blocks edge moves to the replacement, so they wait for it instead.
 Use --keep-blockers to leave those edges on the superseded issue.
+A blocker that already has an edge of another non-hierarchy type to the
+replacement keeps its edge on the superseded issue and is listed in
+kept_blockers, as is the replacement's own edge.
 
 Examples:
   bd supersede bd-old --with bd-new    # Mark bd-old as superseded by bd-new

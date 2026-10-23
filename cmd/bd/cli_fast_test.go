@@ -1300,6 +1300,39 @@ func TestCLI_Supersede_MovesBlockers(t *testing.T) {
 		}
 	})
 
+	t.Run("conflicting edge to replacement keeps blocker before cycle check", func(t *testing.T) {
+		tmpDir := setupCLITestDB(t)
+		oldID := create(t, tmpDir, "Old work")
+		newID := create(t, tmpDir, "New work")
+		a := create(t, tmpDir, "Waits on work")
+		runBDInProcess(t, tmpDir, "dep", "add", a, oldID)
+		runBDInProcess(t, tmpDir, "dep", "add", a, newID, "--type", "relates-to")
+		// a -> new as blocks would close a cycle; it is never created, so the
+		// cycle must not abort the supersede.
+		runBDInProcess(t, tmpDir, "dep", "add", newID, a)
+
+		out := runBDInProcess(t, tmpDir, "supersede", oldID, "--with", newID, "--json")
+		var result map[string]interface{}
+		if err := json.Unmarshal([]byte(out), &result); err != nil {
+			t.Fatalf("parse supersede output: %v\n%s", err, out)
+		}
+		if result["status"] != "closed" {
+			t.Errorf("expected %s closed, got %v", oldID, result["status"])
+		}
+		kept, _ := result["kept_blockers"].([]interface{})
+		if len(kept) != 1 || kept[0] != a {
+			t.Errorf("expected kept_blockers [%s], got %v", a, result["kept_blockers"])
+		}
+
+		deps := depsOf(t, tmpDir, a)
+		if deps[oldID] != "blocks" {
+			t.Errorf("expected %s to stay blocked by %s, got deps %v", a, oldID, deps)
+		}
+		if deps[newID] != "relates-to" {
+			t.Errorf("expected %s -> %s to stay relates-to, got deps %v", a, newID, deps)
+		}
+	})
+
 	t.Run("moved edge keeps its metadata", func(t *testing.T) {
 		tmpDir := setupCLITestDB(t)
 		oldID := create(t, tmpDir, "Old work")

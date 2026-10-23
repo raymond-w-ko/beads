@@ -40,6 +40,9 @@ Useful for design docs, specs, and evolving artifacts.
 Issues blocked by the superseded issue now block on the replacement: each
 inbound blocks edge moves to the replacement, so they wait for it instead.
 Use --keep-blockers to leave those edges on the superseded issue.
+A blocker that already has an edge of another non-hierarchy type to the
+replacement keeps its edge on the superseded issue and is listed in
+kept_blockers, as is the replacement's own edge.
 
 Examples:
   bd supersede bd-old --with bd-new    # Mark bd-old as superseded by bd-new`,
@@ -214,22 +217,30 @@ func runSupersede(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return fmt.Errorf("failed to read dependencies of %s: %w", row.IssueID, err)
 			}
-			hasBlocks := false
+			var existingType types.DependencyType
 			for _, d := range existing {
-				if d.DependsOnID == newID && d.Type == types.DepBlocks {
-					hasBlocks = true
+				if d.DependsOnID == newID {
+					existingType = d.Type
 					break
 				}
 			}
-			if !hasBlocks {
+			// A different edge type to new (relates-to, waits-for, ...) cannot
+			// become blocks: leave the edge on old. Decide here rather than on
+			// AddDependency's type conflict, which its cycle check would
+			// preempt. Parent-child still goes to AddDependency, whose
+			// hierarchy check refuses it like a cycle.
+			if existingType != "" && existingType != types.DepBlocks && existingType != types.DepParentChild {
+				kept = append(kept, row.IssueID)
+				continue
+			}
+			if existingType != types.DepBlocks {
 				err := tx.AddDependency(ctx, &types.Dependency{
 					IssueID:     row.IssueID,
 					DependsOnID: newID,
 					Type:        types.DepBlocks,
 					Metadata:    row.Metadata,
 				}, actor)
-				// A different edge type to new (relates-to, waits-for, ...)
-				// cannot become blocks: leave the edge on old.
+				// Fallback for a conflicting edge the read above did not see.
 				var conflict *domain.DependencyTypeConflictError
 				if errors.As(err, &conflict) {
 					kept = append(kept, row.IssueID)
