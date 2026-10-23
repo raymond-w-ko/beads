@@ -1,6 +1,6 @@
 # Upstream
 
-This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-22 at fork main f19bcec8f, upstream/main 882317770.
+This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-22 at fork main 33184bffc, upstream/main 882317770.
 
 ## Posted
 
@@ -15,7 +15,7 @@ This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `r
 | Issue | [#7632](https://github.com/gastownhall/beads/issues/7632) | bd show --json: say the direction of a dependency edge in words (relation beside dependency_type) | 9d6725a8d (described only) | - | issue open, auto-triaged (gascityinc-sarah); no maintainer reply |
 | Issue | [#7634](https://github.com/gastownhall/beads/issues/7634) | Embedded mode: bd ready wakes expired defers and commits while MIGRATION-FREEZE is set | - (fork-only gap, not fixed) | - | issue open, auto-triaged (gascityinc-sarah); no maintainer reply |
 
-Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator selection), bd-8irlo (this status), bd-hpall (PR C), bd-zzheg (this update), bd-ag0kx, bd-ke5hc, bd-yxtwb, bd-0efhc (PR #7645 fix round), bd-ppay0, bd-mo505, bd-a4g6y (PR #7645 test isolation), bd-e0w55, bd-asr18, bd-s3rkm, bd-r41db, bd-9mhx2 (supersede blockers move), bd-1005b, bd-s2cx8 (in-process CLI harness reset).
+Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator selection), bd-8irlo (this status), bd-hpall (PR C), bd-zzheg (this update), bd-ag0kx, bd-ke5hc, bd-yxtwb, bd-0efhc (PR #7645 fix round), bd-ppay0, bd-mo505, bd-a4g6y (PR #7645 test isolation), bd-e0w55, bd-asr18, bd-s3rkm, bd-r41db, bd-9mhx2 (supersede blockers move), bd-1005b, bd-s2cx8 (in-process CLI harness reset), bd-hj2hy, bd-bs9rk (supersede conflicting blockers).
 
 ## Not posted yet
 
@@ -26,7 +26,7 @@ Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator select
 | da73d6e70 / dependency_cycle_chain_test.go | deep-chain cycle test | optional test-only PR, not approved |
 | 7fc83d768 | SHOW TABLES/COLUMNS probes instead of INFORMATION_SCHEMA; retried open-time drift check (Dolt 1105 under concurrent DROP DATABASE) | candidate upstream PR; operator selects |
 | 1a7b0e7f8 | Comment wording for the two-statement column probe; UPSTREAM.md hash for 7fc83d768 | fork-only (docs) |
-| 94af39eca | `bd supersede` moves inbound `blocks` edges to the replacement in one transaction; `--keep-blockers` opts out; JSON `moved_blockers`/`kept_blockers` (asked by everturn, mail bd-wisp-sy63f) | candidate upstream PR; operator selects |
+| 94af39eca, 33184bffc | `bd supersede` moves inbound `blocks` edges to the replacement in one transaction; `--keep-blockers` opts out; JSON `moved_blockers`/`kept_blockers` (asked by everturn, mail bd-wisp-sy63f); 33184bffc keeps a blocker whose edge to the replacement has another type and carries edge metadata on the move | candidate upstream PR; operator selects |
 
 ## Already upstream
 
