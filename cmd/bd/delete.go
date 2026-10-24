@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -46,7 +47,34 @@ Cascade: Recursively delete all dependents
   bd delete bd-1 --cascade --force
 
 Force: Delete and orphan dependents
-  bd delete bd-1 --force`,
+  bd delete bd-1 --force
+
+GUARDED DELETION OF ARCHIVED THREADS (--if-threads):
+  bd delete --force --from-file ids.txt --if-threads guard.json
+
+The guard file is JSON:
+  {"cutoff": "<RFC3339>", "member_label": "...", "exclude_label": "...",
+   "edge": "replies-to",
+   "threads": [{"root": "<id>",
+                "members": [{"id": "...", "revision": "<sha256>"}]}]}
+
+Each revision is the "revision" field 'bd image' printed when the thread was
+archived. Inside the deleting transaction, before any row changes, every
+listed thread must still be exactly what was archived:
+  membership   the beads joined to root by edge dependencies (either
+               direction, skipping beads labelled exclude_label) are exactly
+               the listed members
+  revision     every member's current image revision is the listed one
+  eligibility  every member carries member_label, is a wisp, is closed, and
+               closed before cutoff
+  coverage     every requested id carrying member_label is a listed member
+If any check fails nothing is deleted and bd exits 13 (the guard-mismatch
+exit code 'bd update --if-assignee' uses), naming each failed thread and
+check on stderr. With --json the last stderr line is
+  {"error": "...", "failed_threads": [{"root": "...", "check": "...",
+   "ids": ["..."]}], "guard_mismatch": true}
+--if-threads requires --force and refuses --cascade (exit 1). With --dry-run
+the same guard runs in the preview's read and exits 13 the same way.`,
 	Args:          cobra.MinimumNArgs(0),
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -68,6 +96,11 @@ Force: Delete and orphan dependents
 		force, _ := cmd.Flags().GetBool("force")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		cascade, _ := cmd.Flags().GetBool("cascade")
+		guardPath, _ := cmd.Flags().GetString("if-threads")
+		guard, err := loadDeleteThreadGuard(guardPath, cmd.Flags().Changed("if-threads"), force, cascade)
+		if err != nil {
+			return HandleError("%v", err)
+		}
 		issueIDs := make([]string, 0, len(args))
 		issueIDs = append(issueIDs, args...)
 		if fromFile != "" {
@@ -89,8 +122,11 @@ Force: Delete and orphan dependents
 			}
 		}
 
-		if len(issueIDs) > 1 || cascade {
-			if err := deleteBatch(cmd, issueIDs, force, dryRun, cascade, jsonOutput, false); err != nil {
+		// A guarded delete always takes the batch path: the guard is a property
+		// of the request, and the batch path is the one that hands the role
+		// whatever the request carries.
+		if len(issueIDs) > 1 || cascade || guard != nil {
+			if err := deleteBatchGuarded(issueIDs, force, dryRun, cascade, jsonOutput, guard); err != nil {
 				if _, ok := exitCodeFromError(err); ok {
 					return err
 				}
@@ -276,6 +312,14 @@ func deleteIssue(ctx context.Context, issueID string) error {
 //
 //nolint:unparam // cmd parameter required for potential future use
 func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, cascade bool, jsonOutput bool, _ bool, _ ...string) error {
+	return deleteBatchGuarded(issueIDs, force, dryRun, cascade, jsonOutput, nil)
+}
+
+// deleteBatchGuarded is deleteBatch with `bd delete --if-threads`'s thread
+// guard, which the role checks inside the deleting (or, under --dry-run,
+// previewing) transaction. A guard refusal is reported by
+// reportThreadGuardMismatch and exits ExitGuardMismatch, preview or not.
+func deleteBatchGuarded(issueIDs []string, force bool, dryRun bool, cascade bool, jsonOutput bool, guard *issueops.ThreadGuard) error {
 	if store == nil {
 		if err := ensureStoreActive(); err != nil {
 			return err
@@ -322,17 +366,21 @@ func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, c
 	// --force is the confirmation as well as the orphan mode, so an unconfirmed
 	// run asks the role what it WOULD do; see the single-id path.
 	request := issueops.DeleteRequest{
-		Actor:   actor,
-		IDs:     resolvedIDs,
-		Cascade: cascade,
-		Force:   force,
-		DryRun:  dryRun || !force,
+		Actor:       actor,
+		IDs:         resolvedIDs,
+		Cascade:     cascade,
+		Force:       force,
+		DryRun:      dryRun || !force,
+		ThreadGuard: guard,
 	}
 	opsCtx, err := issueOpsContext(ctx)
 	if err != nil {
 		return HandleError("%v", err)
 	}
 	result, err := deleter.Delete(opsCtx, request)
+	if mismatch := threadGuardMismatch(err); mismatch != nil {
+		return reportThreadGuardMismatch(mismatch)
+	}
 	if request.DryRun {
 		if err != nil {
 			if previewErr := outputDeletionPreview(resolvedIDs, issues, cascade, dryRun, nil, err, jsonOutput); previewErr != nil {
@@ -459,6 +507,46 @@ func outputDeletionPreview(issueIDs []string, issues map[string]*types.Issue, ca
 	return nil
 }
 
+// loadDeleteThreadGuard reads `bd delete --if-threads`'s guard file, the JSON
+// form of issueops.ThreadGuard, after the flag rules every route shares: the
+// guard needs --force (it guards a deletion, and --force is this command's
+// confirmation) and refuses --cascade (a cascade deletes beads the file does
+// not list). Unknown keys are refused, so a misspelt field cannot silently
+// drop a check. What the guard says is the role's to validate.
+//
+// given is whether the flag was on the command line at all, and it is what
+// decides "no guard", never the path: an ABSENT flag is an ordinary delete,
+// and a PRESENT flag with an empty path is refused. A purge that runs
+// `--if-threads "$guard_file"` with the variable unset asked for a guarded
+// delete, and reading its empty path as no guard would hand it an unguarded
+// forced one.
+func loadDeleteThreadGuard(path string, given, force, cascade bool) (*issueops.ThreadGuard, error) {
+	if !given {
+		return nil, nil
+	}
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("--if-threads needs a guard file path; an empty path would delete unguarded")
+	}
+	if !force {
+		return nil, fmt.Errorf("--if-threads requires --force")
+	}
+	if cascade {
+		return nil, fmt.Errorf("--if-threads cannot be combined with --cascade: a cascade deletes beads the guard file does not list")
+	}
+	// #nosec G304 - user-provided file path is intentional
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading --if-threads file: %w", err)
+	}
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec.DisallowUnknownFields()
+	var guard issueops.ThreadGuard
+	if err := dec.Decode(&guard); err != nil {
+		return nil, fmt.Errorf("parsing --if-threads file %s: %w", path, err)
+	}
+	return &guard, nil
+}
+
 // readIssueIDsFromFile reads issue IDs from a file (one per line)
 func readIssueIDsFromFile(filename string) ([]string, error) {
 	// #nosec G304 - user-provided file path is intentional
@@ -501,6 +589,7 @@ func init() {
 	deleteCmd.Flags().String("from-file", "", "Read issue IDs from file (one per line)")
 	deleteCmd.Flags().Bool("dry-run", false, "Preview what would be deleted without making changes")
 	deleteCmd.Flags().Bool("cascade", false, "Recursively delete all dependent issues")
+	deleteCmd.Flags().String("if-threads", "", "Delete only if the archived threads in this JSON guard file are unchanged (exit 13 otherwise; requires --force)")
 	deleteCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(deleteCmd)
 }

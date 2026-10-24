@@ -22,6 +22,8 @@ type deleteInput struct {
 	dryRun     bool
 	jsonOutput bool
 	quiet      bool
+	// threadGuard is --if-threads's guard, or nil (see loadDeleteThreadGuard).
+	threadGuard *issueops.ThreadGuard
 }
 
 func gatherDeleteInput(cmd *cobra.Command, args []string) (*deleteInput, error) {
@@ -44,6 +46,12 @@ func gatherDeleteInput(cmd *cobra.Command, args []string) (*deleteInput, error) 
 	in.cascade, _ = cmd.Flags().GetBool("cascade")
 	in.force, _ = cmd.Flags().GetBool("force")
 	in.dryRun, _ = cmd.Flags().GetBool("dry-run")
+	guardPath, _ := cmd.Flags().GetString("if-threads")
+	guard, err := loadDeleteThreadGuard(guardPath, cmd.Flags().Changed("if-threads"), in.force, in.cascade)
+	if err != nil {
+		return nil, err
+	}
+	in.threadGuard = guard
 	in.jsonOutput = jsonOutput
 	in.quiet = isQuiet()
 	return in, nil
@@ -84,13 +92,18 @@ func runDeleteProxiedServer(cmd *cobra.Command, ctx context.Context, args []stri
 	// --force is the confirmation as well as the orphan mode, exactly as on the
 	// direct route, so an unconfirmed run asks the role what it WOULD do.
 	request := issueops.DeleteRequest{
-		Actor:   actor,
-		IDs:     in.ids,
-		Cascade: in.cascade,
-		Force:   in.force,
-		DryRun:  in.dryRun || !in.force,
+		Actor:       actor,
+		IDs:         in.ids,
+		Cascade:     in.cascade,
+		Force:       in.force,
+		DryRun:      in.dryRun || !in.force,
+		ThreadGuard: in.threadGuard,
 	}
 	result, err := deleter.Delete(ctx, request)
+	// A thread-guard refusal reads the same on every route, preview or not.
+	if mismatch := threadGuardMismatch(err); mismatch != nil {
+		return reportThreadGuardMismatch(mismatch)
+	}
 	// THE GUARD REFUSAL IS NOT A BARE ERROR HERE. Classic renders the preview
 	// and THEN the refusal, which is what tells the caller both what would go
 	// and how to proceed; returning early would print the second half only.
