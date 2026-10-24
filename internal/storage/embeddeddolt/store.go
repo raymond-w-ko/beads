@@ -321,6 +321,11 @@ func (s *EmbeddedDoltStore) recheckBlockedAfterCommit(ctx context.Context, pendi
 	return nil
 }
 
+// openTxSQL is how commitConn opens the engine for one transaction. It is
+// OpenSQL; it is a variable only so a test can count the transactions a store
+// begins (export_test.go), which nothing above this seam can observe.
+var openTxSQL = OpenSQL
+
 // commitConn is withConn's transaction: it hands back the dependents the
 // transaction's unblocking writes recorded once it has committed.
 func (s *EmbeddedDoltStore) commitConn(ctx context.Context, commit bool, fn func(tx *sql.Tx) error) (pending issueops.BlockedRecheck, err error) {
@@ -335,7 +340,7 @@ func (s *EmbeddedDoltStore) commitConn(ctx context.Context, commit bool, fn func
 
 	var db *sql.DB
 	var cleanup func() error
-	db, cleanup, err = OpenSQL(ctx, s.dataDir, s.database, s.branch)
+	db, cleanup, err = openTxSQL(ctx, s.dataDir, s.database, s.branch)
 	if err != nil {
 		return
 	}
