@@ -31,6 +31,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   goes silent for 30 s (a client that froze mid-write) is reclaimed, so it
   cannot block the other writers until the server's idle cut.
 
+## [1.3.2-dev.1] - 2026-10-24
+
+Fork pre-release above [1.3.1] and below upstream's 1.3.2, stamped so a caller
+can tell a build carrying the changes below from 1.3.1 by `bd version`. No
+schema migration: upgrading from 1.3.1 is a binary swap.
+
+### Added
+
+- **`bd image <id>... [--from-file ids.txt]`** (fork 7ce887f61) prints one
+  compact JSON line per bead: every stored row that belongs to it — its row,
+  labels, comments, events and dependencies in both directions — raw and read
+  in one transaction, with `revision`, the sha256 hex of the canonical image.
+  The revision changes on any write to the bead, so an archive can check later
+  that a bead is unchanged. If any id names no bead, nothing is printed and the
+  command exits 1 naming every missing id.
+- **`bd delete --force --from-file <ids> --if-threads <guard.json>`** (fork
+  aa13b66ee) deletes only if every archived mail thread in the guard file is
+  unchanged: its membership over the guard's edge type, each member's image
+  revision, each member's eligibility (member label, ephemeral, closed before
+  the cutoff), and coverage of every member-labelled id in the request.
+  Otherwise nothing changes and it exits 13; under `--json` the last stderr
+  line is a JSON report with `"guard_mismatch": true` and `failed_threads`. It
+  needs `--force` and refuses `--cascade` and an empty path (exit 1). With
+  `--dry-run` the same guard runs and fails the same way.
+
+### Changed
+
+- **Every server-mode write to a bead table queues on the journal writer
+  lock** (fork 48e7e1dcb), on the direct and proxied routes, whether the events
+  journal is on or off. Concurrent writers wait their turn instead of
+  interleaving, so a guarded delete and a concurrent comment on a thread member
+  cannot both land.
+
 ## [1.3.1] - 2026-09-30
 
 First stable release of the 1.3.1 patch line. It ships the same code as

@@ -221,6 +221,16 @@ type VersionChange struct {
 // versionChanges contains agent-actionable changes for recent versions
 var versionChanges = []VersionChange{
 	{
+		Version: "1.3.2-dev.1",
+		Date:    "2026-10-24",
+		Changes: []string{
+			"DEV: fork pre-release above 1.3.1 and below 1.3.2, stamped so a caller can tell a build with the changes below from 1.3.1 by 'bd version'. No schema migration, so upgrading from 1.3.1 is a binary swap.",
+			"NEW: 'bd image <id>... [--from-file ids.txt]' prints one compact JSON line per bead: every stored row that belongs to it (its row, labels, comments, events, dependencies in both directions), raw and read in one transaction, plus 'revision', the sha256 hex of the canonical image. The revision changes on any write to the bead, so an archive can check later that a bead is unchanged. If any id names no bead, nothing is printed and the command exits 1 naming every missing id.",
+			"NEW: 'bd delete --force --from-file <ids> --if-threads <guard.json>' deletes only if every archived thread in the guard file is unchanged: membership over its edge type, each member's image revision, eligibility (member label, ephemeral, closed before the cutoff), and coverage of every member-labelled id in the request. Otherwise nothing changes and it exits 13; under --json the last stderr line is a JSON report with 'guard_mismatch': true and 'failed_threads'. It needs --force, and refuses --cascade and an empty path (exit 1). With --dry-run the same guard runs and fails the same way.",
+			"CHANGE: in server mode (direct and proxied) every write to a bead table now queues on the per-database journal writer lock, whether the events journal is on or off. Concurrent writers wait their turn instead of interleaving, so a guarded delete and a concurrent comment on a member cannot both land.",
+		},
+	},
+	{
 		Version: "1.3.1",
 		Date:    "2026-09-30",
 		Changes: []string{
