@@ -451,8 +451,10 @@ func (s *DoltStore) verifiedReadyClaim(ctx context.Context, actor string, write 
 // of unbounded reachable history). Wrapped in withRetryTxNoJournal so a
 // heartbeat that loses Dolt's optimistic merge to a concurrent reclaim/close on
 // the same lease row is replayed against a fresh snapshot rather than
-// surfaced; a heartbeat records no journal event, so it never queues behind
-// journaled writers, where its lease could lapse.
+// surfaced. A heartbeat records no journal event and writes only leases, none
+// of a bead's image tables (issueops.JournalWriterLockTables), so it never
+// queues behind bead writers on the journal writer lock, where its lease could
+// lapse. The fallback that re-arms a missing lease writes leases too.
 func (s *DoltStore) HeartbeatIssue(ctx context.Context, id, actor string) error {
 	if s.isActiveWisp(ctx, id) {
 		// Wisps are ephemeral and never leased; nothing to heartbeat.
@@ -954,7 +956,7 @@ func (s *DoltStore) DeleteIssuesBySourceRepo(ctx context.Context, sourceRepo str
 }
 
 // ClearRepoMtime removes the mtime cache entry for a repository. It writes only
-// repo_mtimes and records no journal event, so it takes no journal writer lock.
+// repo_mtimes, no bead image table, so it takes no journal writer lock.
 func (s *DoltStore) ClearRepoMtime(ctx context.Context, repoPath string) error {
 	return s.withRetryTxNoJournal(ctx, func(tx *sql.Tx) error {
 		return issueops.ClearRepoMtimeInTx(ctx, tx, repoPath)
@@ -974,7 +976,7 @@ func (s *DoltStore) GetRepoMtime(ctx context.Context, repoPath string) (int64, e
 }
 
 // SetRepoMtime updates the mtime cache for a repository's data file. Like
-// ClearRepoMtime it records no journal event and takes no journal writer lock.
+// ClearRepoMtime it writes only repo_mtimes and takes no journal writer lock.
 func (s *DoltStore) SetRepoMtime(ctx context.Context, repoPath, jsonlPath string, mtimeNs int64) error {
 	return s.withRetryTxNoJournal(ctx, func(tx *sql.Tx) error {
 		return issueops.SetRepoMtimeInTx(ctx, tx, repoPath, jsonlPath, mtimeNs)
