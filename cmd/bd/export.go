@@ -45,6 +45,7 @@ EXAMPLES:
   bd export -o issues.jsonl              # Export issues to file
   bd export --include-memories           # Export issues + memories
   bd export --all -o full.jsonl          # Include infra + templates + gates + memories
+  bd export --all --strict               # Fail on any failed read or owner exclusion
   bd export --scrub -o clean.jsonl       # Exclude test/pollution records`,
 	GroupID:       "sync",
 	SilenceUsage:  true,
@@ -61,6 +62,7 @@ var (
 	exportIncludeMemories bool
 	exportExcludeOwners   []string
 	exportVerbose         bool
+	exportStrict          bool
 )
 
 func init() {
@@ -73,6 +75,7 @@ func init() {
 	_ = exportCmd.Flags().MarkHidden("no-memories")
 	exportCmd.Flags().StringArrayVar(&exportExcludeOwners, "exclude-owner", nil, "Exclude issues created by this identity (repeatable; also reads export.exclude_owners config)")
 	exportCmd.Flags().BoolVar(&exportVerbose, "verbose", false, "Print filtered issue count when owners are excluded")
+	exportCmd.Flags().BoolVar(&exportStrict, "strict", false, "Exit non-zero on any failed read, and refuse any owner exclusion (--exclude-owner, export.exclude_owners)")
 	rootCmd.AddCommand(exportCmd)
 }
 
@@ -95,12 +98,12 @@ func runExport(cmd *cobra.Command, args []string) error {
 		// consistent snapshot. Export is read-only: RunTxRead never commits
 		// (the attempt is always rolled back on close).
 		_, err := uow.RunTxRead(ctx, uowProvider, func(ctx context.Context, uw uow.UnitOfWork) (struct{}, error) {
-			return struct{}{}, runExportFromSource(ctx, &uowExportSource{uw: uw})
+			return struct{}{}, runExportFromSource(ctx, &uowExportSource{uw: uw, strict: exportStrict})
 		})
 		return err
 	}
 
-	return runExportFromSource(ctx, storeExportSource{})
+	return runExportFromSource(ctx, storeExportSource{strict: exportStrict})
 }
 
 // runExportFromSource is the whole classic export body with the storage reads
@@ -109,13 +112,21 @@ func runExport(cmd *cobra.Command, args []string) error {
 // handling, the stderr summary — is shared verbatim between the embedded and
 // proxied-server modes, which is what keeps the two outputs byte-identical.
 func runExportFromSource(ctx context.Context, src exportSource) error {
+	// Owner-keyed filtering: exclude issues by created_by identity.
+	// Merges --exclude-owner flag values with export.exclude_owners config.
+	// Resolved first so a --strict refusal comes before any issue is read,
+	// any line is printed, or the output file is created.
+	ownerExcludes, err := resolveOwnerExcludeSet(ctx, src, exportExcludeOwners, exportStrict)
+	if err != nil {
+		return HandleErrorRespectJSON("%v", err)
+	}
+
 	// Determine output destination. File output uses atomic writes
 	// (temp file + rename) so concurrent exports and crashes never
 	// leave a truncated or interleaved JSONL file.
 	var w io.Writer
 	var aw *atomicfile.Writer
 	if exportOutput != "" {
-		var err error
 		aw, err = atomicfile.Create(exportOutput, 0o644)
 		if err != nil {
 			return HandleErrorRespectJSON("failed to create output file: %v", err)
@@ -129,142 +140,41 @@ func runExportFromSource(ctx context.Context, src exportSource) error {
 		w = os.Stdout
 	}
 
-	// Build filter for issues table. Export all statuses by default.
-	// Opt out of BEADS_MAX_ROWS (designer §4.1) — export is a data-integrity
-	// path and must never abort partway through an export run.
-	filter := types.IssueFilter{
-		Limit:         0,
-		MaxRows:       0,
-		MaxRowsSource: "",
-	}
+	filter := buildExportFilter(ctx, src)
 
-	// Exclude infra types by default (agents, roles, messages).
-	if !exportAll && !exportIncludeInfra {
-		var infraTypes []string
-		infraSet := src.GetInfraTypes(ctx)
-		if len(infraSet) > 0 {
-			for t := range infraSet {
-				infraTypes = append(infraTypes, t)
-			}
-		}
-		if len(infraTypes) == 0 {
-			infraTypes = domain.DefaultInfraTypes()
-		}
-		for _, t := range infraTypes {
-			filter.ExcludeTypes = append(filter.ExcludeTypes, types.IssueType(t))
-		}
-	}
-
-	// Exclude templates by default
-	if !exportAll {
-		isTemplate := false
-		filter.IsTemplate = &isTemplate
-	}
-
-	// Exclude ephemeral wisps by default — they are private/transient and
-	// must not reach git history or external integrations (GH#3649).
-	// --all overrides to include everything.
-	if !exportAll {
-		persistentOnly := false
-		filter.Ephemeral = &persistentOnly
-	}
-
-	issues, err := src.SearchIssues(ctx, "", filter)
+	// Pass 1: the ordered id list — the order the whole-set search would
+	// deliver, at one id per bead. Pass 2 reads, filters, hydrates and writes
+	// the beads a page at a time, so memory holds one page of rows and
+	// relations rather than the whole store.
+	ids, err := src.SearchIssueKeys(ctx, "", filter)
 	if err != nil {
 		return HandleErrorRespectJSON("failed to search issues: %v", err)
 	}
 
-	// Scrub test/pollution records if requested
-	if exportScrub {
-		issues = filterOutPollution(issues)
+	pageSize := exportPageSize
+	if pageSize <= 0 {
+		pageSize = len(ids)
 	}
-
-	// Owner-keyed filtering: exclude issues by created_by identity.
-	// Merges --exclude-owner flag values with export.exclude_owners config.
-	ownerExcludes := buildOwnerExcludeSet(ctx, src, exportExcludeOwners)
+	count := 0
 	filteredOwnerCount := 0
-	if len(ownerExcludes) > 0 {
-		before := len(issues)
-		issues = filterOutOwners(issues, ownerExcludes)
-		filteredOwnerCount = before - len(issues)
+	for start := 0; start < len(ids); start += pageSize {
+		end := start + pageSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		written, ownerFiltered, err := exportIssuePage(ctx, src, w, filter, ids[start:end], ownerExcludes)
+		if err != nil {
+			return err
+		}
+		count += written
+		filteredOwnerCount += ownerFiltered
 	}
 
-	if len(issues) == 0 && exportNoMemories {
+	if count == 0 && exportNoMemories {
 		if exportOutput != "" {
 			fmt.Fprintln(os.Stderr, "No issues to export.")
 		}
 		return nil
-	}
-
-	// Bulk-load relational data
-	rel, err := src.LoadExportRelations(ctx, issues)
-	if err != nil {
-		return HandleErrorRespectJSON("failed to load relational data: %v", err)
-	}
-
-	// Explicit plane markers (bd-r9uce): a no_history=true row is either an
-	// unpromoted no-history wisp (wisps table) or a promoted one (durable
-	// issues-table row still carrying the stray flag) — only table membership
-	// can tell them apart, and import routes by the "wisp_plane" marker
-	// stamped here. Ephemeral rows are unambiguous (ephemeral=true only ever lives in
-	// the wisps table) and are deliberately NOT stamped, keeping their export
-	// bytes unchanged.
-	var noHistoryIDs []string
-	for _, issue := range issues {
-		if issue.NoHistory && !issue.Ephemeral {
-			noHistoryIDs = append(noHistoryIDs, issue.ID)
-		}
-	}
-	wispPlane := map[string]bool{}
-	if len(noHistoryIDs) > 0 {
-		wispPlane, err = src.WispPlaneIDs(ctx, noHistoryIDs)
-		if err != nil {
-			return HandleErrorRespectJSON("failed to classify wisp-plane rows: %v", err)
-		}
-	}
-
-	// Populate relational data on each issue
-	for _, issue := range issues {
-		issue.Labels = rel.labels[issue.ID]
-		issue.Dependencies = rel.deps[issue.ID]
-		issue.Comments = rel.comments[issue.ID]
-	}
-
-	// Write JSONL: one JSON object per line
-	count := 0
-	for _, issue := range issues {
-		counts := rel.depCounts[issue.ID]
-		if counts == nil {
-			counts = &types.DependencyCounts{}
-		}
-
-		// Sanitize zero-value timestamps that can't be marshaled to JSON.
-		// NULL datetime columns scanned as time.Time{} (year 0001) cause
-		// MarshalJSON to fail with "year outside of range [0,9999]". (GH#2488)
-		sanitizeZeroTime(issue)
-
-		record := &exportIssueRecord{
-			RecordType: "issue",
-			IssueWithCounts: &types.IssueWithCounts{
-				Issue:           issue,
-				DependencyCount: counts.DependencyCount,
-				DependentCount:  counts.DependentCount,
-				CommentCount:    rel.commentCounts[issue.ID],
-			},
-			WispPlane: wispPlane[issue.ID],
-		}
-
-		data, err := json.Marshal(record)
-		if err != nil {
-			return HandleErrorRespectJSON("failed to marshal issue %s: %v", issue.ID, err)
-		}
-		if _, err := w.Write(data); err != nil {
-			return HandleErrorRespectJSON("failed to write: %v", err)
-		}
-		if _, err := w.Write([]byte{'\n'}); err != nil {
-			return HandleErrorRespectJSON("failed to write newline: %v", err)
-		}
-		count++
 	}
 
 	// Export memories only when explicitly requested (GH#3650).
@@ -328,6 +238,173 @@ func runExportFromSource(ctx context.Context, src exportSource) error {
 	return nil
 }
 
+// buildExportFilter builds the export's search filter from the flags. Export
+// all statuses by default.
+func buildExportFilter(ctx context.Context, src exportSource) types.IssueFilter {
+	// Opt out of BEADS_MAX_ROWS (designer §4.1) — export is a data-integrity
+	// path and must never abort partway through an export run.
+	filter := types.IssueFilter{
+		Limit:         0,
+		MaxRows:       0,
+		MaxRowsSource: "",
+	}
+
+	// Exclude infra types by default (agents, roles, messages).
+	if !exportAll && !exportIncludeInfra {
+		var infraTypes []string
+		infraSet := src.GetInfraTypes(ctx)
+		if len(infraSet) > 0 {
+			for t := range infraSet {
+				infraTypes = append(infraTypes, t)
+			}
+		}
+		if len(infraTypes) == 0 {
+			infraTypes = domain.DefaultInfraTypes()
+		}
+		for _, t := range infraTypes {
+			filter.ExcludeTypes = append(filter.ExcludeTypes, types.IssueType(t))
+		}
+	}
+
+	// Exclude templates by default
+	if !exportAll {
+		isTemplate := false
+		filter.IsTemplate = &isTemplate
+	}
+
+	// Exclude ephemeral wisps by default — they are private/transient and
+	// must not reach git history or external integrations (GH#3649).
+	// --all overrides to include everything.
+	if !exportAll {
+		persistentOnly := false
+		filter.Ephemeral = &persistentOnly
+	}
+	return filter
+}
+
+// exportPageSize is how many beads export reads, hydrates and writes at a
+// time (pass 2 of runExportFromSource); tests lower it.
+var exportPageSize = 500
+
+// readExportPage reads the full rows of one page of pass 1's ids: the export
+// filter's clauses still apply (a page of an export without --all cannot pull
+// in a row the filter excluded), plus IDs. The rows come back in the page's id
+// order; an id whose row is gone was deleted between the passes and is skipped.
+func readExportPage(ctx context.Context, src exportSource, filter types.IssueFilter, page []string) ([]*types.Issue, error) {
+	filter.IDs = page
+	rows, err := src.SearchIssues(ctx, "", filter)
+	if err != nil {
+		return nil, HandleErrorRespectJSON("failed to search issues: %v", err)
+	}
+	byID := make(map[string]*types.Issue, len(rows))
+	for _, issue := range rows {
+		byID[issue.ID] = issue
+	}
+	issues := make([]*types.Issue, 0, len(page))
+	for _, id := range page {
+		if issue, ok := byID[id]; ok {
+			issues = append(issues, issue)
+		}
+	}
+	return issues, nil
+}
+
+// exportIssuePage filters, hydrates and writes one page of beads, returning
+// how many lines it wrote and how many beads the owner filter dropped.
+func exportIssuePage(ctx context.Context, src exportSource, w io.Writer, filter types.IssueFilter, page []string, ownerExcludes map[string]struct{}) (written, ownerFiltered int, err error) {
+	issues, err := readExportPage(ctx, src, filter, page)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Scrub test/pollution records if requested
+	if exportScrub {
+		issues = filterOutPollution(issues)
+	}
+
+	if len(ownerExcludes) > 0 {
+		before := len(issues)
+		issues = filterOutOwners(issues, ownerExcludes)
+		ownerFiltered = before - len(issues)
+	}
+
+	if len(issues) == 0 {
+		return 0, ownerFiltered, nil
+	}
+
+	// Bulk-load relational data
+	rel, err := src.LoadExportRelations(ctx, issues)
+	if err != nil {
+		return 0, 0, HandleErrorRespectJSON("failed to load relational data: %v", err)
+	}
+
+	// Explicit plane markers (bd-r9uce): a no_history=true row is either an
+	// unpromoted no-history wisp (wisps table) or a promoted one (durable
+	// issues-table row still carrying the stray flag) — only table membership
+	// can tell them apart, and import routes by the "wisp_plane" marker
+	// stamped here. Ephemeral rows are unambiguous (ephemeral=true only ever lives in
+	// the wisps table) and are deliberately NOT stamped, keeping their export
+	// bytes unchanged.
+	var noHistoryIDs []string
+	for _, issue := range issues {
+		if issue.NoHistory && !issue.Ephemeral {
+			noHistoryIDs = append(noHistoryIDs, issue.ID)
+		}
+	}
+	wispPlane := map[string]bool{}
+	if len(noHistoryIDs) > 0 {
+		wispPlane, err = src.WispPlaneIDs(ctx, noHistoryIDs)
+		if err != nil {
+			return 0, 0, HandleErrorRespectJSON("failed to classify wisp-plane rows: %v", err)
+		}
+	}
+
+	// Populate relational data on each issue
+	for _, issue := range issues {
+		issue.Labels = rel.labels[issue.ID]
+		issue.Dependencies = rel.deps[issue.ID]
+		issue.Comments = rel.comments[issue.ID]
+	}
+
+	// Write JSONL: one JSON object per line
+	for _, issue := range issues {
+		counts := rel.depCounts[issue.ID]
+		if counts == nil {
+			counts = &types.DependencyCounts{}
+		}
+
+		// Sanitize zero-value timestamps that can't be marshaled to JSON.
+		// NULL datetime columns scanned as time.Time{} (year 0001) cause
+		// MarshalJSON to fail with "year outside of range [0,9999]". (GH#2488)
+		sanitizeZeroTime(issue)
+
+		record := &exportIssueRecord{
+			RecordType: "issue",
+			IssueWithCounts: &types.IssueWithCounts{
+				Issue:           issue,
+				DependencyCount: counts.DependencyCount,
+				DependentCount:  counts.DependentCount,
+				CommentCount:    rel.commentCounts[issue.ID],
+			},
+			WispPlane: wispPlane[issue.ID],
+		}
+
+		data, err := json.Marshal(record)
+		if err != nil {
+			return 0, 0, HandleErrorRespectJSON("failed to marshal issue %s: %v", issue.ID, err)
+		}
+		if _, err := w.Write(data); err != nil {
+			return 0, 0, HandleErrorRespectJSON("failed to write: %v", err)
+		}
+		if _, err := w.Write([]byte{'\n'}); err != nil {
+			return 0, 0, HandleErrorRespectJSON("failed to write newline: %v", err)
+		}
+		written++
+	}
+
+	return written, ownerFiltered, nil
+}
+
 // exportIssueRecord wraps IssueWithCounts with a _type discriminator so that
 // every line in the JSONL export is self-describing. Memory lines already
 // carry "_type":"memory"; this gives issue lines "_type":"issue". (GH#3271)
@@ -374,8 +451,24 @@ func filterOutPollution(issues []*types.Issue) []*types.Issue {
 
 // buildOwnerExcludeSet merges --exclude-owner flag values with the
 // export.exclude_owners (and legacy export.exclude_owner) config entries.
-// Returns the combined set as a map for O(1) lookup.
+// Returns the combined set as a map for O(1) lookup. A failed database config
+// read counts as "key unset".
 func buildOwnerExcludeSet(ctx context.Context, src exportSource, flagOwners []string) map[string]struct{} {
+	set, _ := resolveOwnerExcludeSet(ctx, src, flagOwners, false)
+	return set
+}
+
+// resolveOwnerExcludeSet is buildOwnerExcludeSet with the --strict policy:
+// when strict, a failed database config read is an error, and any owner
+// exclusion in force (the flag, or either key in config.yaml or the database)
+// is refused with an error naming it, since a strict export excludes no owner.
+func resolveOwnerExcludeSet(ctx context.Context, src exportSource, flagOwners []string, strict bool) (map[string]struct{}, error) {
+	refuse := func(what, where string) error {
+		return fmt.Errorf("export --strict: %s is set%s; a strict export excludes no owner", what, where)
+	}
+	if strict && len(flagOwners) > 0 {
+		return nil, refuse("--exclude-owner", "")
+	}
 	set := make(map[string]struct{})
 	for _, o := range flagOwners {
 		if o != "" {
@@ -393,6 +486,12 @@ func buildOwnerExcludeSet(ctx context.Context, src exportSource, flagOwners []st
 			}
 		}
 	}
+	ownerKeys := []string{"export.exclude_owners", "export.exclude_owner"}
+	for _, key := range ownerKeys {
+		if strict && config.GetYamlConfig(key) != "" {
+			return nil, refuse(key, " in config.yaml")
+		}
+	}
 	if val := config.GetYamlConfig("export.exclude_owners"); val != "" {
 		addOwners(val)
 	}
@@ -400,13 +499,27 @@ func buildOwnerExcludeSet(ctx context.Context, src exportSource, flagOwners []st
 		set[strings.TrimSpace(val)] = struct{}{}
 	}
 	// Also read from database for any value stored there directly.
-	if val, err := src.GetConfig(ctx, "export.exclude_owners"); err == nil && val != "" {
-		addOwners(val)
+	for _, key := range ownerKeys {
+		val, err := src.GetConfig(ctx, key)
+		if err != nil {
+			if strict {
+				return nil, fmt.Errorf("export --strict: read %s from database: %w", key, err)
+			}
+			continue
+		}
+		if val == "" {
+			continue
+		}
+		if strict {
+			return nil, refuse(key, " in the database")
+		}
+		if key == "export.exclude_owners" {
+			addOwners(val)
+		} else {
+			set[strings.TrimSpace(val)] = struct{}{}
+		}
 	}
-	if val, err := src.GetConfig(ctx, "export.exclude_owner"); err == nil && val != "" {
-		set[strings.TrimSpace(val)] = struct{}{}
-	}
-	return set
+	return set, nil
 }
 
 // filterOutOwners removes issues whose created_by identity is in the exclude set.

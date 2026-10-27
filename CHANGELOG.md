@@ -31,6 +31,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   goes silent for 30 s (a client that froze mid-write) is reclaimed, so it
   cannot block the other writers until the server's idle cut.
 
+## [1.3.2-dev.2] - 2026-10-27
+
+Fork pre-release above [1.3.2-dev.1] and below upstream's 1.3.2, stamped so a
+caller can tell a build carrying the strict, paged export from 1.3.2-dev.1 by
+`bd version`. No schema migration: upgrading from 1.3.2-dev.1 is a binary swap.
+
+### Added
+
+- **`bd export --strict`** exits non-zero when any read the export makes fails
+  — the bead search, labels, dependency records, comments or their counts of
+  either table, the plane read, the config and memories reads — instead of
+  printing a relation as empty. Before printing a line it refuses an owner
+  exclusion in force: `export.exclude_owners` or `export.exclude_owner` in
+  config.yaml or the database, or `--exclude-owner`. A missing wisps table
+  still reads as empty.
+
+### Changed
+
+- **`bd export` pages its reads**: an ordered id pass, then pages of 500 beads
+  with their relations, each written as it is read, so memory no longer grows
+  with the store (proxied-server mode keeps a whole-set id pass). Output order
+  and lines are unchanged.
+
 ## [1.3.2-dev.1] - 2026-10-24
 
 Fork pre-release above [1.3.1] and below upstream's 1.3.2, stamped so a caller

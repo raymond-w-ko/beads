@@ -7,6 +7,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dberrors"
+	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/storage/uow"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -34,6 +35,10 @@ type exportSource interface {
 	// filter (Limit=0, MaxRows=0). Implementations MUST fail rather than
 	// return a truncated page — export is a data-integrity path.
 	SearchIssues(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error)
+	// SearchIssueKeys returns the ids SearchIssues would return for the same
+	// query and filter, in the same order. Export's first pass walks this
+	// list and reads full rows a page at a time (SearchIssues with IDs).
+	SearchIssueKeys(ctx context.Context, query string, filter types.IssueFilter) ([]string, error)
 	// GetConfig reads one config key from the database (used for the
 	// export.exclude_owners owner-filter keys).
 	GetConfig(ctx context.Context, key string) (string, error)
@@ -64,6 +69,32 @@ type storeWispPartitioner interface {
 	PartitionWispIDs(ctx context.Context, ids []string) (wispIDs, permIDs []string, err error)
 }
 
+// storeKeySearcher is the optional store capability SearchIssueKeys uses in
+// classic mode: an ordered id search that hydrates no row. Both real stores
+// (DoltStore, EmbeddedDoltStore) implement it; a store that does not falls
+// back to the whole-set SearchIssues, projected to ids (today's memory, never
+// a failure).
+type storeKeySearcher interface {
+	SearchIssueKeys(ctx context.Context, query string, filter types.IssueFilter) ([]string, error)
+}
+
+// findStoreCapability walks the decorator-wrapped store global (telemetry,
+// hook firing) down through Unwrap() to the first store implementing C.
+func findStoreCapability[C any](s storage.DoltStorage) (C, bool) {
+	var zero C
+	for s != nil {
+		if c, ok := s.(C); ok {
+			return c, true
+		}
+		u, ok := s.(interface{ Unwrap() storage.DoltStorage })
+		if !ok {
+			return zero, false
+		}
+		s = u.Unwrap()
+	}
+	return zero, false
+}
+
 // exportRelations carries the bulk-loaded relational data for the export set,
 // keyed by issue ID.
 type exportRelations struct {
@@ -75,12 +106,20 @@ type exportRelations struct {
 }
 
 // errExportNoStore reports a classic-source read attempted with no store
-// open. Callers of exportSource.GetConfig treat any error as "key unset",
-// which reproduces the pre-seam `if store == nil` early return.
+// open. Non-strict callers of exportSource.GetConfig treat any error as "key
+// unset", which reproduces the pre-seam `if store == nil` early return.
 var errExportNoStore = errors.New("no store available")
 
+// errExportNoPartitioner is a strict export's refusal to stamp no plane
+// markers when the classic store cannot classify wisp-plane rows.
+var errExportNoPartitioner = errors.New("wisp plane membership: store has no partitioner")
+
 // storeExportSource is the classic-mode exportSource over the `store` global.
-type storeExportSource struct{}
+// strict (bd export --strict) turns every read the classic path degrades
+// (bulk-load errors, a store with no partitioner) into an error.
+type storeExportSource struct {
+	strict bool
+}
 
 func (storeExportSource) GetInfraTypes(ctx context.Context) map[string]bool {
 	if store == nil {
@@ -91,6 +130,17 @@ func (storeExportSource) GetInfraTypes(ctx context.Context) map[string]bool {
 
 func (storeExportSource) SearchIssues(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error) {
 	return store.SearchIssues(ctx, query, filter)
+}
+
+func (storeExportSource) SearchIssueKeys(ctx context.Context, query string, filter types.IssueFilter) ([]string, error) {
+	if ks, ok := findStoreCapability[storeKeySearcher](store); ok {
+		return ks.SearchIssueKeys(ctx, query, filter)
+	}
+	issues, err := store.SearchIssues(ctx, query, filter)
+	if err != nil {
+		return nil, err
+	}
+	return projectIssueIDs(issues), nil
 }
 
 func (storeExportSource) GetConfig(ctx context.Context, key string) (string, error) {
@@ -104,7 +154,7 @@ func (storeExportSource) GetAllConfig(ctx context.Context) (map[string]string, e
 	return store.GetAllConfig(ctx)
 }
 
-func (storeExportSource) LoadExportRelations(ctx context.Context, issues []*types.Issue) (exportRelations, error) {
+func (s storeExportSource) LoadExportRelations(ctx context.Context, issues []*types.Issue) (exportRelations, error) {
 	issueIDs := make([]string, len(issues))
 	for i, issue := range issues {
 		issueIDs[i] = issue.ID
@@ -112,11 +162,30 @@ func (storeExportSource) LoadExportRelations(ctx context.Context, issues []*type
 
 	// Individual bulk-load failures deliberately degrade to empty maps rather
 	// than aborting the export — unchanged from the pre-seam classic behavior.
-	labelsMap, _ := store.GetLabelsForIssues(ctx, issueIDs)
-	allDeps, _ := store.GetDependencyRecordsForIssues(ctx, issueIDs)
-	commentsMap, _ := store.GetCommentsForIssues(ctx, issueIDs)
-	commentCounts, _ := store.GetCommentCounts(ctx, issueIDs)
-	depCounts, _ := store.GetDependencyCounts(ctx, issueIDs)
+	// Under --strict the first failure is the export's error instead; the
+	// loaders' own tolerance for a missing optional wisp table stays.
+	labelsMap, labelsErr := store.GetLabelsForIssues(ctx, issueIDs)
+	allDeps, depsErr := store.GetDependencyRecordsForIssues(ctx, issueIDs)
+	commentsMap, commentsErr := store.GetCommentsForIssues(ctx, issueIDs)
+	commentCounts, commentCountsErr := store.GetCommentCounts(ctx, issueIDs)
+	depCounts, depCountsErr := store.GetDependencyCounts(ctx, issueIDs)
+
+	if s.strict {
+		for _, load := range []struct {
+			relation string
+			err      error
+		}{
+			{"labels", labelsErr},
+			{"dependency records", depsErr},
+			{"comments", commentsErr},
+			{"comment counts", commentCountsErr},
+			{"dependency counts", depCountsErr},
+		} {
+			if load.err != nil {
+				return exportRelations{}, fmt.Errorf("load %s: %w", load.relation, load.err)
+			}
+		}
+	}
 
 	return exportRelations{
 		labels:        labelsMap,
@@ -127,27 +196,21 @@ func (storeExportSource) LoadExportRelations(ctx context.Context, issues []*type
 	}, nil
 }
 
-func (storeExportSource) WispPlaneIDs(ctx context.Context, ids []string) (map[string]bool, error) {
-	if len(ids) == 0 || store == nil {
+func (src storeExportSource) WispPlaneIDs(ctx context.Context, ids []string) (map[string]bool, error) {
+	if len(ids) == 0 {
 		return nil, nil
 	}
-	// The store global is decorator-wrapped (telemetry, hook firing); walk
-	// Unwrap() down to the store that carries the partition capability.
-	s := store
-	var p storeWispPartitioner
-	for {
-		if partitioner, ok := s.(storeWispPartitioner); ok {
-			p = partitioner
-			break
+	// Without --strict, a store that cannot classify yields no markers (the
+	// data-safe side, see storeWispPartitioner); a strict export refuses.
+	noPartitioner := func() (map[string]bool, error) {
+		if src.strict {
+			return nil, errExportNoPartitioner
 		}
-		u, ok := s.(interface{ Unwrap() storage.DoltStorage })
-		if !ok {
-			return nil, nil
-		}
-		s = u.Unwrap()
-		if s == nil {
-			return nil, nil
-		}
+		return nil, nil
+	}
+	p, ok := findStoreCapability[storeWispPartitioner](store)
+	if !ok {
+		return noPartitioner()
 	}
 	wispIDs, _, err := p.PartitionWispIDs(ctx, ids)
 	if err != nil {
@@ -162,9 +225,11 @@ func (storeExportSource) WispPlaneIDs(ctx context.Context, ids []string) (map[st
 
 // uowExportSource is the proxied-server exportSource over a unit of work. All
 // reads run inside the single read transaction runExport opened, so the
-// export is one consistent snapshot.
+// export is one consistent snapshot. strict (bd export --strict) narrows the
+// wisp-plane tolerance in LoadExportRelations to an absent wisps plane.
 type uowExportSource struct {
-	uw uow.UnitOfWork
+	uw     uow.UnitOfWork
+	strict bool
 }
 
 func (s *uowExportSource) GetInfraTypes(ctx context.Context) map[string]bool {
@@ -190,6 +255,19 @@ func (s *uowExportSource) SearchIssues(ctx context.Context, query string, filter
 		return nil, fmt.Errorf("issue search returned a truncated page (limit=%d); export must never truncate", filter.Limit)
 	}
 	return page.Items, nil
+}
+
+// SearchIssueKeys has no key search to call in proxied-server mode: the unit
+// of work's plane-pinned use cases offer none, so pass 1 runs the whole-set
+// SearchIssues inside the export's one read transaction and keeps only the
+// ids (this mode's pass 1 holds every row once, as before paging). The page
+// loop after it is the same as classic mode's.
+func (s *uowExportSource) SearchIssueKeys(ctx context.Context, query string, filter types.IssueFilter) ([]string, error) {
+	issues, err := s.SearchIssues(ctx, query, filter)
+	if err != nil {
+		return nil, err
+	}
+	return projectIssueIDs(issues), nil
 }
 
 func (s *uowExportSource) GetConfig(ctx context.Context, key string) (string, error) {
@@ -228,7 +306,10 @@ func (s *uowExportSource) GetAllConfig(ctx context.Context) (map[string]string, 
 // table-specific are the same test there. The membership probe is the
 // exception — WispPlaneIDs renders FROM wisps LEFT JOIN leases, so its
 // tolerance is pinned to a missing `wisps` table and a broken database
-// surfaces as an error instead of an empty wisp plane.
+// surfaces as an error instead of an empty wisp plane. Under --strict the
+// readers' tolerance narrows too (wispReadTolerated): a missing wisp_labels
+// or wisp_comments while the wisps table answers is a failed read, not an
+// absent plane, as it is for the classic loaders.
 func (s *uowExportSource) LoadExportRelations(ctx context.Context, issues []*types.Issue) (exportRelations, error) {
 	rel := exportRelations{
 		labels:        map[string][]string{},
@@ -287,7 +368,7 @@ func (s *uowExportSource) LoadExportRelations(ctx context.Context, issues []*typ
 
 	wispLabels, err := s.uw.LabelUseCase().GetLabelsForWisps(ctx, wispIDs) //nolint:forbidigo // bulk relation load; see GetLabelsForIssues above
 	if err != nil {
-		if !dberrors.IsTableNotExist(err) {
+		if !s.wispReadTolerated(err, wispSet) {
 			return exportRelations{}, fmt.Errorf("load wisp labels: %w", err)
 		}
 	} else {
@@ -295,7 +376,7 @@ func (s *uowExportSource) LoadExportRelations(ctx context.Context, issues []*typ
 	}
 	wispComments, err := s.uw.CommentUseCase().GetCommentsForWisps(ctx, wispIDs)
 	if err != nil {
-		if !dberrors.IsTableNotExist(err) {
+		if !s.wispReadTolerated(err, wispSet) {
 			return exportRelations{}, fmt.Errorf("load wisp comments: %w", err)
 		}
 	} else {
@@ -303,7 +384,7 @@ func (s *uowExportSource) LoadExportRelations(ctx context.Context, issues []*typ
 	}
 	wispCounts, err := s.uw.CommentUseCase().GetWispCommentCounts(ctx, wispIDs)
 	if err != nil {
-		if !dberrors.IsTableNotExist(err) {
+		if !s.wispReadTolerated(err, wispSet) {
 			return exportRelations{}, fmt.Errorf("load wisp comment counts: %w", err)
 		}
 	} else {
@@ -324,7 +405,7 @@ func (s *uowExportSource) LoadExportRelations(ctx context.Context, issues []*typ
 	wispDepCounts, err := s.uw.DependencyUseCase().CountsByWispIDs(ctx, allIDs)
 	if err != nil {
 		// A rig without the wisp tables simply has no wisp-plane edges.
-		if !dberrors.IsTableNotExist(err) {
+		if !s.wispDepCountsTolerated(err) {
 			return exportRelations{}, fmt.Errorf("load wisp dependency counts: %w", err)
 		}
 	} else {
@@ -343,6 +424,29 @@ func (s *uowExportSource) LoadExportRelations(ctx context.Context, issues []*typ
 	}
 
 	return rel, nil
+}
+
+// wispReadTolerated reports whether a wisp_labels / wisp_comments reader's
+// error is the tolerated absence of the wisp plane. Without --strict any
+// table-not-exist is (unchanged). Under --strict only when membership could
+// not be read because the wisps table is absent (wispSet nil): while the
+// wisps table answers, its rows' labels and comments must be read.
+func (s *uowExportSource) wispReadTolerated(err error, wispSet map[string]bool) bool {
+	if !dberrors.IsTableNotExist(err) {
+		return false
+	}
+	return !s.strict || wispSet == nil
+}
+
+// wispDepCountsTolerated is the same policy for CountsByWispIDs, which is not
+// narrowed by membership: under --strict only a missing optional wisp table
+// (sqlbuild.OptionalWispTable: wisps, wisp_dependencies) is tolerated.
+func (s *uowExportSource) wispDepCountsTolerated(err error) bool {
+	if !s.strict {
+		return dberrors.IsTableNotExist(err)
+	}
+	name, ok := dberrors.MissingTableName(err)
+	return ok && sqlbuild.OptionalWispTable(name)
 }
 
 // wispPlaneSubset returns, in input order, the ids that wispSet marks as
@@ -395,6 +499,15 @@ func (s *uowExportSource) WispPlaneIDs(ctx context.Context, ids []string) (map[s
 		set[w.ID] = true
 	}
 	return set, nil
+}
+
+// projectIssueIDs projects issues to their ids, in order.
+func projectIssueIDs(issues []*types.Issue) []string {
+	ids := make([]string, len(issues))
+	for i, issue := range issues {
+		ids[i] = issue.ID
+	}
+	return ids
 }
 
 // mergeExportMap copies src entries into dst. The label/comment planes are

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/steveyegge/beads/internal/storage/dberrors"
 	"github.com/steveyegge/beads/internal/storage/sqlbuild"
@@ -30,6 +31,25 @@ func SearchIssuesInTx(ctx context.Context, tx DBTX, query string, filter types.I
 // wasted (e.g., partial-ID resolution in internal/utils/id_parser.go).
 func SearchIssueIDsInTx(ctx context.Context, tx DBTX, query string, filter types.IssueFilter) ([]string, error) {
 	return searchInTx(ctx, tx, query, filter, idProjection)
+}
+
+// SearchIssueKeysInTx is the ordered-id variant of SearchIssuesInTx for
+// callers that page through a whole result set (bd export): it projects only
+// the default sort keys (issueKeyProjection) and returns the ids in the merged
+// order SearchIssuesInTx would deliver its rows. It runs the same searchInTx
+// body — ephemeral routing, wisps probe, cross-table duplicate rule,
+// sortMergedResults, cap — so the order matches by construction, at one id
+// string per row instead of a hydrated issue.
+func SearchIssueKeysInTx(ctx context.Context, tx DBTX, query string, filter types.IssueFilter) ([]string, error) {
+	keys, err := searchInTx(ctx, tx, query, filter, issueKeyProjection)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, len(keys))
+	for i, k := range keys {
+		ids[i] = k.ID
+	}
+	return ids, nil
 }
 
 // SearchWispsPlaneInTx searches the wisps plane ALONE: every row stored in
@@ -146,6 +166,48 @@ var idProjection = searchProjection[string]{
 			return false
 		}
 		return sqlbuild.LessID(a, b, sortDesc)
+	},
+}
+
+// issueKey is the payload of issueKeyProjection: the id plus the columns the
+// default sort orders by (priority ASC, created_at DESC, id ASC).
+type issueKey struct {
+	ID        string
+	Priority  int
+	CreatedAt time.Time
+}
+
+// issueKeyProjection scans only the default sort keys, so a merged
+// issues+wisps search can be re-sorted exactly as issueProjection's would be
+// without hydrating a row. Like idProjection it needs no lease join and no
+// id-shrink; its less orders the keys it carries (default, priority, created,
+// id) through sqlbuild.Less itself and compares false for every other key.
+var issueKeyProjection = searchProjection[issueKey]{
+	columns: func(tables FilterTables) string {
+		return tables.Main + ".id, " + tables.Main + ".priority, " + tables.Main + ".created_at"
+	},
+	scan: func(rows *sql.Rows) (issueKey, error) {
+		var k issueKey
+		var createdAtStr sql.NullString // scanned as a string, parsed as ScanIssueFrom does
+		if err := rows.Scan(&k.ID, &k.Priority, &createdAtStr); err != nil {
+			return issueKey{}, err
+		}
+		if createdAtStr.Valid {
+			k.CreatedAt = ParseTimeString(createdAtStr.String)
+		}
+		return k, nil
+	},
+	id:      func(k issueKey) string { return k.ID },
+	hydrate: nil,
+	less: func(a, b issueKey, sortBy string, sortDesc bool) bool {
+		// Keys outside SortDefs fall back to the default order, in SQL and
+		// in Less alike; only a known column this payload lacks is unorderable.
+		if _, known := sqlbuild.SortDefs[sortBy]; known && sortBy != "" && sortBy != "priority" && sortBy != "created" {
+			return false
+		}
+		ai := types.Issue{ID: a.ID, Priority: a.Priority, CreatedAt: a.CreatedAt}
+		bi := types.Issue{ID: b.ID, Priority: b.Priority, CreatedAt: b.CreatedAt}
+		return sqlbuild.Less(&ai, &bi, sortBy, sortDesc)
 	},
 }
 

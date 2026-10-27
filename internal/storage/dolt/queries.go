@@ -37,6 +37,18 @@ func (s *DoltStore) SearchIssueIDs(ctx context.Context, query string, filter typ
 	return result, err
 }
 
+// SearchIssueKeys returns the ids SearchIssues would return, in the same
+// order, without hydrating the rows (the first pass of a paged bd export).
+func (s *DoltStore) SearchIssueKeys(ctx context.Context, query string, filter types.IssueFilter) ([]string, error) {
+	var result []string
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.SearchIssueKeysInTx(ctx, tx, query, filter)
+		return err
+	})
+	return result, err
+}
+
 func (s *DoltStore) SearchIssuesWithCounts(ctx context.Context, query string, filter types.IssueFilter) ([]*types.IssueWithCounts, error) {
 	var result []*types.IssueWithCounts
 	err := s.withReadTx(ctx, func(tx *sql.Tx) error {

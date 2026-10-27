@@ -138,6 +138,8 @@ type savedGlobals struct {
 	exportScrub           bool
 	exportNoMemories      bool
 	exportIncludeMemories bool
+	exportExcludeOwners   []string
+	exportStrict          bool
 }
 
 // saveAndRestoreGlobals snapshots all commonly-mutated package-level globals
@@ -167,6 +169,8 @@ func saveAndRestoreGlobals(t *testing.T) *savedGlobals {
 		exportScrub:           exportScrub,
 		exportNoMemories:      exportNoMemories,
 		exportIncludeMemories: exportIncludeMemories,
+		exportExcludeOwners:   exportExcludeOwners,
+		exportStrict:          exportStrict,
 	}
 	t.Cleanup(func() {
 		dbPath = saved.dbPath
@@ -180,6 +184,8 @@ func saveAndRestoreGlobals(t *testing.T) *savedGlobals {
 		exportScrub = saved.exportScrub
 		exportNoMemories = saved.exportNoMemories
 		exportIncludeMemories = saved.exportIncludeMemories
+		exportExcludeOwners = saved.exportExcludeOwners
+		exportStrict = saved.exportStrict
 	})
 	return saved
 }
