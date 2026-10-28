@@ -583,7 +583,7 @@ func (c *Config) GetGlobalProjectID() string {
 //  1. BEADS_DOLT_PASSWORD env var (highest priority, existing behavior)
 //  2. Credentials file lookup by [host:port] section
 //     (path from BEADS_CREDENTIALS_FILE env var, or ~/.config/beads/credentials)
-//  3. localdolt.DefaultServerPassword (empty except in remote-only builds)
+//  3. localdolt.DefaultServerPassword (empty in every build)
 //
 // Note: uses the port from configfile (metadata.json / env var), which may differ
 // from the resolved runtime port (doltserver port file). If you have the resolved

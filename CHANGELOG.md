@@ -31,6 +31,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   goes silent for 30 s (a client that froze mid-write) is reclaimed, so it
   cannot block the other writers until the server's idle cut.
 
+## [1.3.2-dev.3] - 2026-10-28
+
+Fork pre-release above [1.3.2-dev.2] and below upstream's 1.3.2, stamped so a
+caller can tell a build carrying the fast `bd delete --if-threads` guard from
+1.3.2-dev.2 by `bd version`. No schema migration: upgrading from 1.3.2-dev.2 is
+a binary swap.
+
+### Changed
+
+- **`bd delete --if-threads` checks its guard with a statement count that no
+  longer grows with the number of threads.** It walks all thread roots at once,
+  one level at a time, over the indexed edge columns. It images members with
+  one read per table and batch of ids instead of about six reads per bead. It
+  reads the requested ids in one batch before the transaction instead of one at
+  a time. A guarded delete of a few hundred ids no longer holds the journal
+  writer lock for tens of seconds. Guard results, mismatch reports and exit
+  codes are unchanged.
+
+### Removed
+
+- **The `remote_dolt_only` build's own server defaults.** When env,
+  metadata.json, config.yaml and the credentials file are silent, it no longer
+  falls back to host `dolt-db`, user `beads` and password `beads`. It now takes
+  the default build's fallbacks: host `127.0.0.1`, user `root`, no password.
+  Set `BEADS_DOLT_SERVER_HOST`, `BEADS_DOLT_SERVER_USER` and
+  `BEADS_DOLT_PASSWORD` (or the credentials file) explicitly.
+
 ## [1.3.2-dev.2] - 2026-10-27
 
 Fork pre-release above [1.3.2-dev.1] and below upstream's 1.3.2, stamped so a

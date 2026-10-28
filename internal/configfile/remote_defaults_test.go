@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// Remote-only builds default to the tailnet server when env, config, and
-// credentials are all unset.
+// Remote-only builds take the default build's server defaults when env, config,
+// and credentials are all unset: no shared host, no known password.
 func TestRemoteOnlyServerDefaults(t *testing.T) {
 	for _, name := range []string{
 		"BEADS_DOLT_SERVER_HOST", "BEADS_DOLT_SERVER_USER", "BEADS_DOLT_PASSWORD",
@@ -19,14 +19,14 @@ func TestRemoteOnlyServerDefaults(t *testing.T) {
 	t.Setenv("BEADS_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "missing"))
 
 	c := &Config{}
-	if got := c.GetDoltServerHost(); got != "dolt-db" {
-		t.Errorf("GetDoltServerHost() = %q, want %q", got, "dolt-db")
+	if got := c.GetDoltServerHost(); got != "127.0.0.1" {
+		t.Errorf("GetDoltServerHost() = %q, want %q", got, "127.0.0.1")
 	}
-	if got := c.GetDoltServerUser(); got != "beads" {
-		t.Errorf("GetDoltServerUser() = %q, want %q", got, "beads")
+	if got := c.GetDoltServerUser(); got != "root" {
+		t.Errorf("GetDoltServerUser() = %q, want %q", got, "root")
 	}
-	if got := c.GetDoltServerPassword(); got != "beads" {
-		t.Errorf("GetDoltServerPassword() = %q, want %q", got, "beads")
+	if got := c.GetDoltServerPassword(); got != "" {
+		t.Errorf("GetDoltServerPassword() = %q, want %q", got, "")
 	}
 
 	t.Setenv("BEADS_DOLT_PASSWORD", "from-env")

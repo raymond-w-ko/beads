@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"sort"
 	"strconv"
 	"strings"
@@ -201,13 +202,38 @@ func ImageInTx(ctx context.Context, tx DBTX, ids []string) ([]publicops.Image, e
 	}
 
 	cache := imageColumnCache{}
+	byID := make(map[string]*publicops.Image, len(unique))
+	for _, plane := range []struct {
+		own  imageTables
+		wisp bool
+	}{{durableImageTables, false}, {wispImageTables, true}} {
+		var planeIDs []string
+		for _, id := range unique {
+			if isWisp[id] == plane.wisp {
+				planeIDs = append(planeIDs, id)
+			}
+		}
+		for start := 0; start < len(planeIDs); start += queryBatchSize {
+			end := min(start+queryBatchSize, len(planeIDs))
+			if err := imageBatchInTx(ctx, tx, cache, plane.own, planeIDs[start:end], byID); err != nil {
+				return nil, err
+			}
+		}
+	}
 	images := make([]publicops.Image, 0, len(unique))
 	for _, id := range unique {
-		img, err := imageOneInTx(ctx, tx, cache, id, isWisp[id])
-		if err != nil {
-			return nil, err
+		img := byID[id]
+		if img.Row == nil {
+			// The probe saw it, so only a row deleted under a non-snapshot
+			// transaction gets here.
+			return nil, &publicops.NotFoundError{IDs: []string{id}}
 		}
-		images = append(images, img)
+		sortImageRows(img.Labels, imageLabelKeys)
+		sortImageRows(img.Comments, imageIDKeys)
+		sortImageRows(img.Events, imageIDKeys)
+		sortImageRows(img.Dependencies, imageIDKeys)
+		img.Revision = ComputeImageRevision(*img)
+		images = append(images, *img)
 	}
 	return images, nil
 }
@@ -243,36 +269,68 @@ func imageDurablePresent(ctx context.Context, tx DBTX, ids []string) (map[string
 	return present, nil
 }
 
-func imageOneInTx(ctx context.Context, tx DBTX, cache imageColumnCache, id string, isWisp bool) (publicops.Image, error) {
-	own := durableImageTables
-	if isWisp {
-		own = wispImageTables
+// imageBatchInTx reads the images of ids, all of plane own, into out: one
+// read of each of own's issue, label, comment and event tables and one of each
+// edge table, each over every id at once. An image gets every row matching it
+// as its own single-id read would, so an edge between two requested ids
+// belongs to both. An id whose own row is not read exactly once is left with
+// a nil Row.
+func imageBatchInTx(ctx context.Context, tx DBTX, cache imageColumnCache, own imageTables, ids []string, out map[string]*publicops.Image) error {
+	batch := make(map[string]*publicops.Image, len(ids))
+	for _, id := range ids {
+		img := &publicops.Image{
+			ID:           id,
+			Table:        own.issue,
+			Labels:       []map[string]any{},
+			Comments:     []map[string]any{},
+			Events:       []map[string]any{},
+			Dependencies: []map[string]any{},
+		}
+		batch[id] = img
+		out[id] = img
 	}
-	img := publicops.Image{ID: id, Table: own.issue}
 
-	rows, err := imageSelect(ctx, tx, cache, own.issue, []string{"id"}, id)
+	matches, err := imageSelect(ctx, tx, cache, own.issue, []string{"id"}, ids)
 	if err != nil {
-		return img, err
+		return err
 	}
-	if len(rows) != 1 {
-		// The probe saw it, so only a row deleted under a non-snapshot
-		// transaction gets here.
-		return img, &publicops.NotFoundError{IDs: []string{id}}
+	seen := make(map[string]int, len(ids))
+	for _, m := range matches {
+		for _, id := range m.ids {
+			if img, ok := batch[id]; ok {
+				img.Row = imageRowFor(m, id)
+				seen[id]++
+			}
+		}
 	}
-	img.Row = rows[0]
-	if img.Labels, err = imageSelect(ctx, tx, cache, own.label, []string{"issue_id"}, id); err != nil {
-		return img, err
+	for id, img := range batch {
+		if seen[id] != 1 {
+			img.Row = nil
+		}
 	}
-	if img.Comments, err = imageSelect(ctx, tx, cache, own.comment, []string{"issue_id"}, id); err != nil {
-		return img, err
-	}
-	if img.Events, err = imageSelect(ctx, tx, cache, own.event, []string{"issue_id"}, id); err != nil {
-		return img, err
+	for _, part := range []struct {
+		table string
+		add   func(*publicops.Image, map[string]any)
+	}{
+		{own.label, func(img *publicops.Image, row map[string]any) { img.Labels = append(img.Labels, row) }},
+		{own.comment, func(img *publicops.Image, row map[string]any) { img.Comments = append(img.Comments, row) }},
+		{own.event, func(img *publicops.Image, row map[string]any) { img.Events = append(img.Events, row) }},
+	} {
+		matches, err := imageSelect(ctx, tx, cache, part.table, []string{"issue_id"}, ids)
+		if err != nil {
+			return err
+		}
+		for _, m := range matches {
+			for _, id := range m.ids {
+				if img, ok := batch[id]; ok {
+					part.add(img, imageRowFor(m, id))
+				}
+			}
+		}
 	}
 
 	// Edges in both directions, from both edge tables: a wisp can depend on a
 	// durable bead and a durable bead on a wisp.
-	img.Dependencies = []map[string]any{}
 	for _, table := range []string{durableImageTables.dep, wispImageTables.dep} {
 		cols, err := cache.columns(ctx, tx, table)
 		if err != nil {
@@ -282,7 +340,7 @@ func imageOneInTx(ctx context.Context, tx DBTX, cache imageColumnCache, id strin
 			if table != own.dep && isTableNotExistError(err) {
 				continue
 			}
-			return img, err
+			return err
 		}
 		where := []string{"issue_id"}
 		for _, col := range cols {
@@ -290,64 +348,124 @@ func imageOneInTx(ctx context.Context, tx DBTX, cache imageColumnCache, id strin
 				where = append(where, col.name)
 			}
 		}
-		deps, err := imageSelect(ctx, tx, cache, table, where, id)
+		matches, err := imageSelect(ctx, tx, cache, table, where, ids)
 		if err != nil {
-			return img, err
+			return err
 		}
-		img.Dependencies = append(img.Dependencies, deps...)
+		// A row naming one id in two columns (a self-edge) comes once per
+		// column; its single-id read listed it once.
+		listed := map[string]map[string]bool{}
+		for _, m := range matches {
+			key, err := imageMarshal(m.row)
+			if err != nil {
+				return fmt.Errorf("image: read %s: %w", table, err)
+			}
+			for _, id := range m.ids {
+				img, ok := batch[id]
+				if !ok || listed[id][string(key)] {
+					continue
+				}
+				if listed[id] == nil {
+					listed[id] = map[string]bool{}
+				}
+				listed[id][string(key)] = true
+				img.Dependencies = append(img.Dependencies, imageRowFor(m, id))
+			}
+		}
 	}
+	return nil
+}
 
-	sortImageRows(img.Labels, imageLabelKeys)
-	sortImageRows(img.Comments, imageIDKeys)
-	sortImageRows(img.Events, imageIDKeys)
-	sortImageRows(img.Dependencies, imageIDKeys)
-	img.Revision = ComputeImageRevision(img)
-	return img, nil
+// imageMatch is one row of an image table with the requested ids it matched.
+type imageMatch struct {
+	ids []string
+	row map[string]any
+}
+
+// imageRowFor is m's row for the image of id. A row matching several
+// requested ids gives each image its own map, as their single-id reads did.
+func imageRowFor(m imageMatch, id string) map[string]any {
+	if len(m.ids) < 2 || id == m.ids[0] {
+		return m.row
+	}
+	return maps.Clone(m.row)
 }
 
 // imageSelect reads every stored column of table's rows where any of match
-// equals id, normalized as Image documents. It never returns a nil slice.
-func imageSelect(ctx context.Context, tx DBTX, cache imageColumnCache, table string, match []string, id string) ([]map[string]any, error) {
+// equals one of ids, normalized as Image documents, each paired with the ids
+// it matched. One statement, one UNION ALL arm per match column; a row
+// matching in two columns comes once per arm.
+//
+// The database names the matched ids. Every comparison is the match column
+// against a bound id, `col = ?` as the single-id read's was, so it runs under
+// the column's own collation whatever the collation of the issue table's id
+// or of the other columns: the arm keeps rows equal to any id, and CONCAT_WS
+// lists, by its index in ids, every requested id the row's column equals. Go
+// byte equality would miss a row naming a bead in another case under a
+// case-insensitive column; a join to the issue table would compare under a
+// collation the two columns negotiate; and Dolt matches `col IN (...)` on a
+// column without an index byte for byte, whatever its collation.
+func imageSelect(ctx context.Context, tx DBTX, cache imageColumnCache, table string, match []string, ids []string) ([]imageMatch, error) {
 	cols, err := cache.columns(ctx, tx, table)
 	if err != nil {
 		return nil, err
 	}
 	names := make([]string, len(cols))
 	for i, col := range cols {
-		names[i] = imageQuoteIdent(col.name)
+		names[i] = "t." + imageQuoteIdent(col.name)
 	}
-	conds := make([]string, len(match))
-	args := make([]any, len(match))
+	arms := make([]string, len(match))
+	args := make([]any, 0, 2*len(match)*len(ids))
 	for i, col := range match {
-		conds[i] = imageQuoteIdent(col) + " = ?"
-		args[i] = id
+		equals := "t." + imageQuoteIdent(col) + " = ?"
+		which := make([]string, len(ids))
+		eq := make([]string, len(ids))
+		for j, id := range ids {
+			which[j] = "CASE WHEN " + equals + " THEN '" + strconv.Itoa(j) + "' END"
+			eq[j] = equals
+			args = append(args, id)
+		}
+		for _, id := range ids {
+			args = append(args, id)
+		}
+		//nolint:gosec // table is a fixed name; columns come from SHOW COLUMNS and are quoted; indexes are integers.
+		arms[i] = "SELECT CONCAT_WS(',', " + strings.Join(which, ", ") + "), " + strings.Join(names, ", ") +
+			" FROM " + table + " t WHERE " + strings.Join(eq, " OR ")
 	}
-	//nolint:gosec // table is a fixed name; columns come from SHOW COLUMNS and are quoted.
-	query := "SELECT " + strings.Join(names, ", ") + " FROM " + table + " WHERE " + strings.Join(conds, " OR ")
-	rows, err := tx.QueryContext(ctx, query, args...)
+	rows, err := tx.QueryContext(ctx, strings.Join(arms, " UNION ALL "), args...)
 	if err != nil {
 		return nil, fmt.Errorf("image: read %s: %w", table, err)
 	}
 	defer rows.Close()
-	out := []map[string]any{}
+	var out []imageMatch
 	for rows.Next() {
-		vals := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
+		vals := make([]any, len(cols)+1)
+		ptrs := make([]any, len(vals))
 		for i := range vals {
 			ptrs[i] = &vals[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
 			return nil, fmt.Errorf("image: read %s: scan: %w", table, err)
 		}
+		var matched []string
+		if which := imageText(vals[0]); which != "" {
+			for _, n := range strings.Split(which, ",") {
+				j, err := strconv.Atoi(n)
+				if err != nil || j < 0 || j >= len(ids) {
+					return nil, fmt.Errorf("image: read %s: matched id index %q", table, n)
+				}
+				matched = append(matched, ids[j])
+			}
+		}
 		row := make(map[string]any, len(cols))
 		for i, col := range cols {
-			v, err := normalizeImageValue(col.typ, vals[i])
+			v, err := normalizeImageValue(col.typ, vals[i+1])
 			if err != nil {
 				return nil, fmt.Errorf("image: read %s.%s: %w", table, col.name, err)
 			}
 			row[col.name] = v
 		}
-		out = append(out, row)
+		out = append(out, imageMatch{ids: matched, row: row})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("image: read %s: rows: %w", table, err)

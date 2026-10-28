@@ -2,11 +2,14 @@ package dolt
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 	publicops "github.com/steveyegge/beads/issueops"
 )
@@ -45,6 +48,11 @@ func TestThreadGuardDirectStore(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
+	runThreadGuardCases(t, ctx, directStoreThreadGuardFixture(t, store))
+}
+
+func directStoreThreadGuardFixture(t *testing.T, store *DoltStore) threadGuardFixture {
+	t.Helper()
 	deleter, err := store.Deleter()
 	if err != nil {
 		t.Fatalf("Deleter(): %v", err)
@@ -53,7 +61,7 @@ func TestThreadGuardDirectStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Imager(): %v", err)
 	}
-	runThreadGuardCases(t, ctx, threadGuardFixture{
+	return threadGuardFixture{
 		deleter: deleter,
 		imager:  imager,
 		create: func(ctx context.Context, issue *types.Issue) error {
@@ -68,7 +76,78 @@ func TestThreadGuardDirectStore(t *testing.T) {
 		scalar: func(ctx context.Context, query string, args []any, dest ...any) error {
 			return store.db.QueryRowContext(ctx, query, args...).Scan(dest...)
 		},
-	})
+	}
+}
+
+// countingDBTX runs a check on tx and counts the statements it reads with.
+type countingDBTX struct {
+	tx      *sql.Tx
+	queries int
+}
+
+func (c *countingDBTX) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return c.tx.ExecContext(ctx, query, args...)
+}
+
+func (c *countingDBTX) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	c.queries++
+	return c.tx.QueryContext(ctx, query, args...)
+}
+
+func (c *countingDBTX) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	c.queries++
+	return c.tx.QueryRowContext(ctx, query, args...)
+}
+
+// TestThreadGuardQueriesDoNotGrowWithThreads checks 2 threads and then 12 of
+// one shape — root <- m1 <- m2, plus a thread-keep bystander replying to m1 —
+// and wants the 12-thread check to read with at most threadGuardQueryAllowance
+// more statements than the 2-thread one. Both fit one IN batch per read at
+// every level (the walk batches 50 ids, the images 200), so the allowance only
+// covers a read that spills into one more batch; per-thread work would add
+// statements for each of the ten extra threads.
+func TestThreadGuardQueriesDoNotGrowWithThreads(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+	f := directStoreThreadGuardFixture(t, store)
+
+	const threadGuardQueryAllowance = 4
+	count := func(tag string, threads int) int {
+		t.Helper()
+		var guard *publicops.ThreadGuard
+		var ids []string
+		for i := range threads {
+			th := seedGuardedThread(t, ctx, f, fmt.Sprintf("%s%d", tag, i), false)
+			kept := seedThreadMail(t, ctx, f, fmt.Sprintf("tg-%s%d-kept", tag, i), true, threadGuardMailLabel, threadGuardExcludeLabel)
+			threadGuardEdge(t, ctx, f, kept, th.m1)
+			one := threadGuardFor(t, ctx, f, th.root, th.root, th.m1, th.m2)
+			if guard == nil {
+				guard = one
+			} else {
+				guard.Threads = append(guard.Threads, one.Threads...)
+			}
+			ids = append(ids, th.root, th.m1, th.m2)
+		}
+		tx, err := store.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		counter := &countingDBTX{tx: tx}
+		if err := issueops.CheckThreadGuardInTx(ctx, counter, guard, ids); err != nil {
+			t.Fatalf("check %d threads: %v", threads, err)
+		}
+		return counter.queries
+	}
+
+	two := count("count-two-", 2)
+	twelve := count("count-twelve-", 12)
+	t.Logf("thread guard statements: 2 threads %d, 12 threads %d", two, twelve)
+	if twelve > two+threadGuardQueryAllowance {
+		t.Errorf("12 threads read with %d statements, 2 threads with %d: want at most %d more", twelve, two, threadGuardQueryAllowance)
+	}
 }
 
 // runThreadGuardCases is the whole suite. Every case seeds its own thread
@@ -140,6 +219,19 @@ func runThreadGuardCases(t *testing.T, ctx context.Context, f threadGuardFixture
 			{Root: first.root, Check: publicops.ThreadGuardEligibility, IDs: []string{first.m2}},
 			{Root: second.root, Check: publicops.ThreadGuardRevision, IDs: []string{second.m1}},
 			{Check: publicops.ThreadGuardCoverage, IDs: []string{stray}},
+		})
+	})
+
+	t.Run("JoinedThreadsSeeEachOthersMembers", func(t *testing.T) {
+		first := seedGuardedThread(t, ctx, f, "joined-a", false)
+		second := seedGuardedThread(t, ctx, f, "joined-b", false)
+		threadGuardEdge(t, ctx, f, second.root, first.m2)
+		guard := threadGuardFor(t, ctx, f, first.root, first.root, first.m1, first.m2)
+		guard.Threads = append(guard.Threads, threadGuardFor(t, ctx, f, second.root, second.root, second.m1, second.m2).Threads...)
+
+		assertThreadGuardRefuses(t, ctx, f, first, threadGuardDelete(guard, false, first.m2, second.m2), []publicops.ThreadGuardFailure{
+			{Root: first.root, Check: publicops.ThreadGuardMembership, IDs: []string{second.m1, second.m2, second.root}},
+			{Root: second.root, Check: publicops.ThreadGuardMembership, IDs: []string{first.m1, first.m2, first.root}},
 		})
 	})
 

@@ -221,6 +221,15 @@ type VersionChange struct {
 // versionChanges contains agent-actionable changes for recent versions
 var versionChanges = []VersionChange{
 	{
+		Version: "1.3.2-dev.3",
+		Date:    "2026-10-28",
+		Changes: []string{
+			"DEV: fork pre-release above 1.3.2-dev.2 and below 1.3.2, stamped so a caller can tell a build with the fast 'bd delete --if-threads' guard from 1.3.2-dev.2 by 'bd version'. No schema migration, so upgrading from 1.3.2-dev.2 is a binary swap.",
+			"CHANGE: 'bd delete --if-threads' checks its guard with a statement count that no longer grows with the number of threads: one walk for all roots per level over the indexed edge columns, one image read per table and batch of members instead of about six per bead, and one batch read of the requested ids before the transaction instead of one per id. A guarded delete of a few hundred ids no longer holds the journal writer lock for tens of seconds. Guard results, mismatch reports and exit codes are unchanged.",
+			"CHANGE: the remote_dolt_only build no longer falls back to host 'dolt-db', user 'beads' and password 'beads' when env, metadata.json, config.yaml and the credentials file are silent; it takes the default build's fallbacks (host 127.0.0.1, user root, no password). Set BEADS_DOLT_SERVER_HOST, BEADS_DOLT_SERVER_USER and BEADS_DOLT_PASSWORD (or the credentials file) explicitly.",
+		},
+	},
+	{
 		Version: "1.3.2-dev.2",
 		Date:    "2026-10-27",
 		Changes: []string{

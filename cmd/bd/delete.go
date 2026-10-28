@@ -330,7 +330,26 @@ func deleteBatchGuarded(issueIDs []string, force bool, dryRun bool, cascade bool
 	resolvedIDs := make([]string, 0, len(issueIDs))
 	notFound := []string{}
 	var routedStore storage.DoltStorage
+	// One read for every id stored locally under exactly that id: the per-id
+	// resolution would find each in the local store first and resolve it to
+	// itself. Only the rest (partial ids, routed prefixes, the missing) take
+	// the per-id path, one round trip or more apiece.
+	exact := make(map[string]*types.Issue)
+	if len(issueIDs) > 0 {
+		found, err := store.GetIssuesByIDs(ctx, issueIDs)
+		if err != nil {
+			return fmt.Errorf("getting issues: %v", err)
+		}
+		for _, issue := range found {
+			exact[issue.ID] = issue
+		}
+	}
 	for _, id := range issueIDs {
+		if issue, ok := exact[id]; ok {
+			issues[id] = issue
+			resolvedIDs = append(resolvedIDs, id)
+			continue
+		}
 		result, err := resolveAndGetIssueForMutation(ctx, store, id)
 		if err != nil {
 			if isNotFoundErr(err) {
