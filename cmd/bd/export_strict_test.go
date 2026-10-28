@@ -156,14 +156,24 @@ func TestExportStrictFailedRelationRead(t *testing.T) {
 		relation string // named in the strict error
 		id       string // row whose relation reads empty without --strict
 		field    string
+		// searchFails names the label table whose broken column fails the
+		// page search's own label hydration: such a case fails without
+		// --strict too, so the non-strict leg asserts that failure instead.
+		searchFails string
 	}{
-		{"labels", "", "load labels", "strict-1", "labels"},
-		{"issue dependencies", "RENAME TABLE dependencies TO dependencies_broken", "load dependency records", "strict-1", "dependencies"},
-		{"issue comments", "RENAME TABLE comments TO comments_broken", "load comments", "strict-1", "comments"},
+		// The decorator replaces the whole bulk GetLabelsForIssues method, so
+		// this case covers the strict check on the bulk load's result, not a
+		// failed read of the labels or wisp_labels tables: those fail the
+		// page search's label hydration first (the two cases below).
+		{"labels", "", "load labels", "strict-1", "labels", ""},
+		{"issue labels column", "ALTER TABLE labels RENAME COLUMN label TO label_broken", "hydrate labels", "strict-1", "labels", "labels"},
+		{"wisp labels column", "ALTER TABLE wisp_labels RENAME COLUMN label TO label_broken", "hydrate labels", "strict-wisp-1", "labels", "wisp_labels"},
+		{"issue dependencies", "RENAME TABLE dependencies TO dependencies_broken", "load dependency records", "strict-1", "dependencies", ""},
+		{"issue comments", "RENAME TABLE comments TO comments_broken", "load comments", "strict-1", "comments", ""},
 		// wisp_dependencies is an optional wisp table: a missing one reads as
 		// empty, so break a column the loader selects instead.
-		{"wisp dependencies", "ALTER TABLE wisp_dependencies RENAME COLUMN type TO type_broken", "load dependency records", "strict-wisp-1", "dependencies"},
-		{"wisp comments", "RENAME TABLE wisp_comments TO wisp_comments_broken", "load comments", "strict-wisp-1", "comments"},
+		{"wisp dependencies", "ALTER TABLE wisp_dependencies RENAME COLUMN type TO type_broken", "load dependency records", "strict-wisp-1", "dependencies", ""},
+		{"wisp comments", "RENAME TABLE wisp_comments TO wisp_comments_broken", "load comments", "strict-wisp-1", "comments", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -184,6 +194,27 @@ func TestExportStrictFailedRelationRead(t *testing.T) {
 			}
 			if stdout != "" {
 				t.Errorf("strict export printed lines before failing:\n%s", stdout)
+			}
+			if tt.searchFails != "" {
+				fromTable := "get labels for issues from " + tt.searchFails + ":"
+				if !strings.Contains(stderr, fromTable) {
+					t.Errorf("strict error does not name %q; stderr:\n%s", fromTable, stderr)
+				}
+
+				// The page search hydrates labels from the same table, so the
+				// export fails without --strict too, before any line.
+				exportStrict = false
+				stdout, stderr, err = runExportCaptured(t)
+				if err == nil {
+					t.Fatalf("non-strict export with %s succeeded; stdout:\n%s", tt.ddl, stdout)
+				}
+				if !strings.Contains(stderr, tt.relation) || !strings.Contains(stderr, fromTable) {
+					t.Errorf("non-strict error does not name %q from %s; stderr:\n%s", tt.relation, tt.searchFails, stderr)
+				}
+				if stdout != "" {
+					t.Errorf("non-strict export printed lines before failing:\n%s", stdout)
+				}
+				return
 			}
 
 			// Without --strict the same export succeeds with the relation empty.

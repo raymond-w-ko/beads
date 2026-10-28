@@ -264,6 +264,99 @@ func TestExportPagedStrictFailsMidStream(t *testing.T) {
 	}
 }
 
+// pageReadRecorder records the export's reads around the real store: the key
+// pass is forwarded to the real SearchIssueKeys capability, and every
+// SearchIssues call returns the real store's result unchanged while its filter
+// ids, its row count and whether the key pass came first are recorded.
+// Unwrap keeps the partitioner reachable for WispPlaneIDs.
+type pageReadRecorder struct {
+	storage.DoltStorage
+	keyPasses int
+	reads     []recordedPageRead
+}
+
+type recordedPageRead struct {
+	afterKeyPass bool
+	ids          []string
+	rows         int
+}
+
+func (r *pageReadRecorder) SearchIssueKeys(ctx context.Context, query string, filter types.IssueFilter) ([]string, error) {
+	ks, ok := findStoreCapability[storeKeySearcher](r.DoltStorage)
+	if !ok {
+		return nil, errors.New("wrapped store has no SearchIssueKeys")
+	}
+	r.keyPasses++
+	return ks.SearchIssueKeys(ctx, query, filter)
+}
+
+func (r *pageReadRecorder) SearchIssues(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error) {
+	issues, err := r.DoltStorage.SearchIssues(ctx, query, filter)
+	r.reads = append(r.reads, recordedPageRead{
+		afterKeyPass: r.keyPasses > 0,
+		ids:          slices.Clone(filter.IDs),
+		rows:         len(issues),
+	})
+	return issues, err
+}
+
+func (r *pageReadRecorder) Unwrap() storage.DoltStorage { return r.DoltStorage }
+
+// TestExportPagedRowReadsAreBounded pins pass 2's full-row reads to their
+// page: the output oracle alone cannot see a page read that drops the id
+// restriction, because readExportPage keeps only the page's ids from whatever
+// rows come back, so the bytes stay correct while each page hydrates the
+// whole store.
+func TestExportPagedRowReadsAreBounded(t *testing.T) {
+	s := setupPagedExportStore(t)
+	exportAll = true
+
+	filter := buildExportFilter(context.Background(), storeExportSource{})
+	wantIDs := issueIDsInOrder(t, filter)
+	wantLines := referenceExportLines(t, filter)
+	wantPages := (len(wantIDs) + exportPageSize - 1) / exportPageSize
+	if wantPages < 3 {
+		t.Fatalf("seed spans %d issues, want several pages of %d", len(wantIDs), exportPageSize)
+	}
+
+	rec := &pageReadRecorder{DoltStorage: s}
+	store = rec
+	stdout, stderr, err := runExportCaptured(t)
+	if err != nil {
+		t.Fatalf("export: %v (stderr %q)", err, stderr)
+	}
+	gotLines, _ := exportedIssueLines(t, stdout)
+	if !slices.Equal(gotLines, wantLines) {
+		t.Errorf("paged export lines differ from the whole-set export\n got %v\nwant %v", gotLines, wantLines)
+	}
+
+	if rec.keyPasses != 1 {
+		t.Errorf("export ran %d key passes, want 1", rec.keyPasses)
+	}
+	if len(rec.reads) != wantPages {
+		t.Errorf("export ran %d page reads, want %d (%d issues, pages of %d)", len(rec.reads), wantPages, len(wantIDs), exportPageSize)
+	}
+	var readIDs []string
+	for i, read := range rec.reads {
+		if !read.afterKeyPass {
+			t.Errorf("page read %d ran before the key pass", i)
+		}
+		if len(read.ids) == 0 {
+			t.Errorf("page read %d carries no id restriction (loaded %d rows)", i, read.rows)
+		}
+		if len(read.ids) > exportPageSize {
+			t.Errorf("page read %d asks for %d ids, more than the page size %d", i, len(read.ids), exportPageSize)
+		}
+		if read.rows > len(read.ids) || read.rows > exportPageSize {
+			t.Errorf("page read %d loaded %d rows for %d ids (page size %d)", i, read.rows, len(read.ids), exportPageSize)
+		}
+		readIDs = append(readIDs, read.ids...)
+	}
+	if !slices.Equal(readIDs, wantIDs) {
+		t.Errorf("page reads asked for\n got %v\nwant %v", readIDs, wantIDs)
+	}
+}
+
 func TestSearchIssueKeysOrder(t *testing.T) {
 	s := setupPagedExportStore(t)
 	ctx := context.Background()
