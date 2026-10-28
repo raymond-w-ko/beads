@@ -221,6 +221,14 @@ type VersionChange struct {
 // versionChanges contains agent-actionable changes for recent versions
 var versionChanges = []VersionChange{
 	{
+		Version: "1.3.3-dev.1",
+		Date:    "2026-10-28",
+		Changes: []string{
+			"DEV: fork pre-release above upstream 1.3.2, a merge of upstream tag v1.3.2 (9b65b9e19) into the fork, stamped so a caller can tell the merged build from upstream's 1.3.2 by 'bd version'. No schema migration, so upgrading from 1.3.2-dev.3 is a binary swap. The fork's behaviour stays: the remote_dolt_only fence, port 3307 for every external server, the remote-only 'make build', and no dolt-db/beads/beads fallback defaults.",
+			"CHANGE: carries upstream 1.3.2's user-visible fixes (see the 1.3.2 and 1.3.2-rc.* entries below): 'bd purge' keeps every closed bead in a chain above a live bead; 'bd purge --limit N' without --force suggests a --force command that keeps --limit; 'bd export' fails with 'failed to classify wisp-plane rows' when the wisps table exists but cannot be read; least-privilege Dolt users can write again (the no-op DOLT_CHECKOUT is skipped). Run 'bd recompute-blocked' once per workspace that crossed migration 0059 under bd 1.3.0 or later.",
+		},
+	},
+	{
 		Version: "1.3.2-dev.3",
 		Date:    "2026-10-28",
 		Changes: []string{
@@ -246,6 +254,42 @@ var versionChanges = []VersionChange{
 			"NEW: 'bd image <id>... [--from-file ids.txt]' prints one compact JSON line per bead: every stored row that belongs to it (its row, labels, comments, events, dependencies in both directions), raw and read in one transaction, plus 'revision', the sha256 hex of the canonical image. The revision changes on any write to the bead, so an archive can check later that a bead is unchanged. If any id names no bead, nothing is printed and the command exits 1 naming every missing id.",
 			"NEW: 'bd delete --force --from-file <ids> --if-threads <guard.json>' deletes only if every archived thread in the guard file is unchanged: membership over its edge type, each member's image revision, eligibility (member label, ephemeral, closed before the cutoff), and coverage of every member-labelled id in the request. Otherwise nothing changes and it exits 13; under --json the last stderr line is a JSON report with 'guard_mismatch': true and 'failed_threads'. It needs --force, and refuses --cascade and an empty path (exit 1). With --dry-run the same guard runs and fails the same way.",
 			"CHANGE: in server mode (direct and proxied) every write to a bead table now queues on the per-database journal writer lock, whether the events journal is on or off. Concurrent writers wait their turn instead of interleaving, so a guarded delete and a concurrent comment on a member cannot both land.",
+		},
+	},
+	{
+		Version: "1.3.2",
+		Date:    "2026-10-23",
+		Changes: []string{
+			"STABLE: first stable 1.3.2 release. Same code as 1.3.2-rc.3; only the version stamp changed. No schema migration, so upgrading from 1.3.1 or any 1.3.2 RC is a binary swap. The 1.3.2-rc.3, rc.2 and rc.1 entries below all apply; after upgrading from bd <=1.3.0, run 'bd recompute-blocked' once per workspace (#7037).",
+		},
+	},
+	{
+		Version: "1.3.2-rc.3",
+		Date:    "2026-10-23",
+		Changes: []string{
+			"RC: third candidate for 1.3.2, rc.2 plus three fixes and security bumps, with no schema migration, so upgrading from 1.3.1 or an earlier 1.3.2 RC is a binary swap. The rc.1 upgrade note still applies: after upgrading from bd <=1.3.0, run 'bd recompute-blocked' once per workspace (#7037).",
+			"FIX: a least-privilege Dolt user (EXECUTE on dolt_add/dolt_commit only) can write again: the no-op DOLT_CHECKOUT on fresh connections is skipped when the session is already on the branch (#7322).",
+			"FIX: bd export --all no longer stalls on workspaces with many wisps: bulk readers read at most 200 ids per IN list, and a repeated id is read once (#6444, #7785).",
+			"FIX: bd purge --limit N without --force now suggests a --force command that keeps --limit, and a negative --older-than overflow is refused (#7540).",
+			"SECURITY: builds with Go 1.26.10 (eMudhra CA distrust); x/net v0.60.0, x/crypto v0.57.0, grpc v1.83.2, thrift v0.24.0.",
+		},
+	},
+	{
+		Version: "1.3.2-rc.2",
+		Date:    "2026-10-10",
+		Changes: []string{
+			"RC: second candidate for 1.3.2, rc.1 plus one fix, with no schema migration, so upgrading from 1.3.1 or 1.3.2-rc.1 is a binary swap. The rc.1 upgrade note still applies: after upgrading from bd <=1.3.0, run 'bd recompute-blocked' once per workspace (#7037).",
+			"FIX: the post-commit blocked-state recheck publishes its Dolt commit after its own transaction commits (#7030, backport of #6876). Minted inside the transaction, DOLT_ADD staged issues from the BEGIN-time root and could write concurrently committed rows back to their old values while unblocking writes raced. A failed trailing commit now counts as post_tx_commit_dropped instead of a recheck failure.",
+		},
+	},
+	{
+		Version: "1.3.2-rc.1",
+		Date:    "2026-10-05",
+		Changes: []string{
+			"RC: first candidate for 1.3.2, a patch on top of 1.3.1 with no schema migration, so upgrading from 1.3.1 is a binary swap.",
+			"UPGRADE: after upgrading from bd <=1.3.0, run 'bd recompute-blocked' once per workspace (#7037). Migration 0059 (first shipped in 1.3.0) recomputes is_blocked with a recursive query whose parent-child filter is dropped by a Dolt query-planner bug on Dolt servers older than 2.4.0 and on the embedded engine (dolthub/dolt#11886). Blockedness then spreads across relates-to, discovered-from, tracks and other edges, and unblocked beads silently vanish from 'bd ready'. The flag is stored, so the damage persists until recomputed. This includes a workspace now on 1.3.1 that was first created by 1.2.x or earlier. The command is idempotent and reports rows_corrected.",
+			"FIX: 'bd purge' keeps every closed bead in a chain above a live bead, not just the one a live bead points at directly (#7031). A closed root over a closed child over an open grandchild used to lose its root, orphaning the rest; --wisps-plane retention sweeps hit this.",
+			"FIX: auto-backup records the Dolt commit read before the sync as its watermark (#7032). A commit landing during the sync used to be recorded as backed up although the snapshot lacked it, and auto-backup then reported 'no changes' until HEAD moved again.",
 		},
 	},
 	{
