@@ -1,6 +1,6 @@
 # Upstream
 
-This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-23 at fork main 69709b0d5, upstream/main 882317770.
+This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-27 at fork main a32d1c7f3, upstream/main ce8554ffb.
 
 ## Posted
 
@@ -15,7 +15,7 @@ This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `r
 | Issue | [#7632](https://github.com/gastownhall/beads/issues/7632) | bd show --json: say the direction of a dependency edge in words (relation beside dependency_type) | 9d6725a8d (described only) | - | issue open, auto-triaged (gascityinc-sarah); no maintainer reply |
 | Issue | [#7634](https://github.com/gastownhall/beads/issues/7634) | Embedded mode: bd ready wakes expired defers and commits while MIGRATION-FREEZE is set | - (fork-only gap, not fixed) | - | issue open, auto-triaged (gascityinc-sarah); no maintainer reply |
 
-Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator selection), bd-8irlo (this status), bd-hpall (PR C), bd-zzheg (this update), bd-ag0kx, bd-ke5hc, bd-yxtwb, bd-0efhc (PR #7645 fix round), bd-ppay0, bd-mo505, bd-a4g6y (PR #7645 test isolation), bd-e0w55, bd-asr18, bd-s3rkm, bd-r41db, bd-9mhx2 (supersede blockers move), bd-1005b, bd-s2cx8 (in-process CLI harness reset), bd-hj2hy, bd-bs9rk (supersede conflicting blockers), bd-eepnt, bd-mlr3s (conflicting blocker before cycle check), bd-lj1oq, bd-1pocx (stale in-process CLI tests).
+Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator selection), bd-8irlo (this status), bd-hpall (PR C), bd-zzheg (this update), bd-ag0kx, bd-ke5hc, bd-yxtwb, bd-0efhc (PR #7645 fix round), bd-ppay0, bd-mo505, bd-a4g6y (PR #7645 test isolation), bd-e0w55, bd-asr18, bd-s3rkm, bd-r41db, bd-9mhx2 (supersede blockers move), bd-1005b, bd-s2cx8 (in-process CLI harness reset), bd-hj2hy, bd-bs9rk (supersede conflicting blockers), bd-eepnt, bd-mlr3s (conflicting blocker before cycle check), bd-lj1oq, bd-1pocx (stale in-process CLI tests), bd-a93bt, bd-skjnq, bd-aqwsl, bd-ve8gk, bd-akqgg, bd-zv1xt (strict, paged export).
 
 ## Not posted yet
 
@@ -27,6 +27,7 @@ Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator select
 | 7fc83d768 | SHOW TABLES/COLUMNS probes instead of INFORMATION_SCHEMA; retried open-time drift check (Dolt 1105 under concurrent DROP DATABASE) | candidate upstream PR; operator selects |
 | 1a7b0e7f8 | Comment wording for the two-statement column probe; UPSTREAM.md hash for 7fc83d768 | fork-only (docs) |
 | 94af39eca, 33184bffc, 9d08d1e9d | `bd supersede` moves inbound `blocks` edges to the replacement in one transaction; `--keep-blockers` opts out; JSON `moved_blockers`/`kept_blockers` (asked by everturn, mail bd-wisp-sy63f); 33184bffc keeps a blocker whose edge to the replacement has another type and carries edge metadata on the move; 9d08d1e9d keeps such a blocker before the cycle check and says so in the help | candidate upstream PR; operator selects |
+| a32d1c7f3 | bd export --strict (any failed read of either table, the plane read, the owner config or memories exits non-zero; an owner exclusion in force, config.yaml, database or --exclude-owner, is refused before a line is printed; a missing wisps table still reads as empty) and a paged export (ordered id pass through the search body, then 500-bead pages with relations written as read, order and lines unchanged); version 1.3.2-dev.2 (asked by everturn ADR 0177, mail bd-wisp-sqecv; beads bd-a93bt, bd-skjnq, bd-aqwsl, bd-ve8gk) | candidate upstream PR; operator selects |
 
 ## Already upstream
 
