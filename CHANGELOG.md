@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`bd import` no longer reports escaped metadata as a tie conflict.**
+  `bd export` writes metadata with `<`, `>` and `&` escaped as `\u003c`,
+  `\u003e` and `\u0026`, while the store returns the plain characters, so
+  re-importing an unchanged export listed those beads under "Kept local
+  state" with the same `updated_at` but different content. Metadata is now
+  compared as JSON values, so such rows count as unchanged.
 - **Journaled writes in server mode queue instead of aborting each other**
   ([#6117](https://github.com/gastownhall/beads/issues/6117)). Every write
   that records a journal event now waits for a per-database server lock

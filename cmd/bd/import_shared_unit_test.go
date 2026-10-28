@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -103,11 +104,17 @@ func TestFilterStaleImportIssuesReportsTieConflicts(t *testing.T) {
 		{ID: "bd-tie", Title: "title", UpdatedAt: base},                                // notes missing
 		{ID: "bd-tie-same", Title: "title", Notes: "kept notes", UpdatedAt: base},      // identical
 		{ID: "bd-subsec", Title: "title", UpdatedAt: base.Add(400 * time.Millisecond)}, // sub-second "newer"
+		// export's HTML-escaped form of the local metadata
+		{ID: "bd-escaped", Title: "title", Metadata: json.RawMessage(`{"note":"a -\u003e b"}`), UpdatedAt: base},
+		// an integer beyond float64 precision changed by one
+		{ID: "bd-bigint", Title: "title", Metadata: json.RawMessage(`{"external_id":9007199254740993}`), UpdatedAt: base},
 	}
 	store := &fakeImportIssueLookupStore{issues: []*types.Issue{
 		{ID: "bd-tie", Title: "title", Notes: "local notes", UpdatedAt: base},
 		{ID: "bd-tie-same", Title: "title", Notes: "kept notes", UpdatedAt: base},
 		{ID: "bd-subsec", Title: "title", Notes: "local notes", UpdatedAt: base},
+		{ID: "bd-escaped", Title: "title", Metadata: json.RawMessage(`{"note":"a -> b"}`), UpdatedAt: base},
+		{ID: "bd-bigint", Title: "title", Metadata: json.RawMessage(`{"external_id":9007199254740992}`), UpdatedAt: base},
 	}}
 
 	filtered, skippedIDs, plan, err := filterStaleImportIssues(context.Background(), store, incoming)
@@ -117,14 +124,21 @@ func TestFilterStaleImportIssuesReportsTieConflicts(t *testing.T) {
 	if len(skippedIDs) != 0 {
 		t.Fatalf("skippedIDs = %#v, want none (ties are not stale)", skippedIDs)
 	}
-	if len(filtered) != 3 {
-		t.Fatalf("filtered = %d rows, want all 3 kept for aux merging", len(filtered))
+	if len(filtered) != 5 {
+		t.Fatalf("filtered = %d rows, want all 5 kept for aux merging", len(filtered))
 	}
 	// bd-tie differs (notes wiped) at the same second; bd-subsec's 400ms
 	// must not promote it past the tie (updated_at is DATETIME(0)).
-	want := map[string]bool{"bd-tie": true, "bd-subsec": true}
-	if len(plan.TieKeptLocal) != 2 || !want[plan.TieKeptLocal[0]] || !want[plan.TieKeptLocal[1]] {
-		t.Fatalf("plan.TieKeptLocal = %#v, want [bd-tie bd-subsec]", plan.TieKeptLocal)
+	// bd-escaped's metadata is the same JSON value, so it is no tie;
+	// bd-bigint's differs past float64 precision, so it is one.
+	want := map[string]bool{"bd-tie": true, "bd-subsec": true, "bd-bigint": true}
+	if len(plan.TieKeptLocal) != len(want) {
+		t.Fatalf("plan.TieKeptLocal = %#v, want [bd-tie bd-subsec bd-bigint]", plan.TieKeptLocal)
+	}
+	for _, id := range plan.TieKeptLocal {
+		if !want[id] {
+			t.Fatalf("plan.TieKeptLocal = %#v, want [bd-tie bd-subsec bd-bigint]", plan.TieKeptLocal)
+		}
 	}
 	if len(plan.Updates) != 0 {
 		t.Fatalf("plan.Updates = %#v, want empty", plan.Updates)
@@ -438,6 +452,51 @@ func TestImportRowChangeSummary(t *testing.T) {
 	}
 	if s := importRowChangeSummary(local, local); s != "" {
 		t.Fatalf("importRowChangeSummary(identical) = %q, want empty", s)
+	}
+}
+
+// bd-tihoi: export writes metadata HTML-escaped (\u003e, \u0026) while the
+// store returns plain characters, so a byte-identical re-import must not
+// report metadata as changed (and so as a tie conflict).
+func TestImportRowChangeSummaryMetadata(t *testing.T) {
+	tests := []struct {
+		name            string
+		local, incoming string
+		nilLocal        bool
+		wantChanged     bool
+	}{
+		{name: "escaped vs plain", local: `{"note":"a -> b & c"}`, incoming: `{"note":"a -\u003e b \u0026 c"}`},
+		{name: "key order", local: `{"a":1,"b":"x"}`, incoming: `{"b":"x","a":1}`},
+		{name: "whitespace", local: `{"a":1}`, incoming: " { \"a\" : 1 }\n"},
+		{name: "value change", local: `{"note":"a"}`, incoming: `{"note":"b"}`, wantChanged: true},
+		// bd-3qbme: a float64 decode merges adjacent integers beyond 2^53.
+		{name: "adjacent large integers", local: `{"external_id":9007199254740992}`, incoming: `{"external_id":9007199254740993}`, wantChanged: true},
+		{name: "nested large integers", local: `{"ids":[9007199254740992]}`, incoming: `{"ids":[9007199254740993]}`, wantChanged: true},
+		{name: "equivalent number spellings", local: `{"n":1,"m":[100]}`, incoming: `{"n":1.0,"m":[1e2]}`},
+		{name: "number vs string", local: `{"n":1}`, incoming: `{"n":"1"}`, wantChanged: true},
+		{name: "trailing data", local: `{"a":1}`, incoming: `{"a":1} {"a":2}`, wantChanged: true},
+		{name: "nil vs empty object", nilLocal: true, incoming: `{}`, wantChanged: true},
+		{name: "nil vs null", nilLocal: true, incoming: `null`},
+		{name: "empty vs null", local: "", incoming: `null`},
+		{name: "invalid same bytes", local: `{bad`, incoming: ` {bad `},
+		{name: "invalid differs", local: `{bad`, incoming: `{"bad":1}`, wantChanged: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			local := &types.Issue{Title: "t"}
+			if !tt.nilLocal {
+				local.Metadata = json.RawMessage(tt.local)
+			}
+			incoming := &types.Issue{Title: "t", Metadata: json.RawMessage(tt.incoming)}
+			got := importRowChangeSummary(local, incoming)
+			want := ""
+			if tt.wantChanged {
+				want = "metadata"
+			}
+			if got != want {
+				t.Fatalf("importRowChangeSummary(%q, %q) = %q, want %q", tt.local, tt.incoming, got, want)
+			}
+		})
 	}
 }
 

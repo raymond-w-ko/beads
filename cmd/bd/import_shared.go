@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"sort"
 	"strings"
@@ -1151,10 +1153,97 @@ func importRowChangeSummary(local, incoming *types.Issue) string {
 	if !intPtrEqual(local.EstimatedMinutes, incoming.EstimatedMinutes) {
 		parts = append(parts, "estimate")
 	}
-	if string(local.Metadata) != string(incoming.Metadata) {
+	if !metadataEqual(local.Metadata, incoming.Metadata) {
 		parts = append(parts, "metadata")
 	}
 	return strings.Join(parts, ", ")
+}
+
+// metadataEqual reports whether two metadata documents hold the same JSON
+// value. Export writes Go's HTML-escaped form (\u003c, \u003e, \u0026) while
+// the store returns the plain characters, so bytes must not be compared.
+// Empty and JSON null both mean "no metadata"; an empty object is a value.
+// Numbers compare exactly: a float64 decode would merge distinct integers
+// beyond 2^53 and hide a real change.
+func metadataEqual(a, b json.RawMessage) bool {
+	a, b = bytes.TrimSpace(a), bytes.TrimSpace(b)
+	if metadataAbsent(a) || metadataAbsent(b) {
+		return metadataAbsent(a) && metadataAbsent(b)
+	}
+	av, aerr := decodeMetadataValue(a)
+	bv, berr := decodeMetadataValue(b)
+	if aerr != nil || berr != nil {
+		return bytes.Equal(a, b)
+	}
+	return jsonValueEqual(av, bv)
+}
+
+func metadataAbsent(m json.RawMessage) bool {
+	return len(m) == 0 || string(m) == "null"
+}
+
+// decodeMetadataValue decodes one JSON document, keeping numbers as
+// json.Number. Trailing data after the value is an error, as in json.Unmarshal.
+func decodeMetadataValue(m json.RawMessage) (any, error) {
+	dec := json.NewDecoder(bytes.NewReader(m))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("trailing data after metadata value")
+	}
+	return v, nil
+}
+
+// jsonValueEqual compares values decoded with UseNumber. Numbers are equal
+// when their exact decimal values are, so 1 and 1.0 match but adjacent
+// integers beyond float64 precision do not.
+func jsonValueEqual(a, b any) bool {
+	switch av := a.(type) {
+	case json.Number:
+		bv, ok := b.(json.Number)
+		return ok && jsonNumberEqual(av, bv)
+	case map[string]any:
+		bv, ok := b.(map[string]any)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for k, ae := range av {
+			be, ok := bv[k]
+			if !ok || !jsonValueEqual(ae, be) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		bv, ok := b.([]any)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if !jsonValueEqual(av[i], bv[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		// string, bool, nil
+		return a == b
+	}
+}
+
+func jsonNumberEqual(a, b json.Number) bool {
+	if a == b {
+		return true
+	}
+	ar, aok := new(big.Rat).SetString(a.String())
+	br, bok := new(big.Rat).SetString(b.String())
+	if !aok || !bok {
+		return false
+	}
+	return ar.Cmp(br) == 0
 }
 
 func stringPtrEqual(a, b *string) bool {
