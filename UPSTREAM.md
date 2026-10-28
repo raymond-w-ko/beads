@@ -1,6 +1,6 @@
 # Upstream
 
-This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-28 at fork main 61627cfd0, upstream/main ce8554ffb.
+This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-28 at fork main 94a546cce, upstream/main c153e3b9c.
 
 ## Posted
 
@@ -27,7 +27,7 @@ Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator select
 | 7fc83d768 | SHOW TABLES/COLUMNS probes instead of INFORMATION_SCHEMA; retried open-time drift check (Dolt 1105 under concurrent DROP DATABASE) | candidate upstream PR; operator selects |
 | 1a7b0e7f8 | Comment wording for the two-statement column probe; UPSTREAM.md hash for 7fc83d768 | fork-only (docs) |
 | 94af39eca, 33184bffc, 9d08d1e9d | `bd supersede` moves inbound `blocks` edges to the replacement in one transaction; `--keep-blockers` opts out; JSON `moved_blockers`/`kept_blockers` (asked by everturn, mail bd-wisp-sy63f); 33184bffc keeps a blocker whose edge to the replacement has another type and carries edge metadata on the move; 9d08d1e9d keeps such a blocker before the cycle check and says so in the help | candidate upstream PR; operator selects |
-| a32d1c7f3 | bd export --strict (any failed read of either table, the plane read, the owner config or memories exits non-zero; an owner exclusion in force, config.yaml, database or --exclude-owner, is refused before a line is printed; a missing wisps table still reads as empty) and a paged export (ordered id pass through the search body, then 500-bead pages with relations written as read, order and lines unchanged); version 1.3.2-dev.2 (asked by everturn ADR 0177, mail bd-wisp-sqecv; beads bd-a93bt, bd-skjnq, bd-aqwsl, bd-ve8gk) | candidate upstream PR; operator selects |
+| a32d1c7f3 | bd export --strict (any failed read of either table, the plane read, the owner config or memories exits non-zero; an owner exclusion in force, config.yaml, database or --exclude-owner, is refused before a line is printed; a missing wisps table still reads as empty) and a paged export (ordered id pass through the search body, then 500-bead pages with relations written as read, order and lines unchanged); version 1.3.2-dev.2 (asked by everturn ADR 0177, mail bd-wisp-sqecv; beads bd-a93bt, bd-skjnq, bd-aqwsl, bd-ve8gk) | candidate upstream PR; operator selects; upstream 1.3.2 (#6444, #7785 at 12846c6a3, a96f12ccd) carries the wisp-classification failure and the 200-id batching, the --strict and paged parts stay fork-only |
 | 61627cfd0 | bd delete --if-threads guard checked in a query count independent of the thread count (one walk for all roots per level with UNION ALL over the indexed edge columns, one exclude-label read per level, ImageInTx rows read per plane in batches with column-collation-faithful OR of col = ? matching, one GetIssuesByIDs read of the ids before the transaction); remote_dolt_only build drops its dolt-db and beads/beads fallbacks (127.0.0.1, root, empty like the default build); version 1.3.2-dev.3 (asked by everturn mail bd-wisp-8mr60 and operator mail bd-wisp-a3txx; beads bd-mr4zw, bd-1ib7c, bd-7ty9d, bd-mqjmb, bd-yljjb, bd-72krj, bd-wyzim, bd-qg2ch) | guard and image parts: candidate upstream PR, operator selects; defaults removal: fork-only |
 
 ## Already upstream
@@ -37,6 +37,7 @@ Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator select
 | 7ac4628bb, da73d6e70 | ba12ffa74 (#7224) |
 | 5d08ebcce (except the freeze check) | 9d646fc88 (#6424) |
 | merge 1a26e3afe and its 35 release commits | tag v1.3.1 |
+| merge 94a546cce and its 34 release commits | tag v1.3.2 (9b65b9e19), merged 2026-10-28 with fork precedence; stamped 1.3.3-dev.1 (bead bd-01jyf, review bd-g9ehw, landed by bd-l7acv; asked by operator mail bd-wisp-dioay) |
 | f19bcec8f | ebe3b6bcb (#7185): upstream's `installExecuteIsolation` and `resetCommandFlags` fix the same in-process CLI runner leaks (BEADS_DIR left set, cobra flag state kept between runs); the fork's smaller harness patch is interim and the next upstream merge replaces it |
 | 69709b0d5 | ebe3b6bcb (#7185): the removed `DryRunWithRigPrefix` subtest and the `--` before flag-like create titles are upstream's hunks; the one-second wait before the `--age 0s` wisp GC call is fork-only until the DATETIME rounding race is fixed upstream |
 
