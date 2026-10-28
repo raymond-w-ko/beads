@@ -1,6 +1,6 @@
 # Upstream
 
-This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-27 at fork main a32d1c7f3, upstream/main ce8554ffb.
+This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-10-28 at fork main 61627cfd0, upstream/main ce8554ffb.
 
 ## Posted
 
@@ -28,6 +28,7 @@ Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator select
 | 1a7b0e7f8 | Comment wording for the two-statement column probe; UPSTREAM.md hash for 7fc83d768 | fork-only (docs) |
 | 94af39eca, 33184bffc, 9d08d1e9d | `bd supersede` moves inbound `blocks` edges to the replacement in one transaction; `--keep-blockers` opts out; JSON `moved_blockers`/`kept_blockers` (asked by everturn, mail bd-wisp-sy63f); 33184bffc keeps a blocker whose edge to the replacement has another type and carries edge metadata on the move; 9d08d1e9d keeps such a blocker before the cycle check and says so in the help | candidate upstream PR; operator selects |
 | a32d1c7f3 | bd export --strict (any failed read of either table, the plane read, the owner config or memories exits non-zero; an owner exclusion in force, config.yaml, database or --exclude-owner, is refused before a line is printed; a missing wisps table still reads as empty) and a paged export (ordered id pass through the search body, then 500-bead pages with relations written as read, order and lines unchanged); version 1.3.2-dev.2 (asked by everturn ADR 0177, mail bd-wisp-sqecv; beads bd-a93bt, bd-skjnq, bd-aqwsl, bd-ve8gk) | candidate upstream PR; operator selects |
+| 61627cfd0 | bd delete --if-threads guard checked in a query count independent of the thread count (one walk for all roots per level with UNION ALL over the indexed edge columns, one exclude-label read per level, ImageInTx rows read per plane in batches with column-collation-faithful OR of col = ? matching, one GetIssuesByIDs read of the ids before the transaction); remote_dolt_only build drops its dolt-db and beads/beads fallbacks (127.0.0.1, root, empty like the default build); version 1.3.2-dev.3 (asked by everturn mail bd-wisp-8mr60 and operator mail bd-wisp-a3txx; beads bd-mr4zw, bd-1ib7c, bd-7ty9d, bd-mqjmb, bd-yljjb, bd-72krj, bd-wyzim, bd-qg2ch) | guard and image parts: candidate upstream PR, operator selects; defaults removal: fork-only |
 
 ## Already upstream
 
@@ -43,8 +44,8 @@ Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator select
 
 | Fork commits | Why |
 |--------------|-----|
-| e6d342069, ecce4664a, 7dfdc78f4, 51902b39b, b7aed9203, 784f3cdb5, 38598302d | remote_dolt_only build: no local Dolt, external server on 3307, dolt-db and beads/beads defaults, remote-only `make build`, test skips |
-| a8716a50d (credentials_test.go part) | needed only for the remote_dolt_only default host |
+| e6d342069, ecce4664a, 7dfdc78f4, 51902b39b, b7aed9203, 784f3cdb5, 38598302d | remote_dolt_only build: no local Dolt, external server on 3307, dolt-db and beads/beads defaults (removed by 61627cfd0, bd-72krj), remote-only `make build`, test skips |
+| a8716a50d (credentials_test.go part) | needed only for the remote_dolt_only default host (host default removed by 61627cfd0; the test part may now match upstream, check before the next merge) |
 | c9ba431a6 | test Dolt server for the remote-only build |
 | cab3d5cb3 (AGENTS.md part) | everturn checks |
 | e017d0679 | fork glossary |
