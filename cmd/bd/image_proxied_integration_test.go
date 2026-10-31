@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -242,8 +243,9 @@ func assertImageFromFile(t *testing.T, r imageRoute, want string, ids ...string)
 	}
 }
 
-// writeBetweenReads runs write once, just before the image read of trigger's
-// own row: after the transaction has read every earlier id.
+// writeBetweenReads runs write once, just before the batch's durable edge
+// read for trigger: after the transaction has read every requested id's own
+// row, labels, comments and events, and before it reads any edge.
 type writeBetweenReads struct {
 	storeissueops.DBTX
 	trigger string
@@ -252,7 +254,7 @@ type writeBetweenReads struct {
 }
 
 func (w *writeBetweenReads) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	if !w.fired && strings.Contains(query, "FROM issues WHERE `id` = ?") && len(args) == 1 && args[0] == w.trigger {
+	if !w.fired && strings.Contains(query, " FROM dependencies t WHERE ") && slices.Contains(args, any(w.trigger)) {
 		w.fired = true
 		w.write()
 	}
@@ -327,12 +329,16 @@ func TestImageRoutesAgreeOnOneDataset(t *testing.T) {
 		assertImageFromFile(t, r, embeddedOut, a.ID, w.ID)
 	}
 
-	// ONE TRANSACTION: a write committed by a second connection between the
-	// reads of two ids shows in both images or in neither. The write is an
-	// edge d -> c, which lands in both images' Dependencies. It runs through
+	// ONE TRANSACTION: a write committed by a second connection between two
+	// reads of one call shows in every part of both images or in none. The
+	// write is an edge d -> c, which lands in both images' Dependencies and
+	// also changes a part read earlier (its event or a row). It runs through
 	// ImageInTx on one transaction — the body all three roles wrap in their
-	// one read transaction — with the write hooked in front of d's row read,
-	// after c is fully read.
+	// one read transaction — with the write hooked in front of the edge read,
+	// after every other part is read. Each image must then be the one from
+	// before the write or the one from after it, both from the same side: a
+	// read that is not one snapshot mixes the earlier parts from before with
+	// the edges from after, and matches neither.
 	t.Run("one_transaction", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
@@ -341,6 +347,10 @@ func TestImageRoutesAgreeOnOneDataset(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer db.Close()
+		before, err := storeissueops.ImageInTx(ctx, db, []string{c.ID, d.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -358,16 +368,39 @@ func TestImageRoutesAgreeOnOneDataset(t *testing.T) {
 		if !hooked.fired {
 			t.Fatal("the write never ran between the reads")
 		}
-		inC, inD := imageHasDependency(snap[0], d.ID, c.ID), imageHasDependency(snap[1], d.ID, c.ID)
-		if inC != inD {
-			t.Fatalf("one read shows the mid-read edge in one image only: in %s %v, in %s %v", c.ID, inC, d.ID, inD)
+		after, err := storeissueops.ImageInTx(ctx, db, []string{c.ID, d.ID})
+		if err != nil {
+			t.Fatal(err)
 		}
-		t.Logf("mid-read edge visible in both images: %v (false is the snapshot)", inC)
+		withoutEdges := func(img issueops.Image) string {
+			img.Dependencies, img.Revision = nil, ""
+			b, err := storeissueops.CanonicalImageJSON(img)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(b)
+		}
+		if withoutEdges(before[0]) == withoutEdges(after[0]) && withoutEdges(before[1]) == withoutEdges(after[1]) {
+			t.Fatal("the write changed nothing but the edges, so a mixed read would go unseen")
+		}
+		side := func(i int) string {
+			switch snap[i].Revision {
+			case before[i].Revision:
+				return "before"
+			case after[i].Revision:
+				return "after"
+			}
+			return "neither"
+		}
+		if side(0) == "neither" || side(0) != side(1) {
+			t.Fatalf("one read is not one snapshot: %s's image is from %s the write, %s's from %s", c.ID, side(0), d.ID, side(1))
+		}
+		t.Logf("one read saw the state from %s the mid-read write (before is the snapshot)", side(0))
 
 		// The write did land: a fresh read on every route sees it in both.
-		after := decodeImageLines(t, proxied.image(t, c.ID, d.ID))
-		if !imageHasDependency(after[0], d.ID, c.ID) || !imageHasDependency(after[1], d.ID, c.ID) {
-			t.Fatalf("the committed edge is missing from a fresh read: %v / %v", after[0].Dependencies, after[1].Dependencies)
+		fresh := decodeImageLines(t, proxied.image(t, c.ID, d.ID))
+		if !imageHasDependency(fresh[0], d.ID, c.ID) || !imageHasDependency(fresh[1], d.ID, c.ID) {
+			t.Fatalf("the committed edge is missing from a fresh read: %v / %v", fresh[0].Dependencies, fresh[1].Dependencies)
 		}
 		if got := direct.image(t, c.ID, d.ID); got != proxied.image(t, c.ID, d.ID) {
 			t.Errorf("direct and proxied differ after the write")
