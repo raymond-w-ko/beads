@@ -8,7 +8,7 @@ and loses everything when it stops.
 | Setting | Value |
 |---------|-------|
 | Container | `bd-test-dolt` |
-| Image | `dolthub/dolt-sql-server:2.2.0`, pinned by digest in `Dockerfile` |
+| Image | `dolthub/dolt-sql-server:2.6.2`, pinned by digest in `Dockerfile` |
 | Address | `127.0.0.1:3317` |
 | User | `beads`, password `bd-test` (test-only, all privileges) |
 
@@ -35,5 +35,5 @@ a real server.
 
 The Go test harness does not use this container. With
 `BEADS_TEST_ENV_RUN_DOLT=1`, `scripts/test.sh` lets `internal/testutil` start
-its own testcontainers from the same image on random ports; see
-`engdocs/TESTING.md`.
+its own testcontainers on random ports, from the `dolthub/dolt-sql-server` tag
+its `DoltDockerImage` names; see `engdocs/TESTING.md`.

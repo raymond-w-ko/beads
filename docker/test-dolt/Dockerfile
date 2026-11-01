@@ -3,10 +3,11 @@
 # lives on tmpfs and the port is bound to 127.0.0.1 only. It is never the
 # production server. See README.md.
 
-# Dolt 2.2.0 exactly, the version beads pins (scripts/ci/install-dolt.sh) and
-# the image the Go test harness uses (internal/testutil). Same digest as
-# everturn's docker/test-dolt; raise it only together with that pin.
-# dolthub/dolt-sql-server:2.2.0
-FROM dolthub/dolt-sql-server@sha256:baf9449a54dc6572dc5d688386e6f45ecb9f76e5bc4869be429f450b90ffecb0
+# Dolt 2.6.2 exactly. Upstream beads requires Dolt 2.6.0 or later
+# (scripts/ci/install-dolt.sh, internal/testutil); 2.6.2 adds 2.6.1's DOLT_GC
+# and memory fixes and a server-crash fix in generated-column index rows. Same
+# digest as everturn's docker/test-dolt; raise it only together with that pin.
+# dolthub/dolt-sql-server:2.6.2 (multi-arch index digest)
+FROM dolthub/dolt-sql-server@sha256:c8f51ad58aaa585850dea9fd77268aab3de1aaef4cd48ce83900eb103ea5ebf7
 
 COPY init.sql /docker-entrypoint-initdb.d/init.sql
