@@ -253,18 +253,67 @@ func ResolveConflictRows(ctx context.Context, db DBConn, table string, keys []st
 		return 0, fmt.Errorf("set dolt_force_transaction_commit: %w", err)
 	}
 
+	// --theirs writes their values back into the table, and a generated
+	// column (issues.everturn_action) refuses any assigned value; read the
+	// set once for every row resolved here.
+	var generated map[string]bool
+	if strategy == ConflictStrategyTheirs {
+		var err error
+		if generated, err = conflictGeneratedColumns(ctx, db, table); err != nil {
+			return 0, err
+		}
+	}
+
 	resolved := 0
 	for _, key := range keys {
 		row, err := loadConflictRow(ctx, db, table, keyCol, key)
 		if err != nil {
 			return resolved, err
 		}
-		if err := resolveOneConflictRow(ctx, db, table, keyCol, key, strategy, row); err != nil {
+		if err := resolveOneConflictRow(ctx, db, table, keyCol, key, strategy, row, generated); err != nil {
 			return resolved, err
 		}
 		resolved++
 	}
 	return resolved, nil
+}
+
+// conflictGeneratedColumns names the columns of table that SHOW CREATE TABLE
+// defines GENERATED ALWAYS AS: dolt computes them, and an UPDATE that assigns
+// one fails ("The value specified for generated column ... is not allowed").
+// SHOW COLUMNS cannot be used: Dolt 2.2.0 leaves Extra empty for a STORED
+// generated column. Each column definition is one line opening with its
+// backtick-quoted name (the shape issueops.imageGeneratedFromCreate reads).
+func conflictGeneratedColumns(ctx context.Context, db DBConn, table string) (map[string]bool, error) {
+	if err := ValidateConflictTable(table); err != nil {
+		return nil, err
+	}
+	var name, ddl string
+	//nolint:gosec // table validated as an identifier just above.
+	if err := db.QueryRowContext(ctx, "SHOW CREATE TABLE `"+table+"`").Scan(&name, &ddl); err != nil {
+		return nil, fmt.Errorf("read generated columns of %s: %w", table, err)
+	}
+	generated := map[string]bool{}
+	for _, line := range strings.Split(ddl, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "`") || !strings.Contains(strings.ToUpper(line), " GENERATED ALWAYS AS ") {
+			continue
+		}
+		var col strings.Builder
+		for i := 1; i < len(line); i++ {
+			if line[i] == '`' {
+				if i+1 < len(line) && line[i+1] == '`' {
+					col.WriteByte('`')
+					i++
+					continue
+				}
+				generated[col.String()] = true
+				break
+			}
+			col.WriteByte(line[i])
+		}
+	}
+	return generated, nil
 }
 
 // rawConflictRow is one conflict row kept in raw scanned form, so their_*
@@ -369,8 +418,10 @@ func conflictTargetStillPresent(ctx context.Context, db DBConn, table, keyCol st
 // "ours" is dolt's manual-resolution path: the working set already holds our
 // values, so deleting the conflict row *is* the resolution. "theirs" first
 // writes their values over ours, then deletes the conflict row — the order
-// matters, since the delete is what tells dolt the row is settled.
-func resolveOneConflictRow(ctx context.Context, db DBConn, table, keyCol, key, strategy string, row rawConflictRow) error {
+// matters, since the delete is what tells dolt the row is settled. generated
+// names table's generated columns: they count as their data but are never
+// written, since dolt recomputes them from the columns that are.
+func resolveOneConflictRow(ctx context.Context, db DBConn, table, keyCol, key, strategy string, row rawConflictRow, generated map[string]bool) error {
 	ourKey, ourOK := row.value("our", keyCol)
 	theirKey, theirOK := row.value("their", keyCol)
 	if !ourOK || !theirOK {
@@ -389,9 +440,12 @@ func resolveOneConflictRow(ctx context.Context, db DBConn, table, keyCol, key, s
 		if len(names) == 0 {
 			return fmt.Errorf("conflict for %s %s carries no their_* data columns", table, key)
 		}
-		sets := make([]string, len(names))
+		sets := make([]string, 0, len(names))
 		args := make([]any, 0, len(names)+1)
 		for i, n := range names {
+			if generated[n] {
+				continue
+			}
 			// Column names are interpolated (MySQL cannot bind an
 			// identifier) and come from the conflict table's own schema,
 			// which a peer's schema merge can extend — gate them exactly
@@ -399,29 +453,34 @@ func resolveOneConflictRow(ctx context.Context, db DBConn, table, keyCol, key, s
 			if err := ValidateConflictTable(n); err != nil {
 				return fmt.Errorf("refusing to write unexpected column %q of %s: %w", n, table, err)
 			}
-			sets[i] = fmt.Sprintf("`%s` = ?", n)
+			sets = append(sets, fmt.Sprintf("`%s` = ?", n))
 			args = append(args, vals[i])
 		}
-		args = append(args, ourKey)
-		stmt := fmt.Sprintf("UPDATE `%s` SET %s WHERE `%s` = ?", table, strings.Join(sets, ", "), keyCol) //nolint:gosec // identifiers validated above
-		res, err := db.ExecContext(ctx, stmt, args...)
-		if err != nil {
-			return fmt.Errorf("apply their values for %s %s: %w", table, key, err)
-		}
-		// Zero rows would mean the row we read the conflict for is no longer
-		// there — another session on the same branch deleted it between the
-		// read and the write. Clearing the conflict now would discard their
-		// side under a --theirs invocation, undetectably. But zero is not
-		// proof of that on its own (see conflictTargetStillPresent), so ask
-		// before refusing: an operator who named this row deserves the abort
-		// only when the row really is gone.
-		if n, err := res.RowsAffected(); err != nil || n == 0 {
-			present, err := conflictTargetStillPresent(ctx, db, table, keyCol, ourKey)
+		// Only generated columns differ: dolt recomputes them from the
+		// stored ones, so there is nothing to write before the delete.
+		if len(sets) > 0 {
+			args = append(args, ourKey)
+			stmt := fmt.Sprintf("UPDATE `%s` SET %s WHERE `%s` = ?", table, strings.Join(sets, ", "), keyCol) //nolint:gosec // identifiers validated above
+			res, err := db.ExecContext(ctx, stmt, args...)
 			if err != nil {
-				return fmt.Errorf("confirm %s %s still exists after writing their values: %w", table, key, err)
+				return fmt.Errorf("apply their values for %s %s: %w", table, key, err)
 			}
-			if !present {
-				return fmt.Errorf("their values for %s %s matched no row (was it deleted concurrently?); conflict left unresolved", table, key)
+			// Zero rows would mean the row we read the conflict for is no
+			// longer there — another session on the same branch deleted it
+			// between the read and the write. Clearing the conflict now would
+			// discard their side under a --theirs invocation, undetectably.
+			// But zero is not proof of that on its own (see
+			// conflictTargetStillPresent), so ask before refusing: an
+			// operator who named this row deserves the abort only when the
+			// row really is gone.
+			if n, err := res.RowsAffected(); err != nil || n == 0 {
+				present, err := conflictTargetStillPresent(ctx, db, table, keyCol, ourKey)
+				if err != nil {
+					return fmt.Errorf("confirm %s %s still exists after writing their values: %w", table, key, err)
+				}
+				if !present {
+					return fmt.Errorf("their values for %s %s matched no row (was it deleted concurrently?); conflict left unresolved", table, key)
+				}
 			}
 		}
 	}

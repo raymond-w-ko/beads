@@ -251,3 +251,232 @@ func TestAutoResolveConflictsAfterCLIPull_DependencyAuditOnly(t *testing.T) {
 		t.Errorf("expected 1 dependency row after resolve, got %d", count)
 	}
 }
+
+// TestAutoResolveConflictsAfterCLIPull_TheirsOnlyEverturnAction pins the sync
+// auto-merge against the fork's STORED generated column issues.everturn_action
+// (schema/fork_indexes.go). We edit the title, the peer edits only metadata's
+// $.everturn.action, and both restamp updated_at, so the row conflicts with
+// metadata and everturn_action both theirs-only. The field merge must take
+// their metadata and leave everturn_action for dolt to recompute: assigning a
+// generated column fails ("The value specified for generated column
+// "everturn_action" in table "issues" is not allowed").
+func TestAutoResolveConflictsAfterCLIPull_TheirsOnlyEverturnAction(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+	db := store.db
+
+	const issueID = "genc-1"
+	const wake = `{"everturn":{"action":"wake"}}`
+	var currentBranch string
+	if err := db.QueryRowContext(ctx, "SELECT active_branch()").Scan(&currentBranch); err != nil {
+		t.Fatalf("get current branch: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, metadata, updated_at) "+
+			"VALUES (?, 'base title', '', '', '', '', 'open', 2, 'task', '{}', '2026-07-10 10:00:00')", issueID); err != nil {
+		t.Fatalf("seed issue: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'seed issue')"); err != nil {
+		t.Fatalf("commit seed issue: %v", err)
+	}
+
+	peerBranch := currentBranch + "_genpeer"
+	if _, err := db.ExecContext(ctx, "CALL DOLT_BRANCH(?)", peerBranch); err != nil {
+		t.Fatalf("create peer branch: %v", err)
+	}
+	defer func() {
+		db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch)
+		db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', ?)", peerBranch)
+	}()
+
+	// Ours: a title edit.
+	if _, err := db.ExecContext(ctx,
+		"UPDATE issues SET title = 'our title', updated_at = '2026-07-10 11:00:00' WHERE id = ?", issueID); err != nil {
+		t.Fatalf("edit title on current: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'title on current')"); err != nil {
+		t.Fatalf("commit title on current: %v", err)
+	}
+
+	// Theirs: only metadata, and so only $.everturn.action.
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", peerBranch); err != nil {
+		t.Fatalf("checkout peer: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		"UPDATE issues SET metadata = ?, updated_at = '2026-07-10 12:00:00' WHERE id = ?", wake, issueID); err != nil {
+		t.Fatalf("edit metadata on peer: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'everturn action on peer')"); err != nil {
+		t.Fatalf("commit metadata on peer: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch); err != nil {
+		t.Fatalf("checkout current: %v", err)
+	}
+
+	// Persist the conflicted merge into the working set, as a CLI pull leaves it.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "SET @@dolt_allow_commit_conflicts = 1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("allow commit conflicts: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_MERGE(?)", peerBranch); err != nil {
+		t.Logf("merge returned: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("persist conflicted working set: %v", err)
+	}
+
+	var n int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM dolt_conflicts_issues WHERE our_id = ?", issueID).Scan(&n); err != nil {
+		t.Fatalf("count issues conflicts: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("issues conflicts for %s = %d, want 1 (both sides restamped updated_at)", issueID, n)
+	}
+
+	resolved, err := store.autoResolveConflictsAfterCLIPull(ctx)
+	if err != nil {
+		t.Fatalf("autoResolveConflictsAfterCLIPull: %v", err)
+	}
+	if !resolved {
+		t.Fatal("expected the field-mergeable issues conflict to auto-resolve after a CLI pull")
+	}
+
+	var title, action, updated string
+	if err := db.QueryRowContext(ctx,
+		"SELECT title, COALESCE(everturn_action, ''), DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') FROM issues WHERE id = ?", issueID).
+		Scan(&title, &action, &updated); err != nil {
+		t.Fatalf("read merged issue: %v", err)
+	}
+	if title != "our title" {
+		t.Errorf("title = %q, want our edit %q", title, "our title")
+	}
+	if action != "wake" {
+		t.Errorf("everturn_action = %q, want %q recomputed from their metadata", action, "wake")
+	}
+	if updated != "2026-07-10 12:00:00" {
+		t.Errorf("updated_at = %q, want the newer side's %q", updated, "2026-07-10 12:00:00")
+	}
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM dolt_conflicts_issues").Scan(&n); err != nil {
+		t.Fatalf("count issues conflicts after resolve: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("issues conflicts after resolve = %d, want 0", n)
+	}
+}
+
+// TestAutoResolveConflictsAfterCLIPull_ContestedGeneratedEqualTimestampDeclines
+// pins review bd-r7n55: a generated column is dropped from the auto-merge's
+// write-back plan only, never from its merge rules. On this test branch,
+// issues gains a STORED generated projection over two fields the sides edit
+// independently, so it is contested: base "base title:", ours "our title:",
+// theirs "base title:peer description". Both sides stamp the same updated_at,
+// so the LWW tiebreak is ambiguous and the row must stay the operator's.
+// Divergent row_lock values keep dolt from merging the disjoint source edits
+// itself (row_lock is excluded from auto-merge classification).
+func TestAutoResolveConflictsAfterCLIPull_ContestedGeneratedEqualTimestampDeclines(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+	db := store.db
+
+	const issueID = "genc-2"
+	var currentBranch string
+	if err := db.QueryRowContext(ctx, "SELECT active_branch()").Scan(&currentBranch); err != nil {
+		t.Fatalf("get current branch: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		"ALTER TABLE issues ADD COLUMN merge_summary TEXT GENERATED ALWAYS AS (CONCAT(title, CHAR(58), description)) STORED"); err != nil {
+		t.Fatalf("add generated projection: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, metadata, updated_at) "+
+			"VALUES (?, 'base title', '', '', '', '', 'open', 2, 'task', '{}', '2026-07-10 10:00:00')", issueID); err != nil {
+		t.Fatalf("seed issue: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'generated projection and seed issue')"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	peerBranch := currentBranch + "_gencontested"
+	if _, err := db.ExecContext(ctx, "CALL DOLT_BRANCH(?)", peerBranch); err != nil {
+		t.Fatalf("create peer branch: %v", err)
+	}
+	defer func() {
+		db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch)
+		db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', ?)", peerBranch)
+	}()
+
+	// Ours: the title.
+	if _, err := db.ExecContext(ctx,
+		"UPDATE issues SET title = 'our title', row_lock = 111, updated_at = '2026-07-10 11:00:00' WHERE id = ?", issueID); err != nil {
+		t.Fatalf("edit title on current: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'title on current')"); err != nil {
+		t.Fatalf("commit title on current: %v", err)
+	}
+
+	// Theirs: the description, at the same updated_at.
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", peerBranch); err != nil {
+		t.Fatalf("checkout peer: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		"UPDATE issues SET description = 'peer description', row_lock = 222, updated_at = '2026-07-10 11:00:00' WHERE id = ?", issueID); err != nil {
+		t.Fatalf("edit description on peer: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'description on peer')"); err != nil {
+		t.Fatalf("commit description on peer: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch); err != nil {
+		t.Fatalf("checkout current: %v", err)
+	}
+
+	// Persist the conflicted merge into the working set, as a CLI pull leaves it.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "SET @@dolt_allow_commit_conflicts = 1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("allow commit conflicts: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_MERGE(?)", peerBranch); err != nil {
+		t.Logf("merge returned: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("persist conflicted working set: %v", err)
+	}
+
+	var n int
+	var base, ours, theirs string
+	if err := db.QueryRowContext(ctx,
+		"SELECT base_merge_summary, our_merge_summary, their_merge_summary FROM dolt_conflicts_issues WHERE our_id = ?", issueID).
+		Scan(&base, &ours, &theirs); err != nil {
+		t.Fatalf("read the issues conflict (want exactly one, contested merge_summary): %v", err)
+	}
+	if base == ours || base == theirs || ours == theirs {
+		t.Fatalf("merge_summary base/ours/theirs = %q/%q/%q; want three distinct values (contested)", base, ours, theirs)
+	}
+
+	resolved, err := store.autoResolveConflictsAfterCLIPull(ctx)
+	if err != nil {
+		t.Fatalf("autoResolveConflictsAfterCLIPull: %v", err)
+	}
+	if resolved {
+		t.Fatal("auto-merge accepted an equal-timestamp contested generated merge_summary; the merge rules must decline it")
+	}
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM dolt_conflicts_issues WHERE our_id = ?", issueID).Scan(&n); err != nil {
+		t.Fatalf("count issues conflicts after decline: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("issues conflicts for %s after decline = %d, want 1 (left for the operator)", issueID, n)
+	}
+}

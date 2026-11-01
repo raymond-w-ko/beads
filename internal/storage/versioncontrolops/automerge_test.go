@@ -70,7 +70,7 @@ func TestMergeIssuesConflictRow_DisjointFieldsBothSurvive(t *testing.T) {
 		"updated_at": {tsBase, tsOurs, tsTheirs},
 	})
 
-	m, ok := mergeIssuesConflictRow(row)
+	m, ok := mergeIssuesConflictRow(row, nil)
 	if !ok {
 		t.Fatal("expected disjoint-field conflict to be field-mergeable")
 	}
@@ -100,7 +100,7 @@ func TestMergeIssuesConflictRow_ContestedCellLWW(t *testing.T) {
 			"status":     {"open", "in_progress", "closed"},
 			"updated_at": {tsBase, tsOurs, tsTheirs},
 		})
-		m, ok := mergeIssuesConflictRow(row)
+		m, ok := mergeIssuesConflictRow(row, nil)
 		if !ok {
 			t.Fatal("expected contested cell with distinct timestamps to be mergeable")
 		}
@@ -114,7 +114,7 @@ func TestMergeIssuesConflictRow_ContestedCellLWW(t *testing.T) {
 			"status":     {"open", "in_progress", "closed"},
 			"updated_at": {tsBase, tsTheirs, tsOurs},
 		})
-		m, ok := mergeIssuesConflictRow(row)
+		m, ok := mergeIssuesConflictRow(row, nil)
 		if !ok {
 			t.Fatal("expected contested cell with distinct timestamps to be mergeable")
 		}
@@ -136,7 +136,7 @@ func TestMergeIssuesConflictRow_AmbiguousLeftAlone(t *testing.T) {
 			"status":     {"open", "in_progress", "closed"},
 			"updated_at": {tsBase, tsOurs, tsOurs},
 		})
-		if _, ok := mergeIssuesConflictRow(row); ok {
+		if _, ok := mergeIssuesConflictRow(row, nil); ok {
 			t.Error("a contested cell with equal updated_at must be left for the operator")
 		}
 	})
@@ -146,7 +146,7 @@ func TestMergeIssuesConflictRow_AmbiguousLeftAlone(t *testing.T) {
 			"status":     {"open", "in_progress", "closed"},
 			"updated_at": {tsBase, "not-a-time", tsTheirs},
 		})
-		if _, ok := mergeIssuesConflictRow(row); ok {
+		if _, ok := mergeIssuesConflictRow(row, nil); ok {
 			t.Error("a contested cell with an unparseable updated_at must be left for the operator")
 		}
 	})
@@ -159,7 +159,7 @@ func TestMergeIssuesConflictRow_AmbiguousLeftAlone(t *testing.T) {
 			"assignee":   {"", "", "alice"},
 			"updated_at": {tsBase, tsOurs, tsOurs},
 		})
-		if _, ok := mergeIssuesConflictRow(row); !ok {
+		if _, ok := mergeIssuesConflictRow(row, nil); !ok {
 			t.Error("disjoint edits must merge regardless of the timestamps")
 		}
 	})
@@ -174,7 +174,7 @@ func TestMergeIssuesConflictRow_StructuralConflictsLeftAlone(t *testing.T) {
 			"status":     {nil, "open", "closed"},
 			"updated_at": {nil, tsOurs, tsTheirs},
 		})
-		if _, ok := mergeIssuesConflictRow(row); ok {
+		if _, ok := mergeIssuesConflictRow(row, nil); ok {
 			t.Error("add/add must be left for the operator")
 		}
 	})
@@ -184,7 +184,7 @@ func TestMergeIssuesConflictRow_StructuralConflictsLeftAlone(t *testing.T) {
 			"status":     {"open", nil, "closed"},
 			"updated_at": {tsBase, nil, tsTheirs},
 		})
-		if _, ok := mergeIssuesConflictRow(row); ok {
+		if _, ok := mergeIssuesConflictRow(row, nil); ok {
 			t.Error("delete/modify must be left for the operator")
 		}
 	})
@@ -199,7 +199,7 @@ func TestMergeIssuesConflictRow_NullVsEmpty(t *testing.T) {
 		"assignee":   {nil, "", nil},
 		"updated_at": {tsBase, tsOurs, tsTheirs},
 	})
-	m, ok := mergeIssuesConflictRow(row)
+	m, ok := mergeIssuesConflictRow(row, nil)
 	if !ok {
 		t.Fatal("expected the row to merge: only one side changed assignee")
 	}
@@ -218,7 +218,7 @@ func TestMergeIssuesConflictRow_ByteValuesCompareEqual(t *testing.T) {
 		"assignee":   {"", "", "alice"},
 		"updated_at": {tsBase, tsOurs, tsTheirs},
 	})
-	m, ok := mergeIssuesConflictRow(row)
+	m, ok := mergeIssuesConflictRow(row, nil)
 	if !ok {
 		t.Fatal("expected the row to merge")
 	}
@@ -306,7 +306,7 @@ func TestMergeIssuesConflictRow_UpdatedAtAlwaysWrittenWithTheMerge(t *testing.T)
 		"assignee":   {"", "", "alice"},
 		"updated_at": {tsBase, tsTheirs, tsOurs}, // ours = 12:00, theirs = 11:00
 	})
-	m, ok := mergeIssuesConflictRow(row)
+	m, ok := mergeIssuesConflictRow(row, nil)
 	if !ok {
 		t.Fatal("expected disjoint-field conflict to merge")
 	}
@@ -331,7 +331,7 @@ func TestMergeIssuesConflictRow_NoWriteNoUpdatedAt(t *testing.T) {
 		"status":     {"open", "in_progress", "open"}, // only we changed it
 		"updated_at": {tsBase, tsTheirs, tsBase},
 	})
-	m, ok := mergeIssuesConflictRow(row)
+	m, ok := mergeIssuesConflictRow(row, nil)
 	if !ok {
 		t.Fatal("expected the row to merge")
 	}
@@ -353,7 +353,7 @@ func TestMergeIssuesConflictRow_CloseGroupIsAtomic(t *testing.T) {
 			"close_reason": {"", "done", ""},
 			"updated_at":   {tsBase, tsOurs, tsTheirs}, // theirs newer
 		})
-		m, ok := mergeIssuesConflictRow(row)
+		m, ok := mergeIssuesConflictRow(row, nil)
 		if !ok {
 			t.Fatal("expected the close-group conflict to merge by LWW")
 		}
@@ -376,7 +376,7 @@ func TestMergeIssuesConflictRow_CloseGroupIsAtomic(t *testing.T) {
 			"close_reason": {"", "done", ""},
 			"updated_at":   {tsBase, tsTheirs, tsOurs}, // ours newer
 		})
-		m, ok := mergeIssuesConflictRow(row)
+		m, ok := mergeIssuesConflictRow(row, nil)
 		if !ok {
 			t.Fatal("expected the close-group conflict to merge by LWW")
 		}
@@ -393,7 +393,7 @@ func TestMergeIssuesConflictRow_CloseGroupIsAtomic(t *testing.T) {
 			"closed_at":  {nil, "2026-07-10 11:00:00", nil},
 			"updated_at": {tsBase, tsOurs, tsOurs},
 		})
-		if _, ok := mergeIssuesConflictRow(row); ok {
+		if _, ok := mergeIssuesConflictRow(row, nil); ok {
 			t.Error("a contested close group with equal timestamps must go to the operator")
 		}
 	})
@@ -411,7 +411,7 @@ func TestMergeIssuesConflictRow_NonScalarColumnsDecline(t *testing.T) {
 				col:          {"base", "base + ours", "base + theirs"},
 				"updated_at": {tsBase, tsOurs, tsTheirs},
 			})
-			if _, ok := mergeIssuesConflictRow(row); ok {
+			if _, ok := mergeIssuesConflictRow(row, nil); ok {
 				t.Errorf("a contested %s must go to the operator, not be settled by LWW", col)
 			}
 		})
@@ -422,7 +422,7 @@ func TestMergeIssuesConflictRow_NonScalarColumnsDecline(t *testing.T) {
 				"assignee":   {"", "alice", ""},
 				"updated_at": {tsBase, tsOurs, tsTheirs},
 			})
-			m, ok := mergeIssuesConflictRow(row)
+			m, ok := mergeIssuesConflictRow(row, nil)
 			if !ok {
 				t.Fatalf("a one-sided %s edit is not contested and must merge", col)
 			}
@@ -443,7 +443,7 @@ func TestMergeIssuesConflictRow_ContestedCellsAreNamed(t *testing.T) {
 		"assignee":   {"", "", "alice"},
 		"updated_at": {tsBase, tsOurs, tsTheirs},
 	})
-	m, ok := mergeIssuesConflictRow(row)
+	m, ok := mergeIssuesConflictRow(row, nil)
 	if !ok {
 		t.Fatal("expected the row to merge")
 	}
@@ -745,6 +745,7 @@ func TestIssuesConflictsAreFieldMergeableLoadsEveryRow(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows(cols).
 			AddRow("bd-1", "bd-1", "bd-1", "open", "open", "closed", "2026-07-25 09:00:00", "2026-07-25 09:00:00", "2026-07-25 10:00:00").
 			AddRow("bd-2", "bd-2", "bd-2", "open", "open", "closed", "2026-07-25 09:00:00", "2026-07-25 09:00:00", "2026-07-25 10:00:00"))
+	expectIssuesShowCreate(mock)
 
 	plan, mergeable, err := issuesConflictsAreFieldMergeable(ctx, db)
 	if err != nil {
@@ -782,7 +783,7 @@ func TestMergeIssuesConflictRow_SettledRowGetsFreshRowLock(t *testing.T) {
 		"row_lock":   {int64(7), int64(111), int64(222)},
 		"updated_at": {tsBase, tsOurs, tsTheirs},
 	})
-	m, ok := mergeIssuesConflictRow(row)
+	m, ok := mergeIssuesConflictRow(row, nil)
 	if !ok {
 		t.Fatal("expected disjoint-field conflict to merge")
 	}
@@ -815,7 +816,7 @@ func TestMergeIssuesConflictRow_RowLockOnlyDivergenceIsNotAConflict(t *testing.T
 		"row_lock":   {int64(7), int64(111), int64(222)},
 		"updated_at": {tsBase, tsOurs, tsOurs}, // equal: LWW could never settle this
 	})
-	m, ok := mergeIssuesConflictRow(row)
+	m, ok := mergeIssuesConflictRow(row, nil)
 	if !ok {
 		t.Fatal("a row whose only divergence is the row_lock token must merge, not decline")
 	}
@@ -838,7 +839,7 @@ func TestMergeIssuesConflictRow_NoRowLockColumnDegradesGracefully(t *testing.T) 
 		"updated_at": {tsBase, tsOurs, tsTheirs},
 		// deliberately no "row_lock" key: simulates a pre-0054 schema.
 	})
-	m, ok := mergeIssuesConflictRow(row)
+	m, ok := mergeIssuesConflictRow(row, nil)
 	if !ok {
 		t.Fatal("expected disjoint-field conflict to merge even without a row_lock column")
 	}
@@ -862,4 +863,210 @@ func TestFreshRowLockDistinctFrom(t *testing.T) {
 			t.Fatal("minted token must be non-zero")
 		}
 	}
+}
+
+// issuesShowCreateDDL is SHOW CREATE TABLE issues trimmed to the columns these
+// cases use, with the fork's STORED generated column (fork_indexes.go).
+const issuesShowCreateDDL = "CREATE TABLE `issues` (\n" +
+	"  `id` varchar(255) NOT NULL,\n" +
+	"  `metadata` json DEFAULT (json_object()),\n" +
+	"  `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,\n" +
+	"  `everturn_action` varchar(255) GENERATED ALWAYS AS (left(json_unquote(json_extract(`metadata`, _utf8mb4'$.everturn.action')), 255)) STORED,\n" +
+	"  PRIMARY KEY (`id`)\n" +
+	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+
+// expectIssuesShowCreate pins issuesConflictsAreFieldMergeable's one read of
+// the issues table's generated columns.
+func expectIssuesShowCreate(mock sqlmock.Sqlmock) {
+	mock.ExpectQuery(regexp.QuoteMeta("SHOW CREATE TABLE `issues`")).
+		WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("issues", issuesShowCreateDDL))
+}
+
+// TestIssuesFieldMergeSkipsGeneratedColumns pins the sync auto-merge against
+// the fork's STORED generated column issues.everturn_action: when only their
+// side changed metadata (and so $.everturn.action), both cells classify as
+// theirs-only, but dolt refuses any value assigned to a generated column ("The
+// value specified for generated column ... is not allowed"). The plan writes
+// metadata and leaves everturn_action for dolt to recompute.
+func TestIssuesFieldMergeSkipsGeneratedColumns(t *testing.T) {
+	ctx := context.Background()
+	const conflictSQL = "SELECT * FROM `dolt_conflicts_issues`"
+	const deleteSQL = "DELETE FROM dolt_conflicts_issues WHERE our_id = ?"
+	cols := []string{
+		"base_id", "our_id", "their_id",
+		"base_metadata", "our_metadata", "their_metadata",
+		"base_updated_at", "our_updated_at", "their_updated_at",
+		"base_everturn_action", "our_everturn_action", "their_everturn_action",
+		"our_diff_type", "their_diff_type",
+	}
+	const wake = `{"everturn":{"action":"wake"}}`
+
+	t.Run("their metadata is written, the generated column is not", func(t *testing.T) {
+		db, mock := newMockDB(t)
+		mock.ExpectQuery(regexp.QuoteMeta(conflictSQL)).
+			WillReturnRows(sqlmock.NewRows(cols).AddRow(
+				"bd-1", "bd-1", "bd-1",
+				"{}", "{}", wake,
+				tsBase, tsOurs, tsTheirs,
+				nil, nil, "wake",
+				"modified", "modified"))
+		expectIssuesShowCreate(mock)
+		mock.ExpectExec("^"+regexp.QuoteMeta("UPDATE `issues` SET `metadata` = ?, `updated_at` = ? WHERE `id` = ?")+"$").
+			WithArgs(wake, tsTheirs, "bd-1").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec(regexp.QuoteMeta(deleteSQL)).WithArgs("bd-1").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		plan, mergeable, err := issuesConflictsAreFieldMergeable(ctx, db)
+		if err != nil || !mergeable {
+			t.Fatalf("issuesConflictsAreFieldMergeable = %v, %v; want a mergeable plan", mergeable, err)
+		}
+		if _, written := plan[0].merged("everturn_action"); written {
+			t.Fatalf("plan writes the generated column everturn_action: %v", plan[0].columns)
+		}
+		if err := resolveIssuesFieldMerge(ctx, db, plan); err != nil {
+			t.Fatalf("resolveIssuesFieldMerge: %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
+	t.Run("a row whose theirs-only cells are all generated clears without a write", func(t *testing.T) {
+		db, mock := newMockDB(t)
+		mock.ExpectQuery(regexp.QuoteMeta(conflictSQL)).
+			WillReturnRows(sqlmock.NewRows(cols).AddRow(
+				"bd-1", "bd-1", "bd-1",
+				"{}", "{}", "{}",
+				tsBase, tsBase, tsBase,
+				nil, nil, "wake",
+				"modified", "modified"))
+		expectIssuesShowCreate(mock)
+		// No UPDATE: nothing but a generated cell differs, and dolt accepts
+		// no assignment to it.
+		mock.ExpectExec(regexp.QuoteMeta(deleteSQL)).WithArgs("bd-1").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		plan, mergeable, err := issuesConflictsAreFieldMergeable(ctx, db)
+		if err != nil || !mergeable {
+			t.Fatalf("issuesConflictsAreFieldMergeable = %v, %v; want a mergeable plan", mergeable, err)
+		}
+		if err := resolveIssuesFieldMerge(ctx, db, plan); err != nil {
+			t.Fatalf("resolveIssuesFieldMerge: %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+}
+
+// TestMergeIssuesConflictRowContestedGeneratedCell pins review bd-r7n55's
+// finding: a generated column must go through the same merge rules as any
+// other cell and be dropped only from the write-back plan. merge_summary
+// stands for a generated projection over fields the two sides edited
+// independently (CONCAT(title, ':', description)), so it is contested whenever
+// they both edit. Removing it from classification would let an ambiguous LWW
+// tiebreak through that the rules decline.
+func TestMergeIssuesConflictRowContestedGeneratedCell(t *testing.T) {
+	generated := map[string]bool{"merge_summary": true}
+	rowWith := func(ourUpdated, theirUpdated any) rawConflictRow {
+		return conflictRowFor(t, map[string][3]any{
+			"id":            {"bd-1", "bd-1", "bd-1"},
+			"title":         {"base", "ours", "base"}, // only we changed it
+			"description":   {"", "", "peer"},         // only they changed it
+			"row_lock":      {int64(1), int64(111), int64(222)},
+			"updated_at":    {tsBase, ourUpdated, theirUpdated},
+			"merge_summary": {"base:", "ours:", "base:peer"}, // contested
+		})
+	}
+
+	for _, tc := range []struct {
+		name                     string
+		ourUpdated, theirUpdated any
+	}{
+		{"equal timestamps", tsOurs, tsOurs},
+		{"unparseable timestamps", "not a time", "also not a time"},
+	} {
+		t.Run(tc.name+" still decline", func(t *testing.T) {
+			row := rowWith(tc.ourUpdated, tc.theirUpdated)
+			if _, ok := mergeIssuesConflictRow(row, nil); ok {
+				t.Fatal("control: the merge rules must decline this row without the generated set")
+			}
+			if m, ok := mergeIssuesConflictRow(row, generated); ok {
+				t.Fatalf("a contested generated cell bypassed the ambiguous LWW tiebreak: columns=%v lww=%v", m.columns, m.lww)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name                     string
+		ourUpdated, theirUpdated any
+	}{
+		{"theirs newer", tsOurs, tsTheirs},
+		{"ours newer", tsTheirs, tsOurs},
+	} {
+		t.Run(tc.name+" follows the merge rules and never writes the generated cell", func(t *testing.T) {
+			row := rowWith(tc.ourUpdated, tc.theirUpdated)
+			want, wantOK := mergeIssuesConflictRow(row, nil)
+			got, ok := mergeIssuesConflictRow(row, generated)
+			if ok != wantOK || !ok {
+				t.Fatalf("ok = %v, want %v (and mergeable)", ok, wantOK)
+			}
+			if _, written := got.merged("merge_summary"); written {
+				t.Fatalf("plan writes the generated column merge_summary: %v", got.columns)
+			}
+			if !sameStrings(got.lww, want.lww) || !containsString(got.lww, "merge_summary") {
+				t.Errorf("lww = %v, want %v (the contested generated cell is still named)", got.lww, want.lww)
+			}
+			var wantCols []string
+			for _, c := range want.columns {
+				if c != "merge_summary" {
+					wantCols = append(wantCols, c)
+				}
+			}
+			if !sameStrings(got.columns, wantCols) {
+				t.Errorf("columns = %v, want %v (the merge without the generated cell)", got.columns, wantCols)
+			}
+			for _, c := range got.columns {
+				if c == "row_lock" {
+					continue // freshly minted per call
+				}
+				gv, _ := got.merged(c)
+				wv, _ := want.merged(c)
+				if !conflictCellsEqual(gv, wv) {
+					t.Errorf("%s = %v, want %v", c, gv, wv)
+				}
+			}
+		})
+	}
+}
+
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// sameStrings compares two lists as multisets: plan order follows the conflict
+// table's column order, which conflictRowFor does not fix.
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	count := map[string]int{}
+	for _, s := range a {
+		count[s]++
+	}
+	for _, s := range b {
+		count[s]--
+	}
+	for _, n := range count {
+		if n != 0 {
+			return false
+		}
+	}
+	return true
 }

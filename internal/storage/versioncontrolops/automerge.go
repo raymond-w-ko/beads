@@ -329,8 +329,15 @@ func classifyCell(row rawConflictRow, col string) (cellVerdict, any, bool) {
 // ambiguous (equal or unparseable updated_at), or a contested cell whose
 // contents LWW cannot merge without loss (issuesNonScalarColumns).
 //
+// generated names the issues columns dolt computes (the fork's STORED
+// issues.everturn_action, see conflictGeneratedColumns). They go through every
+// merge rule like any data column, so a contested one still declines on an
+// ambiguous LWW tiebreak and is still named in lww, but they never enter the
+// write-back plan: dolt refuses any value assigned to a generated column and
+// recomputes it from the columns that are written.
+//
 // It is pure, so every merge rule is unit-testable without a database.
-func mergeIssuesConflictRow(row rawConflictRow) (issuesRowMerge, bool) {
+func mergeIssuesConflictRow(row rawConflictRow, generated map[string]bool) (issuesRowMerge, bool) {
 	baseOK, ourOK, theirOK := row.sidesPresent([]string{issuesKeyColumn})
 	if !baseOK || !ourOK || !theirOK {
 		// add/add (no base row) or delete/modify (one side removed it):
@@ -402,6 +409,13 @@ func mergeIssuesConflictRow(row rawConflictRow) (issuesRowMerge, bool) {
 
 	merge := issuesRowMerge{ourKey: ourKey}
 	takeTheirs := func(col string) {
+		// A generated cell runs every rule below (a contested one still
+		// declines on an ambiguous LWW tiebreak and is still named in lww),
+		// but only here, at the write, is it dropped: dolt recomputes it from
+		// the columns the plan does write.
+		if generated[col] {
+			return
+		}
 		merge.columns = append(merge.columns, col)
 		merge.values = append(merge.values, theirVals[col])
 	}
@@ -550,9 +564,17 @@ func issuesConflictsAreFieldMergeable(ctx context.Context, db DBConn) ([]issuesR
 	if declineDuplicateConflictRows("issues", []string{issuesKeyColumn}, rows) {
 		return nil, false, nil
 	}
+	if len(rows) == 0 {
+		return []issuesRowMerge{}, true, nil
+	}
+	// The plan's UPDATE must not name a generated column; read them once.
+	generated, err := conflictGeneratedColumns(ctx, db, "issues")
+	if err != nil {
+		return nil, false, err
+	}
 	plan := make([]issuesRowMerge, 0, len(rows))
 	for _, row := range rows {
-		merged, ok := mergeIssuesConflictRow(row)
+		merged, ok := mergeIssuesConflictRow(row, generated)
 		if !ok {
 			return nil, false, nil
 		}

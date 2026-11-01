@@ -234,7 +234,7 @@ func TestResolveOneConflictRowZeroAffectedRows(t *testing.T) {
 		mock.ExpectExec(regexp.QuoteMeta(deleteSQL)).WithArgs("bd-1").
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
-		if err := resolveOneConflictRow(ctx, db, "issues", "id", "bd-1", ConflictStrategyTheirs, row); err != nil {
+		if err := resolveOneConflictRow(ctx, db, "issues", "id", "bd-1", ConflictStrategyTheirs, row, nil); err != nil {
 			t.Fatalf("a write the backend normalized to a no-op must not abort the resolve: %v", err)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
@@ -250,7 +250,7 @@ func TestResolveOneConflictRowZeroAffectedRows(t *testing.T) {
 			WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(0))
 		// No delete: their side must not be discarded silently.
 
-		err := resolveOneConflictRow(ctx, db, "issues", "id", "bd-1", ConflictStrategyTheirs, row)
+		err := resolveOneConflictRow(ctx, db, "issues", "id", "bd-1", ConflictStrategyTheirs, row, nil)
 		if err == nil || !strings.Contains(err.Error(), "deleted concurrently") {
 			t.Fatalf("err = %v, want the concurrent-deletion refusal", err)
 		}
@@ -258,4 +258,110 @@ func TestResolveOneConflictRowZeroAffectedRows(t *testing.T) {
 			t.Fatalf("unmet expectations: %v", err)
 		}
 	})
+}
+
+// TestResolveConflictRowsTheirsSkipsGeneratedColumns pins the --theirs write
+// against a table with a STORED generated column (the fork's
+// issues.everturn_action): dolt refuses any value assigned to one ("The value
+// specified for generated column ... is not allowed"), so the UPDATE writes
+// every other their_* column and leaves the generated one for dolt to
+// recompute. The generated columns are read from SHOW CREATE TABLE, since Dolt
+// 2.2.0 leaves SHOW COLUMNS Extra empty for them.
+func TestResolveConflictRowsTheirsSkipsGeneratedColumns(t *testing.T) {
+	ctx := context.Background()
+	const showCreateSQL = "SHOW CREATE TABLE `issues`"
+	const conflictSQL = "SELECT * FROM `dolt_conflicts_issues` WHERE `our_id` = ? OR `their_id` = ?"
+	const deleteSQL = "DELETE FROM `dolt_conflicts_issues` WHERE `our_id` = ?"
+	const ddl = "CREATE TABLE `issues` (\n" +
+		"  `id` varchar(255) NOT NULL,\n" +
+		"  `title` varchar(500) NOT NULL,\n" +
+		"  `metadata` json DEFAULT (json_object()),\n" +
+		"  `everturn_action` varchar(255) GENERATED ALWAYS AS (left(json_unquote(json_extract(`metadata`, _utf8mb4'$.everturn.action')), 255)) STORED,\n" +
+		"  `odd``name` int GENERATED ALWAYS AS (1) VIRTUAL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+	conflictCols := []string{
+		"from_root_ish", "base_id", "base_title", "base_metadata", "base_everturn_action",
+		"our_id", "our_title", "our_metadata", "our_everturn_action", "our_diff_type",
+		"their_id", "their_title", "their_metadata", "their_everturn_action", "their_diff_type",
+		"dolt_conflict_id",
+	}
+	expectPrelude := func(mock sqlmock.Sqlmock) {
+		mock.ExpectExec(regexp.QuoteMeta("SET @@dolt_allow_commit_conflicts = 1")).WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectExec(regexp.QuoteMeta("SET @@dolt_force_transaction_commit = 1")).WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectQuery(regexp.QuoteMeta(showCreateSQL)).
+			WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("issues", ddl))
+	}
+
+	t.Run("the UPDATE omits the generated column", func(t *testing.T) {
+		db, mock := newMockDB(t)
+		expectPrelude(mock)
+		mock.ExpectQuery(regexp.QuoteMeta(conflictSQL)).WithArgs("bd-1", "bd-1").
+			WillReturnRows(sqlmock.NewRows(conflictCols).AddRow(
+				"r", "bd-1", "base", "{}", nil,
+				"bd-1", "ours", "{}", nil, "modified",
+				"bd-1", "theirs", `{"everturn":{"action":"wake"}}`, "wake", "modified",
+				"c1"))
+		mock.ExpectExec("^"+regexp.QuoteMeta("UPDATE `issues` SET `title` = ?, `metadata` = ? WHERE `id` = ?")+"$").
+			WithArgs("theirs", `{"everturn":{"action":"wake"}}`, "bd-1").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec(regexp.QuoteMeta(deleteSQL)).WithArgs("bd-1").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		n, err := ResolveConflictRows(ctx, db, "issues", []string{"bd-1"}, ConflictStrategyTheirs)
+		if err != nil {
+			t.Fatalf("ResolveConflictRows --theirs: %v", err)
+		}
+		if n != 1 {
+			t.Fatalf("resolved %d rows, want 1", n)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
+	t.Run("a row differing only in generated columns is cleared without a write", func(t *testing.T) {
+		db, mock := newMockDB(t)
+		expectPrelude(mock)
+		mock.ExpectQuery(regexp.QuoteMeta(conflictSQL)).WithArgs("bd-1", "bd-1").
+			WillReturnRows(sqlmock.NewRows([]string{"base_id", "our_id", "their_id", "base_everturn_action", "our_everturn_action", "their_everturn_action"}).
+				AddRow("bd-1", "bd-1", "bd-1", nil, nil, "wake"))
+		// No UPDATE: a SET list of only generated columns has nothing dolt accepts.
+		mock.ExpectExec(regexp.QuoteMeta(deleteSQL)).WithArgs("bd-1").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		if _, err := ResolveConflictRows(ctx, db, "issues", []string{"bd-1"}, ConflictStrategyTheirs); err != nil {
+			t.Fatalf("ResolveConflictRows --theirs: %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+}
+
+func TestConflictGeneratedColumnsParsesShowCreateTable(t *testing.T) {
+	db, mock := newMockDB(t)
+	ddl := "CREATE TABLE `issues` (\n" +
+		"  `id` varchar(255) NOT NULL,\n" +
+		"  `created_at` datetime(6) NOT NULL DEFAULT (CURRENT_TIMESTAMP(6)),\n" +
+		"  `everturn_action` varchar(255) GENERATED ALWAYS AS (left(`metadata`, 255)) STORED,\n" +
+		"  `odd``name` int generated always as (1) VIRTUAL,\n" +
+		"  KEY `idx_generated_always_as` (`everturn_action`)\n" +
+		")"
+	mock.ExpectQuery(regexp.QuoteMeta("SHOW CREATE TABLE `issues`")).
+		WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("issues", ddl))
+
+	got, err := conflictGeneratedColumns(context.Background(), db, "issues")
+	if err != nil {
+		t.Fatalf("conflictGeneratedColumns: %v", err)
+	}
+	want := map[string]bool{"everturn_action": true, "odd`name": true}
+	if len(got) != len(want) {
+		t.Fatalf("generated = %v, want %v", got, want)
+	}
+	for col := range want {
+		if !got[col] {
+			t.Errorf("generated = %v, missing %q", got, col)
+		}
+	}
 }
