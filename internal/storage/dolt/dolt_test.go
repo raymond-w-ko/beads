@@ -83,7 +83,15 @@ func uniqueTestDBName(t *testing.T) string {
 	if _, err := rand.Read(buf); err != nil {
 		t.Fatalf("failed to generate random bytes: %v", err)
 	}
-	return "testdb_" + hex.EncodeToString(buf)
+	name := "testdb_" + hex.EncodeToString(buf)
+	// Drop it when the test ends, whoever created it. Registered here, before
+	// the test opens anything on it, so cleanups that close its connections
+	// run first (t.Cleanup is LIFO; body defers run before any cleanup). A
+	// test that already dropped it makes this a no-op DROP IF EXISTS.
+	// Leaving it costs every later schema init ~0.2-0.9s (bd-5oq1r).
+	port := testServerPort
+	t.Cleanup(func() { dropTestDBs(port, name) })
+	return name
 }
 
 // doltCommitCount reports how many commits the test branch has. Tests that

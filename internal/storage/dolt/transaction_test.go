@@ -155,29 +155,23 @@ func TestPublicTransactionSetupRetriesRollbackSafeErrorsBeforeCallback(t *testin
 	}
 }
 
-// TestRunInTransactionSerializationConflictInvokesCallbacksOnce orders two
-// independent handles so the stale transaction loses at commit. The public
-// callbacks must still each run once, and the winner's content must survive.
+// TestRunInTransactionSerializationConflictInvokesCallbacksOnce makes a public
+// transaction lose at commit. The callback must still run once, and the
+// winner's content must survive.
+//
+// The winner is a plain SQL transaction on its own session, not a second
+// RunInTransaction: in server mode every bead write takes the journal writer
+// lock before BEGIN (issueops.LockJournalWriter), so two RunInTransaction calls
+// on one database queue instead of overlapping, and a second one only gets in
+// by ending the first one's silent session after JournalWriterStaleHolder.
+// Writers that skip the lock (the remote-sync merge path) are what can still
+// race a locked transaction to the same row.
 func TestRunInTransactionSerializationConflictInvokesCallbacksOnce(t *testing.T) {
-	storeA, cleanupA := setupConcurrentTestStore(t)
-	defer cleanupA()
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
 
 	ctx, cancel := testContext(t)
 	defer cancel()
-
-	storeB, err := New(ctx, &Config{
-		Path:           t.TempDir(),
-		CommitterName:  "test",
-		CommitterEmail: "test@example.com",
-		ServerHost:     "127.0.0.1",
-		ServerPort:     testServerPort,
-		Database:       storeA.database,
-		MaxOpenConns:   2,
-	})
-	if err != nil {
-		t.Fatalf("open second store for %s: %v", storeA.database, err)
-	}
-	defer storeB.Close()
 
 	issue := &types.Issue{
 		ID:          "test-tx-at-most-once",
@@ -187,52 +181,49 @@ func TestRunInTransactionSerializationConflictInvokesCallbacksOnce(t *testing.T)
 		Priority:    2,
 		IssueType:   types.TypeTask,
 	}
-	if err := storeA.CreateIssue(ctx, issue, "tester"); err != nil {
+	if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
 		t.Fatalf("create issue: %v", err)
 	}
 
-	var callsA, callsB atomic.Int32
-	aPrepared := make(chan struct{})
-	bPrepared := make(chan struct{})
-	releaseA := make(chan struct{})
-	releaseB := make(chan struct{})
-	errA := make(chan error, 1)
-	errB := make(chan error, 1)
+	rawDB, err := sql.Open("mysql", store.connStr)
+	if err != nil {
+		t.Fatalf("open unlocked SQL handle: %v", err)
+	}
+	defer rawDB.Close()
+
+	var calls atomic.Int32
+	prepared := make(chan struct{})
+	release := make(chan struct{})
+	errStale := make(chan error, 1)
 
 	go func() {
-		errA <- storeA.RunInTransaction(ctx, "test: winner transaction", func(tx storage.Transaction) error {
-			callsA.Add(1)
-			if err := tx.UpdateIssue(ctx, issue.ID, map[string]interface{}{
-				"description": "winner",
-			}, "winner"); err != nil {
-				return err
-			}
-			close(aPrepared)
-			return waitForTransactionRelease(ctx, releaseA)
-		})
-	}()
-
-	go func() {
-		errB <- storeB.RunInTransaction(ctx, "test: stale transaction", func(tx storage.Transaction) error {
-			callsB.Add(1)
+		errStale <- store.RunInTransaction(ctx, "test: stale transaction", func(tx storage.Transaction) error {
+			calls.Add(1)
 			if err := tx.UpdateIssue(ctx, issue.ID, map[string]interface{}{
 				"description": "stale",
 			}, "stale"); err != nil {
 				return err
 			}
-			close(bPrepared)
-			return waitForTransactionRelease(ctx, releaseB)
+			close(prepared)
+			return waitForTransactionRelease(ctx, release)
 		})
 	}()
 
-	waitForTransactionPrepared(t, ctx, aPrepared, "winner")
-	waitForTransactionPrepared(t, ctx, bPrepared, "stale")
-	close(releaseA)
-	if err := <-errA; err != nil {
-		t.Fatalf("winner transaction: %v", err)
+	waitForTransactionPrepared(t, ctx, prepared, "stale")
+	winner, err := rawDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin winner: %v", err)
 	}
-	close(releaseB)
-	err = <-errB
+	if _, err := winner.ExecContext(ctx,
+		"UPDATE issues SET description = ? WHERE id = ?", "winner", issue.ID); err != nil {
+		_ = winner.Rollback()
+		t.Fatalf("winner update: %v", err)
+	}
+	if err := winner.Commit(); err != nil {
+		t.Fatalf("winner commit: %v", err)
+	}
+	close(release)
+	err = <-errStale
 	if err == nil {
 		t.Fatal("stale transaction succeeded, want serialization conflict")
 	}
@@ -243,14 +234,11 @@ func TestRunInTransactionSerializationConflictInvokesCallbacksOnce(t *testing.T)
 	if errors.Is(err, ErrCommitIndeterminate) {
 		t.Fatalf("stale transaction error = %v unexpectedly marks an indeterminate commit", err)
 	}
-	if got := callsA.Load(); got != 1 {
-		t.Errorf("winner callback calls = %d, want 1", got)
-	}
-	if got := callsB.Load(); got != 1 {
+	if got := calls.Load(); got != 1 {
 		t.Errorf("stale callback calls = %d, want 1", got)
 	}
 
-	freshDB, err := sql.Open("mysql", storeA.connStr)
+	freshDB, err := sql.Open("mysql", store.connStr)
 	if err != nil {
 		t.Fatalf("open fresh SQL handle: %v", err)
 	}
