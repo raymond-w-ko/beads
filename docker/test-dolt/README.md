@@ -37,3 +37,15 @@ The Go test harness does not use this container. With
 `BEADS_TEST_ENV_RUN_DOLT=1`, `scripts/test.sh` lets `internal/testutil` start
 its own testcontainers on random ports, from the `dolthub/dolt-sql-server` tag
 its `DoltDockerImage` names; see `engdocs/TESTING.md`.
+
+## A Dolt binary on nixvac
+
+`nixpkgs#dolt` is still 2.5.0, below upstream's 2.6.0 floor. For a `dolt` CLI
+at the image's version, use the stopgap flake in `nix/dolt` (the static
+upstream release binary, pinned by hash):
+
+```
+nix shell path:./nix/dolt#dolt -c dolt version   # dolt version 2.6.2
+```
+
+Retire `nix/dolt` once nixpkgs ships Dolt 2.6.x.
