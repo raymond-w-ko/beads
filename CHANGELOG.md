@@ -36,6 +36,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bd_events_seq` with a serialization failure and replaying. A holder that
   goes silent for 30 s (a client that froze mid-write) is reclaimed, so it
   cannot block the other writers until the server's idle cut.
+- **A proxied-server command against an unreachable external Dolt upstream
+  fails within about a second with a clear error instead of stalling
+  ~20-30 s** ([#7181](https://github.com/gastownhall/beads/pull/7181)). The
+  local db proxy stayed up, so the client saw only a bare close, which the
+  bootstrap ping retried as a transient drop for its whole 30 s budget before
+  reporting `invalid connection`. The proxy now answers such a connection
+  with a MySQL error (2003, prefixed `beads db proxy:`) that says what
+  happened: the dial was refused, the socket is missing, the host is
+  unreachable, or the upstream closed the connection before the MySQL
+  greeting (down, restarting, or at its connection limit). The client
+  retries that error for only about a second, so an endpoint that is
+  flapping or rebinding is still ridden out within one command. A backend
+  that drops a connection after the greeting, a dial timeout, and every
+  refusal from a managed (local sidecar) backend keep the full transient
+  retry.
 
 ## [1.3.3-dev.1] - 2026-10-28
 

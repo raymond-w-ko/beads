@@ -716,9 +716,13 @@ const pingAttemptTimeout = 10 * time.Second
 // application-level rejection that can reach us as one, so at boot an OpError
 // is always the connection itself: refused while the server restarts, reset,
 // or broken pipe. MySQL's own rejections arrive as *mysql.MySQLError and stay
-// permanent. A name that does not resolve is the exception — it will not start
-// resolving, so retrying only spends the whole budget before reporting the
-// same misconfiguration.
+// permanent here. A name that does not resolve is the exception — it will not
+// start resolving, so retrying only spends the whole budget before reporting
+// the same misconfiguration.
+//
+// The db proxy's own upstream-outage report (proxy.IsUpstreamOutageError) is
+// a *mysql.MySQLError too, so this function calls it permanent; pingWithRetry
+// handles it first and retries it only for upstreamOutageRetryWindow.
 //
 // context.DeadlineExceeded counts only because pingWithRetry applies a
 // per-attempt deadline and checks the caller's context *before* consulting
@@ -749,17 +753,62 @@ func isTransientPingError(err error) bool {
 		errors.As(err, &opErr)
 }
 
+// upstreamOutageRetryWindow is how long pingWithRetry keeps retrying the db
+// proxy's report that its external upstream is unreachable (refused, socket
+// gone, or closed before the greeting; see dbproxy/proxy/upstream_error.go).
+// Long enough to ride out an endpoint that is flapping or rebinding (a Dolt
+// restart, a front whose target is being replaced, a server briefly at its
+// connection limit), short enough that a real outage fails within a couple of
+// seconds instead of spending the full 30s bootstrap budget on a dead
+// upstream. A var so tests can shorten it.
+var upstreamOutageRetryWindow = time.Second
+
+// outageWindowBackOff clamps the wrapped backoff so that, after an
+// upstream-outage report, the wait does not run past the end of
+// upstreamOutageRetryWindow: the last attempt lands at the window's end
+// rather than up to one backoff interval after it.
+type outageWindowBackOff struct {
+	backoff.BackOff
+	deadline time.Time // zero until the first upstream-outage report
+	// clamp is whether the last attempt failed with the upstream-outage
+	// report; pingWithRetry sets it before each wait.
+	clamp bool
+}
+
+func (b *outageWindowBackOff) NextBackOff() time.Duration {
+	d := b.BackOff.NextBackOff()
+	// Fork divergence from upstream 683993660, which clamped every wait once
+	// a report had been seen: an upstream that first refuses and then drops
+	// the handshake (a Dolt restart) then got zero-length waits past the
+	// deadline, and the wrapped backoff ran out its 30s budget in a few
+	// milliseconds. Only a wait after the report itself is clamped; one after
+	// any other transient error keeps the normal delay and budget. The
+	// deadline stays the first report's, so a later report is still bounded.
+	if d == backoff.Stop || !b.clamp || b.deadline.IsZero() {
+		return d
+	}
+	if remaining := time.Until(b.deadline); remaining < d {
+		return max(remaining, 0)
+	}
+	return d
+}
+
 // pingWithRetry pings until the server answers, the error proves durable, or
 // bo's MaxElapsedTime is spent. Each attempt gets its own deadline:
 // backoff.Retry bounds the gap between attempts but cannot interrupt one
 // already in flight, so without this cap a server that accepts TCP and then
-// stalls blocks for the caller's entire context.
+// stalls blocks for the caller's entire context. The db proxy's
+// upstream-outage report is retried only for upstreamOutageRetryWindow from
+// the first time it is seen; other transient errors keep bo's delays and
+// budget, before or after a report.
 func pingWithRetry(ctx context.Context, p pinger, bo *backoff.ExponentialBackOff, attemptTimeout time.Duration) error {
+	window := &outageWindowBackOff{BackOff: bo}
 	return backoff.Retry(func() error {
 		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
 		defer cancel()
 
 		err := p.PingContext(attemptCtx)
+		window.clamp = proxy.IsUpstreamOutageError(err)
 		if err == nil {
 			return nil
 		}
@@ -770,11 +819,20 @@ func pingWithRetry(ctx context.Context, p pinger, bo *backoff.ExponentialBackOff
 		if ctx.Err() != nil {
 			return backoff.Permanent(err)
 		}
+		if proxy.IsUpstreamOutageError(err) {
+			if window.deadline.IsZero() {
+				window.deadline = time.Now().Add(upstreamOutageRetryWindow)
+			}
+			if !time.Now().Before(window.deadline) {
+				return backoff.Permanent(err)
+			}
+			return err
+		}
 		if isTransientPingError(err) {
 			return err
 		}
 		return backoff.Permanent(err)
-	}, backoff.WithContext(bo, ctx))
+	}, backoff.WithContext(window, ctx))
 }
 
 // assertSessionDatabaseOnPool runs assertSessionDatabase on a connection pinned

@@ -45,7 +45,7 @@ func TestProxiedOutageReconnectAcceptanceMatrix(t *testing.T) {
 			require.NoError(t, err)
 			var endpoint string
 			if topology.socket {
-				endpoint = filepath.Join(t.TempDir(), "dolt.sock")
+				endpoint = shortSocketPath(t, "dolt.sock")
 			} else {
 				endpoint = strconv.Itoa(gatePort)
 			}
@@ -237,4 +237,17 @@ func startOutageBridge(t *testing.T, endpoint, upstreamPort string, socket bool)
 		}
 	})
 	return cmd
+}
+
+// shortSocketPath returns a unix-socket path under a short private directory:
+// t.TempDir() under a long test name exceeds sun_path (108 bytes on Linux),
+// and socat then binds a silently truncated path instead.
+func shortSocketPath(t *testing.T, name string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "bds")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, name)
 }
