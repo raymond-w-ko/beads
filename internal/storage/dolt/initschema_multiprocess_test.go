@@ -122,9 +122,7 @@ func TestMultiProcessSchemaInit(t *testing.T) {
 	if _, err := initDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+dbName+"`"); err != nil {
 		t.Fatalf("create database: %v", err)
 	}
-	t.Cleanup(func() {
-		// Skip DROP — rapid cycles can crash the Dolt container.
-	})
+	t.Cleanup(func() { dropTestDBs(testServerPort, dbName) })
 
 	// Spawn N subprocesses.
 	const numProcs = 8

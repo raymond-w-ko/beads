@@ -57,9 +57,7 @@ func TestSchemaInitRecoversFromPartialNonlocalMigration(t *testing.T) {
 	if _, err := rootDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+dbName+"`"); err != nil {
 		t.Fatalf("create database: %v", err)
 	}
-	t.Cleanup(func() {
-		// Skip DROP — rapid drop cycles can crash the Dolt container.
-	})
+	t.Cleanup(func() { dropTestDBs(testServerPort, dbName) })
 
 	dbDSN := doltutil.ServerDSN{Host: "127.0.0.1", Port: testServerPort, User: "root", Database: dbName}.String()
 	db, err := sql.Open("mysql", dbDSN)

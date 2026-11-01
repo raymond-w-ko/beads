@@ -46,8 +46,7 @@ func newTestDoltDB(t *testing.T) (*sql.DB, func()) {
 
 	return db, func() {
 		db.Close()
-		// Skip DROP DATABASE — rapid CREATE/DROP cycles crash the Dolt container.
-		// Orphan databases are cleaned up when the container terminates.
+		dropTestDBs(testServerPort, dbName)
 	}
 }
 

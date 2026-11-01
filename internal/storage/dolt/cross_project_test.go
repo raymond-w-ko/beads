@@ -104,10 +104,9 @@ func setupTwoProjectStores(t *testing.T, prefixA, prefixB string) (storeA, store
 	}
 
 	cleanup = func() {
-		// Skip DROP DATABASE — rapid CREATE/DROP cycles crash the Dolt container.
-		// Orphan databases are cleaned up when the container terminates.
 		storeA.Close()
 		storeB.Close()
+		dropTestDBs(testServerPort, dbNameA, dbNameB)
 		os.RemoveAll(tmpDirA)
 		os.RemoveAll(tmpDirB)
 	}
@@ -269,9 +268,9 @@ func TestCrossProject_PortCollision_SameDatabase(t *testing.T) {
 	}
 
 	defer func() {
-		// Skip DROP DATABASE — rapid CREATE/DROP cycles crash the Dolt container.
 		storeA.Close()
 		storeB.Close()
+		dropTestDBs(testServerPort, sharedDB)
 		os.RemoveAll(tmpDirA)
 		os.RemoveAll(tmpDirB)
 	}()

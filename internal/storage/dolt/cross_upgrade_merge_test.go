@@ -191,11 +191,11 @@ func setupPreReshapeAncestor(t *testing.T) *crossUpgradeEnv {
 		t.Fatalf("open admin connection: %v", err)
 	}
 	t.Cleanup(func() { admin.Close() })
-	// Skip DROP DATABASE on cleanup — rapid CREATE/DROP cycles crash the Dolt
-	// container (see setupConcurrentTestStore); orphans die with the container.
 	if _, err := admin.ExecContext(ctx, "CREATE DATABASE `"+dbName+"`"); err != nil {
 		t.Fatalf("create database: %v", err)
 	}
+	// Registered before the test's own connections, so it runs after they close.
+	t.Cleanup(func() { dropTestDBs(testServerPort, dbName) })
 
 	db, err := sql.Open("mysql", doltutil.ServerDSN{
 		Host: "127.0.0.1", Port: testServerPort, User: "root", Database: dbName, Timeout: 10 * time.Second,

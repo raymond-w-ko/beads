@@ -98,10 +98,8 @@ func createTestDatabase(t *testing.T, port int, dbName string) {
 }
 
 func dropTestDatabase(t *testing.T, port int, dbName string) {
-	// No-op: rapid DROP DATABASE crashes the Dolt test container.
-	// Orphan databases are cleaned up when the container terminates.
-	_ = port
-	_ = dbName
+	t.Helper()
+	dropTestDBs(port, dbName)
 }
 
 func containsAny(s string, substrs ...string) bool {
