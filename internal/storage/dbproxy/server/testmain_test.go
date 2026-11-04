@@ -2,7 +2,9 @@ package server_test
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"regexp"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/doltserver"
@@ -36,7 +38,14 @@ var suiteTempRoot string
 //   - A server this suite leaks on a normal run has its cwd deleted by
 //     t.TempDir's RemoveAll. A root-scoped post-run sweep detects that leak
 //     and fails this package without consuming another live suite's evidence.
+//
+// It also lets this test binary stand in for `dolt` (see fakeDolt, #7184):
+// a fake-dolt child exits through fakeDolt before any suite-root work, so it
+// neither sweeps nor claims a root of its own.
 func TestMain(m *testing.M) {
+	if mode := os.Getenv(fakeDoltEnv); mode != "" {
+		os.Exit(fakeDolt(mode, os.Args[1:]))
+	}
 	os.Exit(testMainInner(m))
 }
 
@@ -82,5 +91,71 @@ func TestTempDirLandsUnderSuiteSweepRoot(t *testing.T) {
 	dir := t.TempDir()
 	if !testutil.PathUnderSuiteRoot(dir, suiteTempRoot) {
 		t.Fatalf("t.TempDir() %q is not under suiteTempRoot %q", dir, suiteTempRoot)
+	}
+}
+
+// fakeDoltEnv, when set, makes this test binary act as a stand-in `dolt`
+// (see fakeDolt) so tests can drive DoltServer through startup behaviors a
+// real dolt cannot be made to show on demand. The internal tests set it and
+// pass os.Args[0] as the dolt binary.
+const fakeDoltEnv = "BEADS_TEST_FAKE_DOLT"
+
+var fakeDoltPortRe = regexp.MustCompile(`(?m)^\s+port:\s*(\d+)`)
+
+// fakeDolt answers the dolt invocations DoltServer.Start makes. For
+// `sql-server --config <file>` it reads listener.port from the file and, by
+// mode:
+//   - "inuse": reports dolt's own port-in-use error and exits 1;
+//   - "silent": listens but never logs the ready line;
+//   - "ready": listens and logs the ready line.
+func fakeDolt(mode string, args []string) int {
+	if len(args) == 0 {
+		return 2
+	}
+	switch args[0] {
+	case "config":
+		fmt.Println("fake")
+		return 0
+	case "init":
+		return 0
+	case "sql-server":
+	default:
+		return 2
+	}
+	var cfgPath string
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--config" {
+			cfgPath = args[i+1]
+		}
+	}
+	body, err := os.ReadFile(cfgPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	m := fakeDoltPortRe.FindSubmatch(body)
+	if m == nil {
+		fmt.Fprintln(os.Stderr, "no listener.port in", cfgPath)
+		return 1
+	}
+	port := string(m[1])
+	if mode == "inuse" {
+		fmt.Fprintf(os.Stderr, "Port %s already in use.\n", port)
+		return 1
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:"+port)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if mode == "ready" {
+		fmt.Fprintln(os.Stderr, `level=info msg="Server ready. Accepting connections."`)
+	}
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return 0
+		}
+		defer c.Close()
 	}
 }

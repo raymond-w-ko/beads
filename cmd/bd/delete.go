@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	storeissueops "github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
+	"github.com/steveyegge/beads/internal/utils"
 	"github.com/steveyegge/beads/issueops"
 )
 
@@ -141,10 +143,18 @@ the same guard runs in the preview's read and exits 13 the same way.`,
 		// stays in the front door: issueops.DeleteRequest.IDs are exact, because
 		// resolving an ambiguous prefix and then deleting the row it hit is the
 		// one place a convenience is not.
-		routedResult, err := resolveAndGetIssueForMutation(ctx, store, issueID)
+		//
+		// Exact here too, never a leading-prefix abbreviation: an id that is
+		// gone (already deleted, a re-run script) would otherwise resolve to
+		// whichever surviving issue's id it begins, and the preview would
+		// print `bd delete <that issue> --force` as the next step.
+		routedResult, err := resolveAndGetIssueForMutationExact(ctx, store, issueID)
 		if err != nil {
 			if isNotFoundErr(err) {
 				return HandleError("issue %s not found", issueID)
+			}
+			if refusal := deleteAbbreviationRefusal(err); refusal != nil {
+				return HandleError("%v", refusal)
 			}
 			return HandleError("%v", err)
 		}
@@ -298,6 +308,33 @@ func renderSingleDeletePreview(
 	return nil
 }
 
+// deleteAbbreviationRefusal is the refusal of an id that names no issue
+// exactly but is the start of one or more: delete needs the full id, so say
+// that and name the ids it begins. It is nil for any other error.
+func deleteAbbreviationRefusal(err error) error {
+	var abbrev *utils.AbbreviatedIDError
+	if !errors.As(err, &abbrev) {
+		return nil
+	}
+	return &deleteAbbreviationError{abbrev: abbrev}
+}
+
+// deleteAbbreviationError is that refusal. To a delete, an id that is only the
+// start of other ids names no row, so the text leads with "not found" — the
+// words gascity's isBdNotFound reads as an already-gone bead — and the error
+// unwraps to storage.ErrNotFound beside the *utils.AbbreviatedIDError, so
+// errors.Is callers classify it as the gone target it is.
+type deleteAbbreviationError struct {
+	abbrev *utils.AbbreviatedIDError
+}
+
+func (e *deleteAbbreviationError) Error() string {
+	return fmt.Sprintf("issue %q not found: bd delete needs the full issue id, and %q is only the start of %s",
+		e.abbrev.Input, e.abbrev.Input, strings.Join(e.abbrev.Matches, ", "))
+}
+
+func (e *deleteAbbreviationError) Unwrap() []error { return []error{storage.ErrNotFound, e.abbrev} }
+
 // deleteIssue removes an issue from the database.
 func deleteIssue(ctx context.Context, issueID string) error {
 	return store.DeleteIssue(ctx, issueID)
@@ -306,9 +343,11 @@ func deleteIssue(ctx context.Context, issueID string) error {
 // deleteBatch is the multi-id and cascade path, shared by `bd delete`,
 // `bd cleanup`, `bd wisp gc` and `bd mol burn`.
 //
-// It resolves the ids the way this front door always has - prefix matching and
+// It resolves the ids in the front door - exact-id matching and
 // cross-repository routing, which issueops.DeleteRequest deliberately does not
-// do - and hands the RESOLVED ids to the role.
+// do - and hands the RESOLVED ids to the role. Never a leading-prefix
+// abbreviation: a re-run of a finished --from-file list would otherwise
+// delete every surviving issue whose id one of its ids begins.
 //
 //nolint:unparam // cmd parameter required for potential future use
 func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, cascade bool, jsonOutput bool, _ bool, _ ...string) error {
@@ -332,8 +371,8 @@ func deleteBatchGuarded(issueIDs []string, force bool, dryRun bool, cascade bool
 	var routedStore storage.DoltStorage
 	// One read for every id stored locally under exactly that id: the per-id
 	// resolution would find each in the local store first and resolve it to
-	// itself. Only the rest (partial ids, routed prefixes, the missing) take
-	// the per-id path, one round trip or more apiece.
+	// itself. Only the rest (routed prefixes, abbreviations to refuse, the
+	// missing) take the per-id exact path, one round trip or more apiece.
 	exact := make(map[string]*types.Issue)
 	if len(issueIDs) > 0 {
 		found, err := store.GetIssuesByIDs(ctx, issueIDs)
@@ -350,10 +389,12 @@ func deleteBatchGuarded(issueIDs []string, force bool, dryRun bool, cascade bool
 			resolvedIDs = append(resolvedIDs, id)
 			continue
 		}
-		result, err := resolveAndGetIssueForMutation(ctx, store, id)
+		result, err := resolveAndGetIssueForMutationExact(ctx, store, id)
 		if err != nil {
 			if isNotFoundErr(err) {
 				notFound = append(notFound, id)
+			} else if refusal := deleteAbbreviationRefusal(err); refusal != nil {
+				return refusal
 			} else {
 				return fmt.Errorf("getting issue %s: %v", id, err)
 			}
