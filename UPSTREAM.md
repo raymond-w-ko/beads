@@ -1,8 +1,8 @@
 # Upstream
 
-This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-11-04 at fork main 4ce6c6deb, upstream/main d95de62fa, PR #7645 head ffd4b6544.
+This fork tracks `gastownhall/beads` (remote `upstream`). Fork branches go to `raymond-w-ko/beads` (remote `origin`). This file records what the fork posted upstream and what it keeps. Updated 2026-11-06 at fork main 71e01c777, upstream/main 8c3eb30f3, PR #7645 head ffd4b6544.
 
-Next upstream release: v1.3.3 (e86e46fd4, released 2026-11-03, on upstream's hotfix/1.3.1 line, not on upstream/main; 32 commits over v1.3.2) is merged, see `## Already upstream`. The next release line is 1.3.4: upstream branch `release-prep/v1.3.4-rc.1` exists, no tag yet. The fork merges release tags only.
+Next upstream release: v1.3.4 (7ef2fd05e, released 2026-11-04, a patch branch off v1.3.3, not on upstream/main; 8 commits over v1.3.3) is merged, see `## Already upstream`. No later tag exists (newest upstream tags: v1.3.4, v1.3.4-rc.1, v1.3.3). The Dolt 2.6.0 floor (upstream 3438ae2fd, 2026-10-26) is on upstream/main and in no tag yet; the fork merges release tags only (bead bd-ppveg watches for the tag that carries the floor).
 
 ## Posted
 
@@ -46,6 +46,7 @@ Beads: bd-ksvg (catalogue), bd-l2jn (upstream matches), bd-so6v (operator select
 | merge 1a26e3afe and its 35 release commits | tag v1.3.1 |
 | merge 94a546cce and its 34 release commits | tag v1.3.2 (9b65b9e19), merged 2026-10-28 with fork precedence; stamped 1.3.3-dev.1 (bead bd-01jyf, review bd-g9ehw, landed by bd-l7acv; asked by operator mail bd-wisp-dioay) |
 | merge 4ce6c6deb and its 32 release commits | tag v1.3.3 (e86e46fd4), merged 2026-11-04 with fork precedence; stamped 1.3.4-dev.1 (bead bd-xxz4d, review bd-gtkab, landed by bd-yrddu; asked by everturn's planner, mail bd-wisp-5o8i5, on the operator's dependency-upgrade order). Hand-resolved: hook markers, CHANGELOG, version.go, info.go, delete.go (exact ids #7375 plus the fork's --if-threads guard), schema_test.go, dbproxy/server testmain_test.go, beads-mcp pins; upstream's delete_exact_id_test.go and migration_updated_at_guard_test.go adapted to the fork's GetIssuesByIDs fast path and SHOW-based probes |
+| merge 71e01c777 and its 8 release commits | tag v1.3.4 (7ef2fd05e), merged 2026-11-06 with fork precedence; stamped 1.3.5-dev.1 (bead bd-25ug3, review bd-x53xt, landed by bd-uaz3q; fork policy, no asking mail). Hand-resolved: hook markers, CHANGELOG, version.go, info.go; one upstream change, GT_ROOT admitted from a project .beads/.env again, exact key only (#8118, backport of #8117); the 1.3.3 allowlist still refuses BEADS_DOLT_SERVER_HOST and BEADS_CREDENTIALS_FILE there |
 | f19bcec8f | ebe3b6bcb (#7185): upstream's `installExecuteIsolation` and `resetCommandFlags` fix the same in-process CLI runner leaks (BEADS_DIR left set, cobra flag state kept between runs); the fork's smaller harness patch is interim and the next upstream merge replaces it |
 | 69709b0d5 | ebe3b6bcb (#7185): the removed `DryRunWithRigPrefix` subtest and the `--` before flag-like create titles are upstream's hunks; the one-second wait before the `--age 0s` wisp GC call is fork-only until the DATETIME rounding race is fixed upstream |
 | 4371bb70c | 683993660 (#7181) Go hunks only, 6e9a15507 (#7129) shortSocketPath, ebe3b6bcb (#7185) hermetic canary hunk; e24940e0c (#7672) left for the next upstream merge; fork fix bd-2l0ob (outage backoff keeps the transient budget) not yet offered upstream |
