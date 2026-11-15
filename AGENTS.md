@@ -99,6 +99,7 @@ test-design guidance, and PR-readiness gates.
 - Scoped check: `./scripts/test.sh <package>...`, for the packages of one change (for example `./scripts/test.sh ./internal/storage/issueops`); `-run`, `-skip`, `-v` pass through.
 - Full check in a worktree: yes
 - Worktree setup: none
+- Commit trailer: `Agent-Signature: {runtime}-{model}-{effort|unknown-reasoning} on behalf of {user}` per seat
 - Both tiers need the default cgo build (`GOFLAGS=-tags=gms_pure_go` from `.buildflags`). Never a bare `go test`: `scripts/test.sh` enters a hermetic environment (temp HOME, no `BEADS_*`/`BD_*` from the caller, Dolt-service tests skipped unless `BEADS_TEST_ENV_RUN_DOLT=1`). The remote-only build's cmd/bd tests run only inside a network namespace (see bd-h37).
 
 ## Non-Interactive Shell Commands
