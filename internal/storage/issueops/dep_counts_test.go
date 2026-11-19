@@ -39,7 +39,8 @@ func TestCountDependencyEdgesInLegSendsTheIndexedStatement(t *testing.T) {
 			// UNION ALL branches.
 			var args []driver.Value
 			for i := 0; i < 3; i++ {
-				args = append(args, id)
+				// The column equality, then the residual COALESCE filter.
+				args = append(args, id, id)
 				for _, a := range typeArgs {
 					args = append(args, a)
 				}
@@ -68,5 +69,27 @@ func TestCountDependencyEdgesInLegSendsTheIndexedStatement(t *testing.T) {
 				t.Errorf("sqlmock expectations: %v", err)
 			}
 		})
+	}
+}
+
+// TestDepTargetCountQueryText spells out the count's statement: the branches
+// are DepTargetPredicates, the ones the dependents reads use, each with the
+// old COALESCE filter as a residual after its indexed column equality and
+// guard, so the count matches only rows the old count matched under any
+// column collations (review bd-lwx6j) and equals the rows the reads return.
+func TestDepTargetCountQueryText(t *testing.T) {
+	const legacy = " AND COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) = ?"
+	for _, c := range []struct{ typeClause, filter string }{
+		{"", ""},
+		{"type IN (?,?)", " AND type IN (?,?)"},
+	} {
+		want := "SELECT count(*) FROM (" +
+			"SELECT 1 AS x FROM dependencies WHERE depends_on_issue_id = ?" + legacy + c.filter +
+			" UNION ALL SELECT 1 FROM dependencies WHERE depends_on_wisp_id = ? AND depends_on_issue_id IS NULL" + legacy + c.filter +
+			" UNION ALL SELECT 1 FROM dependencies WHERE depends_on_external = ? AND COALESCE(depends_on_issue_id, depends_on_wisp_id) IS NULL" + legacy + c.filter +
+			") u"
+		if got := DepTargetCountQuery("dependencies", c.typeClause); got != want {
+			t.Errorf("DepTargetCountQuery(dependencies, %q) =\n%s\nwant\n%s", c.typeClause, got, want)
+		}
 	}
 }

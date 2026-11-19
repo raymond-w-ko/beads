@@ -2,6 +2,8 @@ package dolt
 
 import (
 	"context"
+	"reflect"
+	"sort"
 	"testing"
 	"time"
 
@@ -135,4 +137,99 @@ func TestCountAndIterIncludeWispDependencies(t *testing.T) {
 	if !seen["wc-perm-dep"] || !seen["wc-wisp-dep"] {
 		t.Errorf("IterDependentsWithMetadata(wc-target) streamed %v, want both wc-perm-dep and wc-wisp-dep", seen)
 	}
+
+	// Both dependents reads match one target column per UNION ALL branch
+	// (issueops.DepTargetRowsQuery, iterDependentsQuery), so for an issue, a
+	// wisp and an external target they must return exactly the rows of the
+	// old COALESCE statements run directly (bd-6kzwe). More sources on both
+	// planes give each target several dependents per table, so the slice
+	// path's order (it has no ORDER BY; text `bd show`, dep tree and
+	// `--children` print it as returned) is compared too. The iterator above
+	// holds a pooled connection until closed, which stalls the writes below.
+	_ = iter.Close()
+	createPerm(t, ctx, store, "wc-o1")
+	createPerm(t, ctx, store, "wc-o2")
+	createWisp(t, ctx, store, "wc-ow1")
+	for _, src := range []string{"wc-o1", "wc-o2", "wc-ow1"} {
+		for _, tgt := range []string{"wc-target", "wc-wisp-target", extTarget} {
+			addBlocks(src, tgt)
+		}
+	}
+	for _, target := range []string{"wc-target", "wc-wisp-target", extTarget} {
+		var oldSlice []string
+		for _, table := range []string{"dependencies", "wisp_dependencies"} {
+			oldSlice = append(oldSlice, depRowPairs(t, ctx, store,
+				"SELECT issue_id, type FROM "+table+" WHERE "+depTargetExpr+" = ?", target)...)
+		}
+		if len(oldSlice) != 5 {
+			t.Fatalf("precondition: old COALESCE statement gives %d dependents of %s, want 5: %v", len(oldSlice), target, oldSlice)
+		}
+		deps, err := store.GetDependentsWithMetadata(ctx, target)
+		if err != nil {
+			t.Fatalf("GetDependentsWithMetadata(%s): %v", target, err)
+		}
+		var gotSlice []string
+		for _, d := range deps {
+			gotSlice = append(gotSlice, d.Issue.ID+"/"+string(d.DependencyType))
+		}
+		if !reflect.DeepEqual(gotSlice, oldSlice) {
+			t.Errorf("GetDependentsWithMetadata(%s) = %v, old COALESCE rows in order = %v", target, gotSlice, oldSlice)
+		}
+
+		oldIter := depRowPairs(t, ctx, store, `
+			SELECT i.id, d.type FROM issues i JOIN dependencies d ON d.issue_id = i.id
+			WHERE COALESCE(d.depends_on_issue_id, d.depends_on_wisp_id, d.depends_on_external) = ?
+			UNION ALL
+			SELECT w.id, d.type FROM wisps w JOIN wisp_dependencies d ON d.issue_id = w.id
+			WHERE COALESCE(d.depends_on_issue_id, d.depends_on_wisp_id, d.depends_on_external) = ?`,
+			target, target)
+		it, err := store.IterDependentsWithMetadata(ctx, target)
+		if err != nil {
+			t.Fatalf("IterDependentsWithMetadata(%s): %v", target, err)
+		}
+		var gotIter []string
+		var lastCreated time.Time
+		for it.Next(ctx) {
+			v := it.Value()
+			if v.Issue.CreatedAt.Before(lastCreated) {
+				t.Errorf("IterDependentsWithMetadata(%s): %s created %v after a row created %v; want ORDER BY created_at", target, v.Issue.ID, v.Issue.CreatedAt, lastCreated)
+			}
+			lastCreated = v.Issue.CreatedAt
+			gotIter = append(gotIter, v.Issue.ID+"/"+string(v.DependencyType))
+		}
+		if err := it.Err(); err != nil {
+			t.Fatalf("IterDependentsWithMetadata(%s) iterate: %v", target, err)
+		}
+		_ = it.Close()
+		// The iterator orders by created_at, which can tie between rows, so
+		// its rows are compared as a set.
+		sort.Strings(gotIter)
+		sort.Strings(oldIter)
+		if !reflect.DeepEqual(gotIter, oldIter) || len(gotIter) != 5 {
+			t.Errorf("IterDependentsWithMetadata(%s) = %v, old COALESCE join rows = %v, want the same 5", target, gotIter, oldIter)
+		}
+	}
+}
+
+// depRowPairs runs query (selecting an issue id and a dependency type) and
+// returns its rows as "id/type", in the order the database returned them.
+func depRowPairs(t *testing.T, ctx context.Context, store *DoltStore, query string, args ...any) []string {
+	t.Helper()
+	rows, err := store.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		t.Fatalf("query %s: %v", query, err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id, typ string
+		if err := rows.Scan(&id, &typ); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		out = append(out, id+"/"+typ)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	return out
 }

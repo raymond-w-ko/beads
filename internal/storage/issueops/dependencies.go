@@ -1264,8 +1264,9 @@ func GetDependentsWithMetadataInTx(ctx context.Context, tx DBTX, issueID string)
 	// Query both dependency tables to find all dependents.
 	var deps []depMeta
 	for _, depTable := range []string{"dependencies", "wisp_dependencies"} {
-		rows, err := tx.QueryContext(ctx, fmt.Sprintf(
-			`SELECT issue_id, type FROM %s WHERE %s = ?`, depTable, DepTargetExpr), issueID)
+		// One indexed branch per target column, not `DepTargetExpr = ?`,
+		// which scanned every edge (bd-o24uj site 4).
+		rows, err := tx.QueryContext(ctx, DepTargetRowsQuery(depTable), DepTargetBranchArgs(issueID)...)
 		if err != nil {
 			return nil, fmt.Errorf("get dependents from %s: %w", depTable, err)
 		}

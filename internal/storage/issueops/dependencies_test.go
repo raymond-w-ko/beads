@@ -302,3 +302,56 @@ func TestReplaceDependencyTargetRekeysCascadedRows(t *testing.T) {
 		t.Fatalf("unmet sql expectations: %v", err)
 	}
 }
+
+// TestGetDependentsWithMetadataSendsTheIndexedStatement pins the statement the
+// dependents read (`bd show`, dep tree, relations) sends to each dependency
+// table: one UNION ALL branch per target column, each seekable on its own
+// index, with the guards that give a row to the branch COALESCE would pick,
+// the old filter kept as a residual (collation, review bd-lwx6j) and ORDER BY
+// the primary key (the old scan's order). The old `COALESCE(depends_on_issue_id,
+// depends_on_wisp_id, depends_on_external) = ?` filter alone read every edge
+// of the table (bd-o24uj site 4). The mock compares whole statements, in
+// order, with the target id bound twice per branch;
+// TestDependentsRowsPlanIsIndexed (dolt package) EXPLAINs the same text.
+func TestGetDependentsWithMetadataSendsTheIndexedStatement(t *testing.T) {
+	ctx := context.Background()
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	const id = "gd-target"
+	mock.ExpectBegin()
+	for _, table := range []string{"dependencies", "wisp_dependencies"} {
+		const legacy = " AND COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) = ?"
+		want := "SELECT issue_id, type FROM (" +
+			"SELECT id, issue_id, type FROM " + table + " WHERE depends_on_issue_id = ?" + legacy +
+			" UNION ALL SELECT id, issue_id, type FROM " + table + " WHERE depends_on_wisp_id = ? AND depends_on_issue_id IS NULL" + legacy +
+			" UNION ALL SELECT id, issue_id, type FROM " + table + " WHERE depends_on_external = ? AND COALESCE(depends_on_issue_id, depends_on_wisp_id) IS NULL" + legacy +
+			") u ORDER BY id"
+		if got := DepTargetRowsQuery(table); got != want {
+			t.Fatalf("DepTargetRowsQuery(%q) =\n%s\nwant\n%s", table, got, want)
+		}
+		// Per branch: the column equality, then the residual COALESCE filter.
+		mock.ExpectQuery(want).
+			WithArgs(id, id, id, id, id, id).
+			WillReturnRows(sqlmock.NewRows([]string{"issue_id", "type"}))
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	got, err := GetDependentsWithMetadataInTx(ctx, tx, id)
+	if err != nil {
+		t.Fatalf("GetDependentsWithMetadataInTx: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("dependents = %d, want 0", len(got))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sqlmock expectations: %v", err)
+	}
+}

@@ -59,8 +59,8 @@ func TestCountDependentsPlanIsIndexed(t *testing.T) {
 		{"wisp_dependencies", []string{"depends_on_issue_id", "depends_on_wisp_id"}},
 	} {
 		prod := issueops.DepTargetCountQuery(c.table, "")
-		// Three ? placeholders: the target id once per branch.
-		plan := explainPlan(t, ctx, store.db, literalizeParams(prod, "'cp-target'", "'cp-target'", "'cp-target'"))
+		// The target id at every ? (twice per branch).
+		plan := explainPlan(t, ctx, store.db, literalizeParams(prod, targetLiterals(prod, "'cp-target'")...))
 		if !looksLikeDoltPlan(plan) {
 			t.Skipf("EXPLAIN output not in a recognized Dolt plan format, skipping index assertion; plan=\n%s", plan)
 		}

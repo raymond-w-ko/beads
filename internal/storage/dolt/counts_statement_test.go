@@ -26,10 +26,10 @@ func TestCountDependentsSendsTheIndexedStatement(t *testing.T) {
 	const id = "cs-target"
 	mock.ExpectBegin()
 	mock.ExpectQuery(issueops.DepTargetCountQuery("dependencies", "")).
-		WithArgs(id, id, id).
+		WithArgs(id, id, id, id, id, id).
 		WillReturnRows(sqlmock.NewRows([]string{"count(*)"}).AddRow(2))
 	mock.ExpectQuery(issueops.DepTargetCountQuery("wisp_dependencies", "")).
-		WithArgs(id, id, id).
+		WithArgs(id, id, id, id, id, id).
 		WillReturnRows(sqlmock.NewRows([]string{"count(*)"}).AddRow(5))
 	mock.ExpectRollback()
 

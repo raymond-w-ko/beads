@@ -20,6 +20,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/issueops"
@@ -46,29 +47,33 @@ type doltDependentsIter struct {
 // matches GetDependentsWithMetadata. See the package doc for why the join
 // target per edge table is unambiguous.
 func (s *DoltStore) IterDependentsWithMetadata(ctx context.Context, issueID string) (storage.Iter[types.IssueWithDependencyMetadata], error) {
-	q := fmt.Sprintf(`
-		SELECT %s, d.type
-		FROM issues i
-		JOIN dependencies d ON d.issue_id = i.id
-		%s
-		WHERE %s = ?
-		UNION ALL
-		SELECT %s, d.type
-		FROM wisps w
-		JOIN wisp_dependencies d ON d.issue_id = w.id
-		%s
-		WHERE %s = ?
-		ORDER BY created_at ASC
-	`, prefixedIssueColumns("i"), sqlbuild.LeaseJoin("i"), depTargetExprWithAlias("d"),
-		prefixedIssueColumns("w"), sqlbuild.LeaseJoin("w"), depTargetExprWithAlias("d"))
-	return s.iterIssuesWithDepType(ctx, q, issueID, issueID)
+	args := issueops.DepTargetBranchArgs(issueID)
+	return s.iterIssuesWithDepType(ctx, iterDependentsQuery(), append(args, issueops.DepTargetBranchArgs(issueID)...)...)
 }
 
-func depTargetExprWithAlias(alias string) string {
-	if alias == "" {
-		return depTargetExpr
+// iterDependentsQuery is the statement IterDependentsWithMetadata streams:
+// for each source plane (issues joined to dependencies, wisps joined to
+// wisp_dependencies), one UNION ALL branch per target column
+// (issueops.DepTargetPredicates on d), all under the one ORDER BY. Filtering
+// on the COALESCE target expression left Dolt no index on the edge table, so
+// each `bd show --json` with dependents read every edge (bd-o24uj site 5).
+// Each branch keeps the old COALESCE filter as a residual (see
+// issueops.DepTargetPredicates); bind issueops.DepTargetBranchArgs(id) once
+// per plane, issues first.
+func iterDependentsQuery() string {
+	branches := make([]string, 0, 6)
+	for _, plane := range []struct{ table, alias, depTable string }{
+		{"issues", "i", "dependencies"},
+		{"wisps", "w", "wisp_dependencies"},
+	} {
+		for _, pred := range issueops.DepTargetPredicates("d") {
+			branches = append(branches, fmt.Sprintf(
+				"SELECT %s, d.type FROM %s %s JOIN %s d ON d.issue_id = %s.id %s WHERE %s",
+				prefixedIssueColumns(plane.alias), plane.table, plane.alias, plane.depTable, plane.alias,
+				sqlbuild.LeaseJoin(plane.alias), pred))
+		}
 	}
-	return fmt.Sprintf("COALESCE(%s.depends_on_issue_id, %s.depends_on_wisp_id, %s.depends_on_external)", alias, alias, alias)
+	return strings.Join(branches, " UNION ALL ") + " ORDER BY created_at ASC"
 }
 
 // IterDependenciesWithMetadata streams dependencies (issues issueID depends
