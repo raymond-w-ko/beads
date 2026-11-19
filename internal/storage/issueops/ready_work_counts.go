@@ -359,6 +359,14 @@ func ScanReadyWorkRowWithCounts(rows *sql.Rows, hyd sqlbuild.CountsHydration) (*
 		if err := json.Unmarshal([]byte(depsJSON.String), &deps); err != nil {
 			return nil, fmt.Errorf("scan issue with counts: parse deps_json: %w", err)
 		}
+		// One defined order, whichever form or plan fed JSON_ARRAYAGG: the
+		// dependency row's primary key (sqlbuild.DepJSONObject carries it for
+		// this sort). The key is then dropped, so the dependencies keep the
+		// fields they had before it rode along.
+		sort.SliceStable(deps, func(i, j int) bool { return deps[i].ID < deps[j].ID })
+		for _, d := range deps {
+			d.ID = ""
+		}
 		issue.Dependencies = deps
 	}
 

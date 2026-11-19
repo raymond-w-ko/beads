@@ -344,8 +344,10 @@ func TestSearchCountsSQLShape(t *testing.T) {
 	}
 
 	// By-IDs form: driver and every subquery are constrained to the ids, and the
-	// arg count matches the placeholder injection points (labels, dc, rc-deps,
-	// rc-wisp, cc, pc, d, driver = 8 for the wisp family with labels).
+	// arg count matches the placeholder injection points (labels, dc, three
+	// rc-deps branches and three rc-wisp branches binding twice each — column
+	// match, then the fork's residual COALESCE filter — cc, pc, d, driver = 18
+	// for the wisp family with labels).
 	byIDs, idArgs := SearchCountsSQL(WispsFilterTables, []string{"a", "b"}, "", "", "", true, CountsHydration{})
 	if !strings.Contains(byIDs, "WHERE i.id IN (?,?)") {
 		t.Errorf("by-IDs counts SQL missing driver id filter:\n%s", byIDs)
@@ -359,15 +361,16 @@ func TestSearchCountsSQLShape(t *testing.T) {
 	if strings.Contains(byIDs, "ORDER BY") || strings.Contains(byIDs, "LIMIT") {
 		t.Error("by-IDs counts SQL must not carry ORDER BY / LIMIT (order restored in Go)")
 	}
-	if len(idArgs) != 8*2 {
-		t.Errorf("by-IDs args = %d, want %d", len(idArgs), 8*2)
+	if len(idArgs) != 18*2 {
+		t.Errorf("by-IDs args = %d, want %d", len(idArgs), 18*2)
 	}
 
 	// skipLabels drops the labels point and !includeWispReverseDeps drops the
-	// rc-wisp point, leaving 6 injection points (dc, rc-deps, cc, pc, d, driver).
+	// three rc-wisp branches, leaving 11 injection points (dc, three rc-deps
+	// branches binding twice each, cc, pc, d, driver).
 	_, idArgsNoLabels := SearchCountsSQL(IssuesFilterTables, []string{"a", "b"}, "", "", "", false, CountsHydration{SkipLabels: true})
-	if len(idArgsNoLabels) != 6*2 {
-		t.Errorf("by-IDs args (skipLabels, no wisp deps) = %d, want %d", len(idArgsNoLabels), 6*2)
+	if len(idArgsNoLabels) != 11*2 {
+		t.Errorf("by-IDs args (skipLabels, no wisp deps) = %d, want %d", len(idArgsNoLabels), 11*2)
 	}
 
 	// SkipCounts drops the three cardinality joins and projects constants in
@@ -399,6 +402,110 @@ func TestSearchCountsSQLShape(t *testing.T) {
 	_, idArgsNeither := SearchCountsSQL(WispsFilterTables, []string{"a", "b"}, "", "", "", true, CountsHydration{SkipLabels: true, SkipCounts: true})
 	if len(idArgsNeither) != 3*2 {
 		t.Errorf("by-IDs args (skipLabels+skipCounts) = %d, want %d", len(idArgsNeither), 3*2)
+	}
+}
+
+// TestSearchCountsSQLByIDsReverseBlockersIndexable pins the by-IDs form's
+// reverse-blocker (rc) match (#7635). Matching COALESCE(depends_on_issue_id,
+// depends_on_wisp_id, depends_on_external) IN (ids) can use no index, so every
+// by-IDs batch re-read every blocks edge in both dependency tables. The match
+// is one branch per target column instead, each an IN on that column — the
+// column its own index serves — and each later branch requires the earlier
+// columns NULL. That guard is what keeps the rewrite equal to COALESCE on a
+// row with two targets, which ck_dep_one_target / ck_wisp_dep_one_target
+// forbid but a store can still hold (schema/dep_id_backfill.go leaves such
+// rows for bd doctor): COALESCE files such a row under its FIRST non-NULL
+// target only, and so do the guarded branches.
+//
+// FORK, unlike upstream #8535: every branch also carries the old filter,
+// COALESCE(...) IN (ids), as a residual after the column match, and projects
+// the COALESCE rather than the bare column, so a column whose collation
+// differs from the COALESCE result's cannot admit or join an id the old form
+// did not (review bd-lwx6j; issueops.DepTargetPredicates). The residual rides
+// on the seeked range; it is never the branch's leading match.
+//
+// The predicate form keeps its keyless COALESCE projection: it groups the
+// whole table either way, and has no id list to push.
+func TestSearchCountsSQLByIDsReverseBlockersIndexable(t *testing.T) {
+	t.Parallel()
+
+	ids := []string{"a", "b", "c"}
+	branches := func(table string) []string {
+		return []string{
+			"SELECT " + DepTargetExpr + " AS dep_id FROM " + table + " WHERE type = 'blocks' AND depends_on_issue_id IN (?,?,?) AND " + DepTargetExpr + " IN (?,?,?)",
+			"SELECT " + DepTargetExpr + " AS dep_id FROM " + table + " WHERE type = 'blocks' AND depends_on_issue_id IS NULL AND depends_on_wisp_id IN (?,?,?) AND " + DepTargetExpr + " IN (?,?,?)",
+			"SELECT " + DepTargetExpr + " AS dep_id FROM " + table + " WHERE type = 'blocks' AND depends_on_issue_id IS NULL AND depends_on_wisp_id IS NULL AND depends_on_external IN (?,?,?) AND " + DepTargetExpr + " IN (?,?,?)",
+		}
+	}
+	squash := func(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+	byIDs, _ := SearchCountsSQL(WispsFilterTables, ids, "", "", "", true, CountsHydration{})
+	flat := squash(byIDs)
+	for _, table := range []string{"dependencies", "wisp_dependencies"} {
+		for _, want := range branches(table) {
+			if !strings.Contains(flat, want) {
+				t.Errorf("by-IDs rc missing branch %q:\n%s", want, byIDs)
+			}
+		}
+	}
+	// The COALESCE match is only ever the residual: never right after the
+	// type filter, where it would be the branch's leading (unindexable) match.
+	if strings.Contains(flat, "type = 'blocks' AND "+DepTargetExpr+" IN (") {
+		t.Errorf("by-IDs rc must not lead with the unindexable %s:\n%s", DepTargetExpr, byIDs)
+	}
+	if got := strings.Count(flat, "AND "+DepTargetExpr+" IN (?,?,?)"); got != 6 {
+		t.Errorf("by-IDs rc carries the residual %s filter %d times, want 6 (one per branch):\n%s", DepTargetExpr, got, byIDs)
+	}
+
+	// Without the wisp dependency table only the dependencies branches render.
+	noWisp, _ := SearchCountsSQL(IssuesFilterTables, ids, "", "", "", false, CountsHydration{})
+	if strings.Contains(noWisp, "wisp_dependencies") {
+		t.Errorf("by-IDs rc must not read wisp_dependencies when the probe says absent:\n%s", noWisp)
+	}
+	for _, want := range branches("dependencies") {
+		if !strings.Contains(squash(noWisp), want) {
+			t.Errorf("by-IDs rc (no wisp deps) missing branch %q", want)
+		}
+	}
+
+	// The predicate form's rc is unchanged: keyless, one COALESCE projection
+	// per table.
+	pred, _ := SearchCountsSQL(WispsFilterTables, nil, "", "", "", true, CountsHydration{})
+	for _, table := range []string{"dependencies", "wisp_dependencies"} {
+		want := "SELECT " + DepTargetExpr + " AS dep_id FROM " + table + " WHERE type = 'blocks' UNION ALL"
+		if table == "wisp_dependencies" {
+			want = "SELECT " + DepTargetExpr + " AS dep_id FROM " + table + " WHERE type = 'blocks' ) all_blockers"
+		}
+		if !strings.Contains(squash(pred), want) {
+			t.Errorf("predicate rc changed; missing %q:\n%s", want, pred)
+		}
+	}
+}
+
+// TestSearchCountsSQLByIDsArgsMatchPlaceholders pins that the by-IDs form
+// returns exactly one arg per placeholder, for every hydration and both wisp
+// reverse-dependency settings. Every injection point binds the same id list,
+// so the count is the whole lockstep contract: a branch added to the SQL
+// without its args (or the reverse) fails here rather than as a driver error.
+func TestSearchCountsSQLByIDsArgsMatchPlaceholders(t *testing.T) {
+	t.Parallel()
+
+	ids := []string{"a", "b", "c"}
+	for _, tables := range []FilterTables{IssuesFilterTables, WispsFilterTables} {
+		for _, wispDeps := range []bool{false, true} {
+			for _, hyd := range []CountsHydration{
+				{}, {SkipLabels: true}, {SkipCounts: true}, {SkipLabels: true, SkipCounts: true},
+				{Lite: true}, {Lite: true, SkipLabels: true, SkipCounts: true},
+			} {
+				q, args := SearchCountsSQL(tables, ids, "", "", "", wispDeps, hyd)
+				if got := strings.Count(q, "?"); got != len(args) {
+					t.Errorf("%s wispDeps=%v %+v: %d placeholders, %d args", tables.Main, wispDeps, hyd, got, len(args))
+				}
+				if len(args)%len(ids) != 0 {
+					t.Errorf("%s wispDeps=%v %+v: %d args is not a whole number of id lists", tables.Main, wispDeps, hyd, len(args))
+				}
+			}
+		}
 	}
 }
 

@@ -1,6 +1,9 @@
 package sqlbuild
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // ReadyWorkIssueColumns is IssueSelectColumns qualified with the "i." alias
 // used by the counts mega-query. The lease overlay columns keep their own
@@ -14,8 +17,12 @@ var ReadyWorkIssueColumnsLite = QualifyColumns(IssueBaseColumnsLite, "i.") + ", 
 
 // DepJSONObject renders one dependency row as JSON for JSON_ARRAYAGG
 // aggregation in the counts mega-query. Field names must match the JSON tags
-// of types.Dependency.
+// of types.Dependency. 'id', the row's primary key, rides along only so the
+// scan can put the array in primary-key order (JSON_ARRAYAGG promises none);
+// issueops.ScanReadyWorkRowWithCounts sorts on it and then drops it, so the
+// emitted dependencies keep the fields they had.
 const DepJSONObject = `JSON_OBJECT(
+	'id', id,
 	'issue_id', issue_id,
 	'depends_on_id', COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external),
 	'type', type,
@@ -84,18 +91,26 @@ func (h CountsHydration) IssueColumns() string {
 //     each subquery from scanning its whole side table and, crucially, keeps
 //     the reverse-blocker rc self-join — whose COALESCE(...) key the pure-Go
 //     GMS analyzer cannot auto-index — from re-scanning its full materialization
-//     once per driver row. The returned args are the ids repeated once per
-//     injection point, in left-to-right placeholder order.
+//     once per driver row. rc matches the ids one target column at a time
+//     (reverseBlockersByIDs), so each branch is an indexed lookup rather than a
+//     scan of every blocks edge. The returned args are the ids repeated once
+//     per injection point, in left-to-right placeholder order.
 //
 // The by-IDs form is result-identical to the predicate form over the same set
 // of surviving rows: each per-issue count is a function of the whole dependency
 // graph restricted to that issue, so filtering a subquery's input to ids cannot
 // change any surviving row's count. dep/comment/parent counts are
 // order-insensitive; labels are re-sorted in Go (ScanReadyWorkRowWithCounts).
-// deps_json's element order is whatever JSON_ARRAYAGG emits (SQL does not
-// guarantee one), but it is the same in both forms: restricting the aggregate's
-// input to ids drops only rows for other issues, so the per-issue rows it
-// aggregates — and their relative order — are unchanged.
+// deps_json's element order is NOT the same in both forms: JSON_ARRAYAGG emits
+// its input in whatever order the plan feeds it (SQL guarantees none), and the
+// by-IDs form reaches the dependency rows through another access path than the
+// predicate form, so one issue's array came back in another order (review
+// bd-r8crc). ScanReadyWorkRowWithCounts therefore sorts each array by the
+// dependency row's primary key (the 'id' DepJSONObject carries), on both
+// stacks and for the ready read, so every form emits that one order. It is the
+// order the predicate form's primary-key scan emitted before (bd-2i55u).
+// Upstream #8535's by-IDs form has the same property: without a sort after
+// the scan its arrays can come back in another order too.
 //
 // In the predicate form, whereSQL filters the main table in an inner subquery,
 // BEFORE the aggregate LEFT JOINs. The joins all preserve every main row, so
@@ -136,27 +151,31 @@ func SearchCountsSQL(tables FilterTables, ids []string, whereSQL, orderBySQL, li
 	// Per-subquery id constraints. Empty strings in the predicate form leave the
 	// projection unchanged; in the by-IDs form they push the page down so no
 	// subquery aggregates more than the page's worth of rows.
-	var labelWhere, depBlocksExtra, rcDepExtra, rcWispExtra, ccWhere, pcExtra, depWhere string
+	var labelWhere, depBlocksExtra, ccWhere, pcExtra, depWhere string
 	if byIDs {
 		labelWhere = fmt.Sprintf("WHERE issue_id IN (%s)", inSQL)
 		depBlocksExtra = fmt.Sprintf(" AND issue_id IN (%s)", inSQL)
-		rcDepExtra = fmt.Sprintf(" AND %s IN (%s)", DepTargetExpr, inSQL)
-		rcWispExtra = fmt.Sprintf(" AND %s IN (%s)", DepTargetExpr, inSQL)
 		ccWhere = fmt.Sprintf("WHERE issue_id IN (%s)", inSQL)
 		pcExtra = fmt.Sprintf(" AND issue_id IN (%s)", inSQL)
 		depWhere = fmt.Sprintf("WHERE issue_id IN (%s)", inSQL)
 	}
 
-	reverseBlockerSelect := fmt.Sprintf(`
-				SELECT %s AS dep_id
-				FROM dependencies WHERE type = 'blocks'%s
-	`, DepTargetExpr, rcDepExtra)
+	depTables := []string{"dependencies"}
 	if includeWispReverseDeps {
+		depTables = append(depTables, "wisp_dependencies")
+	}
+	reverseBlockerSelect := ""
+	for _, table := range depTables {
+		if reverseBlockerSelect != "" {
+			reverseBlockerSelect += "\n\t\t\t\tUNION ALL"
+		}
+		if byIDs {
+			reverseBlockerSelect += reverseBlockersByIDs(table, inSQL)
+			continue
+		}
 		reverseBlockerSelect += fmt.Sprintf(`
-				UNION ALL
 				SELECT %s AS dep_id
-				FROM wisp_dependencies WHERE type = 'blocks'%s
-		`, DepTargetExpr, rcWispExtra)
+				FROM %s WHERE type = 'blocks'`, DepTargetExpr, table)
 	}
 
 	labelsSelect := "l.labels_json AS labels_json"
@@ -266,17 +285,22 @@ func SearchCountsSQL(tables FilterTables, ids []string, whereSQL, orderBySQL, li
 	}
 
 	// args follow the placeholder order in sqlText: labels join (unless
-	// skipped), dc, rc dependencies branch, rc wisp branch (if any), cc (all
-	// four unless the counts are skipped), pc, d, then the driver.
-	args := make([]any, 0, len(idArgs)*8)
+	// skipped), dc, the three rc dependencies branches, the three rc wisp
+	// branches (if any), each twice (column match, then the residual), cc (all
+	// of these unless the counts are skipped), pc, d, then the driver. Every
+	// point binds the same id list.
+	args := make([]any, 0, len(idArgs)*18)
 	if !hyd.SkipLabels {
 		args = append(args, idArgs...)
 	}
 	if !hyd.SkipCounts {
 		args = append(args, idArgs...) // dc
-		args = append(args, idArgs...) // rc dependencies
-		if includeWispReverseDeps {
-			args = append(args, idArgs...) // rc wisp_dependencies
+		for range depTables {
+			for range reverseBlockerTargets {
+				for range reverseBlockerBindsPerBranch {
+					args = append(args, idArgs...) // rc branch: column match, then residual
+				}
+			}
 		}
 		args = append(args, idArgs...) // cc
 	}
@@ -285,3 +309,61 @@ func SearchCountsSQL(tables FilterTables, ids []string, whereSQL, orderBySQL, li
 	args = append(args, idArgs...) // driver
 	return sqlText, args
 }
+
+// reverseBlockerTargets are DepTargetExpr's operands, in its COALESCE order.
+var reverseBlockerTargets = []string{"depends_on_issue_id", "depends_on_wisp_id", "depends_on_external"}
+
+// reverseBlockersByIDs renders the by-IDs form's reverse-blocker rows from one
+// dependency table: the blocks edges whose target is one of the page's ids,
+// each projected as that target (#7635).
+//
+// It is DepTargetExpr IN (ids), restated so an index can serve it. Nothing
+// indexes the COALESCE expression, so matching on it re-read every blocks edge
+// in the table once per batch — about 85% of a by-IDs statement's cost at 46k
+// wisps. Here each target column gets its own branch, `<col> IN (ids)`, which
+// an index on that column serves (its own, or (type, <col>)).
+//
+// A branch also requires every EARLIER column NULL, and that guard is what
+// keeps the rewrite equal to COALESCE for every row, not only the rows the
+// one-target CHECKs (ck_dep_one_target, ck_wisp_dep_one_target) admit. A row
+// with two targets is still reachable, by merging drifted schemas or by
+// hand-repair SQL, and the id backfill leaves such rows as they are for
+// `bd doctor` to surface (schema/dep_id_backfill.go, depRow.mergeable).
+// COALESCE files a row with two targets under the first non-NULL one only.
+// Unguarded branches would count it under both — once more for its first
+// target if the two are equal, and once for a second id COALESCE never names
+// if they differ, which COUNT(DISTINCT id) would not undo. With the guards, a
+// row matches only the branch of its first non-NULL column, exactly where
+// COALESCE puts it. The IS NULL tests ride as residual filters on the indexed
+// range.
+//
+// FORK: each branch also keeps the old filter, `DepTargetExpr IN (ids)`, as a
+// residual, and projects DepTargetExpr rather than the bare column, which
+// upstream #8535 does not. A bare column compares under that column's
+// collation, the COALESCE under the collation of its result; where the three
+// target columns' collations differ (the migrations pin none, so they agree on
+// every database bd creates), a column branch could admit an id the old
+// filter did not, and a bare-column dep_id could join an issue row the
+// COALESCE one did not (review bd-lwx6j, fix bd-2fizq). With the residual and
+// the COALESCE projection a branch keeps only rows the old by-IDs filter kept
+// and joins them the way the predicate form does, as
+// issueops.DepTargetPredicates does for the dependents reads (sqlbuild cannot
+// import issueops). The residual binds the ids a second time per branch.
+func reverseBlockersByIDs(table, inSQL string) string {
+	var sb strings.Builder
+	var nullBefore string
+	for i, col := range reverseBlockerTargets {
+		if i > 0 {
+			sb.WriteString("\n\t\t\t\tUNION ALL")
+		}
+		fmt.Fprintf(&sb, `
+				SELECT %[1]s AS dep_id
+				FROM %[2]s WHERE type = 'blocks' AND %[3]s%[4]s IN (%[5]s) AND %[1]s IN (%[5]s)`, DepTargetExpr, table, nullBefore, col, inSQL)
+		nullBefore += col + " IS NULL AND "
+	}
+	return sb.String()
+}
+
+// reverseBlockerBindsPerBranch is how many times each rc branch binds the id
+// list: the column match, then the residual DepTargetExpr filter.
+const reverseBlockerBindsPerBranch = 2
