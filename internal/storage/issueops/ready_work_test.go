@@ -453,3 +453,17 @@ func TestReadyWorkWispIssueFilterPropagatesStatuses(t *testing.T) {
 		t.Fatalf("wisp filter Statuses = %v, want %v", filter.Statuses, want)
 	}
 }
+
+// bd-9mr2a: the wisps half carries the label glob and regex, so the wisps read
+// filters wisp_labels as the issues half filters labels.
+func TestReadyWorkWispIssueFilterPropagatesLabelPatterns(t *testing.T) {
+	t.Parallel()
+
+	filter := readyWorkWispIssueFilter(types.WorkFilter{LabelPattern: "class:*", LabelRegex: "^tier:[0-9]$"})
+	if filter.LabelPattern != "class:*" {
+		t.Errorf("wisp filter LabelPattern = %q, want %q", filter.LabelPattern, "class:*")
+	}
+	if filter.LabelRegex != "^tier:[0-9]$" {
+		t.Errorf("wisp filter LabelRegex = %q, want %q", filter.LabelRegex, "^tier:[0-9]$")
+	}
+}

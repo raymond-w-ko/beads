@@ -157,7 +157,13 @@ func GetReadyWorkInTx(
 		return nil, err
 	}
 
-	issues, err := GetIssuesByIDsInTx(ctx, tx, issueIDs, nil)
+	// Hydrate the issues half from issues alone (an empty, non-nil wisp set):
+	// the predicate selected these ids on the issues row and its labels. With
+	// a nil set GetIssuesByIDsInTx routes an id a wisp also holds to that wisp,
+	// which the wisps half below may have excluded (bd-63vumq). Where both
+	// halves select an id, mergeReadyWisps still keeps the wisp (be-iabdi). A
+	// ready claim on such an id keeps upstream's routing (bd-qdjinw).
+	issues, err := GetIssuesByIDsInTx(ctx, tx, issueIDs, map[string]struct{}{})
 	if err != nil {
 		return nil, fmt.Errorf("get ready work: fetch issues: %w", err)
 	}
@@ -343,11 +349,18 @@ func readyWorkExcludeTypes(extra []types.IssueType) []types.IssueType {
 
 func readyWorkWispIssueFilter(filter types.WorkFilter) types.IssueFilter {
 	pinnedFalse := false
+	// LabelPattern and LabelRegex (bd-9mr2a): the wisps half applies the label
+	// glob and regex on wisp_labels as the issues half
+	// (sqlbuild.BuildReadyWorkWhere) and the list read do; without them every
+	// ready wisp came back whatever its labels, and a patterned claim could
+	// take one.
 	wispFilter := types.IssueFilter{
 		Priority:       filter.Priority,
 		Labels:         filter.Labels,
 		LabelsAny:      filter.LabelsAny,
 		ExcludeLabels:  filter.ExcludeLabels,
+		LabelPattern:   filter.LabelPattern,
+		LabelRegex:     filter.LabelRegex,
 		Limit:          filter.Limit,
 		MolType:        filter.MolType,
 		WispType:       filter.WispType,

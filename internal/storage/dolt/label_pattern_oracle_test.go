@@ -31,9 +31,10 @@ import (
 // (GetReadyWork, GetReadyWorkWithCounts) and the list reads (SearchIssues,
 // SearchIssuesWithCounts), over issues (labels) and wisps (wisp_labels), with
 // the label column of both tables under each of lpoCollations. The ready
-// reads apply the pattern to issues only (their wisps half takes no
-// LabelPattern today); the list reads apply it to both tables, and the test
-// requires a rewritten wisp_labels clause and a list read returning a wisp.
+// reads and the list reads apply the pattern to both tables (the ready reads'
+// wisps half since bd-9mr2a, proved by TestReadyLabelPatternFiltersWisps in
+// ready_label_pattern_wisps_test.go), and the test requires a rewritten
+// wisp_labels clause and a list read returning a wisp.
 //
 // The candidate is the store under test. The oracle is a second store on the
 // same branch whose session rewrites every bare label clause back to today's
@@ -422,9 +423,10 @@ func TestLabelPatternOracle(t *testing.T) {
 					if len(want) > 0 {
 						nonEmpty++
 					}
-					// Only the list reads filter wisps by the pattern: the ready
-					// read's wisps half takes no LabelPattern today
-					// (readyWorkWispIssueFilter), so its wisp rows prove nothing.
+					// wispHits counts the list reads' wisp rows only. The ready
+					// reads filter wisps by the pattern too since bd-9mr2a; their
+					// wisps half is proved by TestReadyLabelPatternFiltersWisps
+					// (ready_label_pattern_wisps_test.go).
 					if strings.HasPrefix(read.name, "Search") {
 						for _, id := range want {
 							if strings.HasPrefix(id, "lpo-wisp-") {
