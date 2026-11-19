@@ -13,8 +13,8 @@ import (
 // fails with a *ThreadGuardMismatchError naming every thread and check that
 // failed.
 //
-// It exists for archive-then-delete (everturn ADR 0170): a caller images a
-// thread, ships the images somewhere durable, then deletes the thread. Between
+// It exists for archive-then-delete: a caller images a thread, ships the
+// images somewhere durable, then deletes the thread. Between
 // the archive and the delete a reply can land, a member can be edited, or a
 // member can be reopened; deleting then would destroy what the archive never
 // saw. The guard is checked INSIDE the deleting transaction, after the writer

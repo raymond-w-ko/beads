@@ -23,9 +23,10 @@ import (
 	publicops "github.com/steveyegge/beads/issueops"
 )
 
-// `bd delete --if-threads` (everturn ADR 0170) on all three routes: the direct
-// route (a `bd init --server` workspace, a DoltStore against a sql-server),
-// the embedded route, and the proxied route. Every case drives the real binary,
+// `bd delete --if-threads` for archive-then-delete of mail threads on all
+// three routes: the direct route (a `bd init --server` workspace, a DoltStore
+// against a sql-server), the embedded route, and the proxied route. Every
+// case drives the real binary,
 // so the flag rules, the exit code and the stderr report are the ones a caller
 // sees, and every case seeds its own thread under its own tag, so one workspace
 // per route serves them all.
