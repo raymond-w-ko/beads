@@ -6,21 +6,10 @@ import (
 	"context"
 	"database/sql"
 
+	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
-
-// depTargetExpr resolves a dependency row's target id from the split physical
-// columns instead of the STORED generated `depends_on_id` column. Both
-// `dependencies` and `wisp_dependencies` define depends_on_id as
-// GENERATED ALWAYS AS (COALESCE(depends_on_issue_id, depends_on_wisp_id,
-// depends_on_external)). Count queries must filter on the base columns: inside
-// a count(*) (which projects no real columns) the pure-Go GMS analyzer can
-// prune the base columns the generated column derives from and then fail with
-// "column depends_on_id could not be found in any table in scope". The slice
-// path projects real columns, so it can use depends_on_id directly. This
-// matches issueops.DepTargetExpr on main.
-const depTargetExpr = "COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external)"
 
 // CountIssues returns the number of issues matching query and filter.
 // Filter.Limit and Filter.Offset are ignored; all other fields apply.
@@ -53,26 +42,16 @@ func (s *EmbeddedDoltStore) CountIssuesByGroup(ctx context.Context, filter types
 
 // CountDependents counts both dependency tables so the total matches
 // GetDependentsWithMetadata: a dependent may be a permanent issue (edge in
-// `dependencies`) or a wisp (edge in `wisp_dependencies`). Counted in separate
-// top-level queries and summed in Go.
+// `dependencies`) or a wisp (edge in `wisp_dependencies`).
 //
-// Both tables' targets are resolved via depTargetExpr (the split physical
-// columns) rather than the STORED generated depends_on_id, which a count(*)
-// can fail to resolve under the pure-Go GMS analyzer.
+// The body is issueops.CountDependencyEdgesInTx, the one the proxied path
+// runs; it matches each target column on its own index (bd-o24uj).
 func (s *EmbeddedDoltStore) CountDependents(ctx context.Context, issueID string) (int64, error) {
 	var n int64
 	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
-		var perm, wisp int64
-		if err := tx.QueryRowContext(ctx,
-			`SELECT count(*) FROM dependencies WHERE `+depTargetExpr+` = ?`, issueID).Scan(&perm); err != nil {
-			return err
-		}
-		if err := tx.QueryRowContext(ctx,
-			`SELECT count(*) FROM wisp_dependencies WHERE `+depTargetExpr+` = ?`, issueID).Scan(&wisp); err != nil {
-			return err
-		}
-		n = perm + wisp
-		return nil
+		var err error
+		n, err = issueops.CountDependencyEdgesInTx(ctx, tx, issueID, domain.DepDirectionIn, nil)
+		return err
 	})
 	return n, err
 }

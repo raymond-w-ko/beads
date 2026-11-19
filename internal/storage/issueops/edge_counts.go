@@ -171,13 +171,11 @@ func tallyEdgesInTx(ctx context.Context, tx DBTX, anchors []string, request publ
 // buildEdgeCountQuery returns the grouped count for one dependency plane, keyed
 // by the anchor end the request's direction names.
 //
-// THE TARGET END IS ALWAYS THE COALESCE EXPRESSION, never the STORED generated
-// `depends_on_id` column. Both dependency tables define that column as
-// GENERATED ALWAYS AS the same COALESCE, and inside an aggregate the pure-Go
-// GMS analyzer can prune the base columns it derives from and then fail with
-// "column depends_on_id could not be found in any table in scope"
-// (dolt/counts.go says so at depTargetExpr). Every other aggregate over these
-// tables in this package resolves the target the same way.
+// The target end is the COALESCE expression over the split target columns
+// (depTargetExpr); the STORED generated `depends_on_id` column that once held
+// it is gone (migration 0043, ignored/0005). That expression seeks no index,
+// so this grouped In count reads the plane; a single-target count matches each
+// column on its own instead (DepTargetCountQuery).
 func buildEdgeCountQuery(depTable, sourceTable string, batchSize int, request publicops.EdgeCountRequest) string {
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", batchSize), ",")
 

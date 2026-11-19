@@ -78,6 +78,47 @@ func TestCountAndIterIncludeWispDependencies(t *testing.T) {
 		t.Errorf("CountDependencies(wc-wisp-dep) = %d, want 1 (edge lives in wisp_dependencies)", n)
 	}
 
+	// CountDependents matches each target column on its own index
+	// (issueops.DepTargetCountQuery), so it must still equal the COALESCE
+	// count for a wisp target (depends_on_wisp_id) and an external target
+	// (depends_on_external), in both tables (bd-4gimb). New sources keep the
+	// counts above unchanged.
+	createWisp(t, ctx, store, "wc-wisp-target")
+	createPerm(t, ctx, store, "wc-perm-src")
+	createWisp(t, ctx, store, "wc-wisp-src")
+	const extTarget = "external:wc:capability"
+	for _, tgt := range []string{"wc-wisp-target", extTarget} {
+		addBlocks("wc-perm-src", tgt)
+		addBlocks("wc-wisp-src", tgt)
+	}
+	for _, c := range []struct{ target, column string }{
+		{"wc-target", "depends_on_issue_id"},
+		{"wc-wisp-target", "depends_on_wisp_id"},
+		{extTarget, "depends_on_external"},
+	} {
+		// Precondition: the edges sit in the column this case covers.
+		var inColumn int64
+		if err := store.db.QueryRowContext(ctx,
+			"SELECT (SELECT count(*) FROM dependencies WHERE "+c.column+" = ?) + (SELECT count(*) FROM wisp_dependencies WHERE "+c.column+" = ?)",
+			c.target, c.target).Scan(&inColumn); err != nil {
+			t.Fatalf("column count %s: %v", c.target, err)
+		}
+		if inColumn != 2 {
+			t.Fatalf("precondition: %d edges to %s in %s, want 2 (1 perm + 1 wisp source)", inColumn, c.target, c.column)
+		}
+		var oracle int64
+		if err := store.db.QueryRowContext(ctx,
+			"SELECT (SELECT count(*) FROM dependencies WHERE "+depTargetExpr+" = ?) + (SELECT count(*) FROM wisp_dependencies WHERE "+depTargetExpr+" = ?)",
+			c.target, c.target).Scan(&oracle); err != nil {
+			t.Fatalf("COALESCE oracle %s: %v", c.target, err)
+		}
+		if n, err := store.CountDependents(ctx, c.target); err != nil {
+			t.Fatalf("CountDependents(%s): %v", c.target, err)
+		} else if n != oracle || n != 2 {
+			t.Errorf("CountDependents(%s) = %d, COALESCE oracle = %d, want both 2", c.target, n, oracle)
+		}
+	}
+
 	// IterDependentsWithMetadata must stream BOTH dependents.
 	iter, err := store.IterDependentsWithMetadata(ctx, "wc-target")
 	if err != nil {
