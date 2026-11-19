@@ -221,6 +221,20 @@ type VersionChange struct {
 // versionChanges contains agent-actionable changes for recent versions
 var versionChanges = []VersionChange{
 	{
+		Version: "1.3.5-dev.4",
+		Date:    "2026-11-19",
+		Changes: []string{
+			"DEV: fork pre-release above 1.3.5-dev.3, stamped so a caller can tell by 'bd version' a build whose databases have the everturn_worktree column and its index. It also marks the wisp dependency index, the short clone-local schema step and the types.custom fix landed since 1.3.5-dev.3.",
+			"NEW: a stored generated column everturn_worktree (metadata $.everturn.worktree, VARCHAR(255)) on issues and wisps, and idx_issues_everturn_worktree (everturn_worktree, created_at) on issues only, so a read of the beads keyed to a worktree seeks the index instead of walking every issue's JSON. A reader must name the column ('WHERE everturn_worktree IN (...)'): the raw 'metadata->>'$.everturn.worktree'' form does not seek. Added at a database's first writable open by this build, which fills the old rows; every bd process of the database waits behind the migration lock meanwhile (measured on Dolt 2.2.0: 9.7 s for the issues column at 100,000 issues, 1.6 s for the wisps column at 20,000 wisps, 0.3 s for the index). A 1.3.5-dev.3 build on a database that has the column sends no DDL and writes, upserts and promotes as before.",
+			"CHANGE: the fork schema step adds idx_wisp_dep_external_target on wisp_dependencies (the name and definition of migrations 0047 and ignored/0003), so the external branch of the dependents count and of 'bd show --json' dependents rows seeks it instead of scanning the table. A writable open sends one more probe, SHOW INDEX FROM wisp_dependencies (31 commands); a read-only open sends none more (38720fbbf).",
+			"CHANGE: a database at the latest version that lacks only fork objects on the dolt_ignored wisps and wisp_dependencies takes a short step under the migration lock: the ALTERs only, with no unstage, re-key, DOLT_ADD or commit, so a user's staged rows and uncommitted durable dependencies are left as they are. A wisp table that is not actively ignored, or a missing fork object on issues, still takes the whole pass (38720fbbf).",
+			"CHANGE: a filtered 'bd list' page of at most 200 ids (one by-IDs batch, or an unbounded read whose LIMIT 201 probe holds at most 200) selects its ordered ids with the plain id scan, then reads the counts of exactly those ids, instead of aggregating every side table over the whole corpus (GH#4370); no emitted value changes. The dependencies array of 'bd list --json' and 'bd ready --json' has one defined order, sorted by the dependency row's primary key; before, its order could change with the query plan. In builds since 1.3.5-dev.2 (cd1225ddf).",
+			"CHANGE: the scoped is_blocked recompute of 'bd create' and 'bd close' is pinned to lookup joins (JOIN_ORDER and LOOKUP_JOIN hints, one indexed EXISTS per dependency table and spawner column in the waits-for gate), so a statistics refresh no longer flips it to a scan of every open issue (6-10 s a statement over an import's few thousand uncommitted issues, against about 0.1 s). The unscoped union keeps the planner's choice. In builds since 1.3.5-dev.2 (161bbf554).",
+			"FIX: fork object names are matched case-insensitively, so an upper-case index name no longer sends the duplicate ALTER on every open; the dolt_ignore seed commit is skipped while another table is staged, so it no longer carries the user's staged rows (38720fbbf).",
+			"FIX: 'bd config set types.custom' with a repeated name ('a,a') no longer fails with a raw Error 1062 duplicate primary key: the custom_types table stores each name once, keeping the first occurrence and the order. The config value is stored as typed, and names compare byte-wise, so 'Broken Pipe,broken pipe' still stores two rows (a668eac83).",
+		},
+	},
+	{
 		Version: "1.3.5-dev.3",
 		Date:    "2026-11-19",
 		Changes: []string{

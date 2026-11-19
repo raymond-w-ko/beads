@@ -36,6 +36,7 @@ func TestForkIndexesSQLNamesEveryIndexWithDirectDDL(t *testing.T) {
 		"idx_issues_everturn_relay_source",
 		"idx_issues_everturn_bead",
 		"idx_issues_everturn_corrects",
+		"idx_issues_everturn_worktree",
 	} {
 		if !strings.Contains(got, "ALTER TABLE issues ADD INDEX "+name+" (") {
 			t.Errorf("forkIndexesSQL() does not add %s on issues:\n%s", name, got)
@@ -48,6 +49,7 @@ func TestForkIndexesSQLNamesEveryIndexWithDirectDDL(t *testing.T) {
 		{"everturn_relay_source", "$.everturn.relay.source"},
 		{"everturn_bead", "$.everturn.bead"},
 		{"everturn_corrects", "$.everturn.corrects"},
+		{"everturn_worktree", "$.everturn.worktree"},
 	} {
 		column := "ALTER TABLE issues ADD COLUMN " + c.name + " VARCHAR(255) GENERATED ALWAYS AS (LEFT(JSON_UNQUOTE(JSON_EXTRACT(metadata, '" + c.path + "')), 255)) STORED;\n"
 		if !strings.Contains(got, column) {
@@ -66,7 +68,7 @@ func TestForkIndexesSQLNamesEveryIndexWithDirectDDL(t *testing.T) {
 			t.Errorf("forkIndexesSQL() uses %s:\n%s", banned, got)
 		}
 	}
-	if n, want := strings.Count(got, ";\n"), 5+7; n != want { // five issues columns, seven issues indexes
+	if n, want := strings.Count(got, ";\n"), 6+8; n != want { // six issues columns, eight issues indexes
 		t.Errorf("forkIndexesSQL() has %d statement terminators, want %d:\n%s", n, want, got)
 	}
 	if !strings.HasSuffix(AllMigrationsSQL(), got) {

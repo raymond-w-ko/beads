@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -29,18 +31,29 @@ var forkIndexNames = []string{
 	"idx_issues_everturn_relay_source",
 	"idx_issues_everturn_bead",
 	"idx_issues_everturn_corrects",
+	"idx_issues_everturn_worktree",
 }
 
-// everturnMailKeyColumns are the four generated columns everturn's mail reads
-// filter on, each on issues and on wisps and indexed on both as
-// (column, created_at), with the metadata path each holds. The names and paths
-// are everturn's reader contract (bd-iqmdg).
-var everturnMailKeyColumns = []struct{ name, path string }{
+// everturnMailKeyColumns are the generated key columns after everturn_action:
+// the four everturn's mail reads filter on (bd-iqmdg) and everturn_worktree,
+// the landing runner's worktree key (bd-0y3xe). Each is on issues and on
+// wisps and indexed as (column, created_at) on issues, and on wisps too
+// unless issuesOnly (everturn_worktree: its reader reads issues only). The
+// names and paths are everturn's reader contract.
+var everturnMailKeyColumns = []struct {
+	name, path string
+	issuesOnly bool
+}{
 	{name: "everturn_key", path: "$.everturn.key"},
 	{name: "everturn_relay_source", path: "$.everturn.relay.source"},
 	{name: "everturn_bead", path: "$.everturn.bead"},
 	{name: "everturn_corrects", path: "$.everturn.corrects"},
+	{name: "everturn_worktree", path: "$.everturn.worktree", issuesOnly: true},
 }
+
+// forkIndexedOn reports whether the step indexes a key column with that
+// issuesOnly on table.
+func forkIndexedOn(table string, issuesOnly bool) bool { return table == "issues" || !issuesOnly }
 
 var forkTables = []string{"issues", "wisps"}
 
@@ -575,11 +588,11 @@ func TestForkIndexesDirtyWispsStillHealed(t *testing.T) {
 	}
 }
 
-// allEverturnKeysMetadata is metadata carrying everturn.action and every mail
-// key, the mail keys ending in suffix.
+// allEverturnKeysMetadata is metadata carrying everturn.action and every other
+// key (everturnMailKeyColumns), each ending in suffix.
 func allEverturnKeysMetadata(action, suffix string) json.RawMessage {
-	return json.RawMessage(fmt.Sprintf(`{"everturn":{"action":%q,"key":"k-%s","relay":{"source":"src-%s"},"bead":"bd-%s","corrects":"mail-%s"}}`,
-		action, suffix, suffix, suffix, suffix))
+	return json.RawMessage(fmt.Sprintf(`{"everturn":{"action":%q,"key":"k-%s","relay":{"source":"src-%s"},"bead":"bd-%s","corrects":"mail-%s","worktree":"wt/bd-%s"}}`,
+		action, suffix, suffix, suffix, suffix, suffix))
 }
 
 // wantAllEverturnKeys is what the generated columns of a row written with
@@ -592,6 +605,7 @@ func wantAllEverturnKeys(action, suffix string) map[string]sql.NullString {
 		"everturn_relay_source": v("src-" + suffix),
 		"everturn_bead":         v("bd-" + suffix),
 		"everturn_corrects":     v("mail-" + suffix),
+		"everturn_worktree":     v("wt/bd-" + suffix),
 	}
 }
 
@@ -681,6 +695,12 @@ func assertEverturnForkSchema(t *testing.T, ctx context.Context, db *sql.DB, whe
 				t.Errorf("%s: %s lacks %s", when, table, c.name)
 			}
 			index := "idx_" + table + "_" + c.name
+			if !forkIndexedOn(table, c.issuesOnly) {
+				if tableIndexExists(t, ctx, db, table, index) {
+					t.Errorf("%s: %s has %s, which the step does not add", when, table, index)
+				}
+				continue
+			}
 			if got, want := tableIndexColumns(t, ctx, db, table, index), []string{c.name, "created_at"}; !slices.Equal(got, want) {
 				t.Errorf("%s: %s columns on %s = %v, want %v", when, index, table, got, want)
 			}
@@ -710,9 +730,13 @@ func TestForkIndexesEverturnMailKeysPresentAndUsed(t *testing.T) {
 
 	for _, table := range forkTables {
 		for _, c := range everturnMailKeyColumns {
+			if !forkIndexedOn(table, c.issuesOnly) {
+				continue
+			}
 			index := "[" + table + "." + c.name + "," + table + ".created_at]"
 			value := map[string]string{
 				"everturn_key": "k-1", "everturn_relay_source": "src-1", "everturn_bead": "bd-1", "everturn_corrects": "mail-1",
+				"everturn_worktree": "wt/bd-1",
 			}[c.name]
 			queries := []string{
 				fmt.Sprintf("SELECT m.id FROM (SELECT id FROM %s WHERE %s = '%s') k JOIN %s m ON m.id = k.id", table, c.name, value, table),
@@ -740,6 +764,29 @@ func TestForkIndexesEverturnMailKeysPresentAndUsed(t *testing.T) {
 			t.Errorf("%s rows with an array everturn_key = %d, want %d", table, n, want)
 		}
 	}
+	// The landing runner's read of the beads keyed to a set of worktrees
+	// (bd-0y3xe), with the column named: it seeks idx_issues_everturn_worktree.
+	// The raw JSON form of the same read is logged for the record; the reader
+	// must name the column, as for everturn_action.
+	keys := []string{"'wt/bd-0'", "'wt/bd-1'"}
+	for i := 2; i < 10; i++ {
+		keys = append(keys, fmt.Sprintf("'wt/bd-absent-%d'", i))
+	}
+	runner := "SELECT i.id FROM issues i WHERE i.status <> 'tombstone' AND i.everturn_worktree IN (" + strings.Join(keys, ", ") + ") ORDER BY i.id"
+	plan := explainPlan(t, ctx, store.db, runner)
+	t.Logf("EXPLAIN FORMAT=TREE %s\n%s", runner, plan)
+	if !strings.Contains(plan, "IndexedTableAccess") || !strings.Contains(plan, "[issues.everturn_worktree,issues.created_at]") {
+		t.Errorf("the runner's read does not seek idx_issues_everturn_worktree, plan:\n%s", plan)
+	}
+	raw := "SELECT i.id FROM issues i WHERE i.status <> 'tombstone' AND i.metadata->>'$.everturn.worktree' IN (" + strings.Join(keys, ", ") + ") ORDER BY i.id"
+	t.Logf("EXPLAIN FORMAT=TREE %s (raw JSON form, not asserted)\n%s", raw, explainPlan(t, ctx, store.db, raw))
+	var n int
+	if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM ("+runner+") r").Scan(&n); err != nil {
+		t.Fatalf("run the runner's read: %v", err)
+	}
+	if want := 120; n != want { // i%4 != 3 and i%5 != 4 and i%3 in {0,1}, i < 300
+		t.Errorf("the runner's read returned %d issues, want %d", n, want)
+	}
 }
 
 // TestForkIndexesEverturnMailKeyValues checks what each mail key column stores,
@@ -753,13 +800,19 @@ func TestForkIndexesEverturnMailKeyValues(t *testing.T) {
 	defer cancel()
 
 	long := strings.Repeat("x", 300)
+	stringKey := map[string]string{"everturn_worktree": "wt/bd-abc12"} // the others: v1
+	for _, c := range everturnMailKeyColumns {
+		if stringKey[c.name] == "" {
+			stringKey[c.name] = "v1"
+		}
+	}
 	for _, table := range forkTables {
 		for _, c := range everturnMailKeyColumns {
 			for _, tc := range []struct {
 				name, metadata string
 				want           sql.NullString
 			}{
-				{name: "string", metadata: metadataAt(c.path, `"v1"`), want: sql.NullString{String: "v1", Valid: true}},
+				{name: "string", metadata: metadataAt(c.path, `"`+stringKey[c.name]+`"`), want: sql.NullString{String: stringKey[c.name], Valid: true}},
 				{name: "missing", metadata: `{"everturn":{"action":"wake"}}`},
 				{name: "array", metadata: metadataAt(c.path, `["k1","k2"]`), want: sql.NullString{String: `["k1", "k2"]`, Valid: true}},
 				{name: "long", metadata: metadataAt(c.path, `"`+long+`"`), want: sql.NullString{String: long[:255], Valid: true}},
@@ -852,13 +905,16 @@ func TestForkIndexesEverturnMailKeysRepaired(t *testing.T) {
 	execAll(t, ctx, store.db,
 		"ALTER TABLE issues DROP COLUMN everturn_key",
 		"ALTER TABLE issues DROP INDEX idx_issues_everturn_bead",
+		"ALTER TABLE issues DROP INDEX idx_issues_everturn_worktree",
 		"CALL DOLT_ADD('issues')",
 		"CALL DOLT_COMMIT('-m', 'test: drop a mail key column and index on issues')",
 		"ALTER TABLE wisps DROP COLUMN everturn_corrects",
 		"ALTER TABLE wisps DROP INDEX idx_wisps_everturn_relay_source",
+		"ALTER TABLE wisps DROP COLUMN everturn_worktree",
 	)
 	if tableColumnExists(t, ctx, store.db, "issues", "everturn_key") || tableIndexExists(t, ctx, store.db, "issues", "idx_issues_everturn_key") ||
-		tableColumnExists(t, ctx, store.db, "wisps", "everturn_corrects") || tableIndexExists(t, ctx, store.db, "wisps", "idx_wisps_everturn_corrects") {
+		tableColumnExists(t, ctx, store.db, "wisps", "everturn_corrects") || tableIndexExists(t, ctx, store.db, "wisps", "idx_wisps_everturn_corrects") ||
+		tableIndexExists(t, ctx, store.db, "issues", "idx_issues_everturn_worktree") || tableColumnExists(t, ctx, store.db, "wisps", "everturn_worktree") {
 		t.Fatalf("a dropped column or its index survived; the case under test did not arise")
 	}
 	if _, err := initSchemaOnDB(ctx, store.db); err != nil {
@@ -923,7 +979,7 @@ func TestForkIndexesEverturnMailKeysBackfilled(t *testing.T) {
 	for _, table := range forkTables {
 		assertEverturnKeys(t, ctx, store.db, table, "fx-mk-old-"+table, wantAllEverturnKeys("wake", "old"))
 		assertEverturnKeys(t, ctx, store.db, table, "fx-mk-old-none-"+table, map[string]sql.NullString{
-			"everturn_key": {}, "everturn_relay_source": {}, "everturn_bead": {}, "everturn_corrects": {},
+			"everturn_key": {}, "everturn_relay_source": {}, "everturn_bead": {}, "everturn_corrects": {}, "everturn_worktree": {},
 		})
 	}
 	if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n != 0 {
@@ -964,16 +1020,22 @@ func TestForkIndexesWispsMadeAgain(t *testing.T) {
 }
 
 // forkMailKeyStatements are the fork step's statements for issues on a
-// database of the previous build (1.3.5-dev.1: everturn_action and its index
-// present, the four mail key columns absent), in the step's order: the four
-// columns, then their four indexes.
-func forkMailKeyStatements() []string {
+// database of the build 1.3.5-dev.1 (everturn_action and its index present,
+// the four mail key columns and everturn_worktree absent), in the step's
+// order: the five columns, then their five indexes.
+func forkMailKeyStatements() []string { return forkKeyStatements("issues") }
+
+// forkKeyStatements is forkMailKeyStatements on table: on wisps, without the
+// index of an issuesOnly column.
+func forkKeyStatements(table string) []string {
 	var out []string
 	for _, c := range everturnMailKeyColumns {
-		out = append(out, "ALTER TABLE issues ADD COLUMN "+c.name+" VARCHAR(255) GENERATED ALWAYS AS (LEFT(JSON_UNQUOTE(JSON_EXTRACT(metadata, '"+c.path+"')), 255)) STORED")
+		out = append(out, "ALTER TABLE "+table+" ADD COLUMN "+c.name+" VARCHAR(255) GENERATED ALWAYS AS (LEFT(JSON_UNQUOTE(JSON_EXTRACT(metadata, '"+c.path+"')), 255)) STORED")
 	}
 	for _, c := range everturnMailKeyColumns {
-		out = append(out, "ALTER TABLE issues ADD INDEX idx_issues_"+c.name+" ("+c.name+", created_at)")
+		if forkIndexedOn(table, c.issuesOnly) {
+			out = append(out, "ALTER TABLE "+table+" ADD INDEX idx_"+table+"_"+c.name+" ("+c.name+", created_at)")
+		}
 	}
 	return out
 }
@@ -1006,7 +1068,8 @@ func toForkBuildSchema(t *testing.T, ctx context.Context, db *sql.DB, drop []str
 	}
 }
 
-// toPreviousBuildSchema is the schema of 1.3.5-dev.1: no mail key columns.
+// toPreviousBuildSchema is the schema of 1.3.5-dev.1: no mail key columns and
+// no everturn_worktree.
 func toPreviousBuildSchema(t *testing.T, ctx context.Context, db *sql.DB) {
 	t.Helper()
 	var drop []string
@@ -1059,6 +1122,16 @@ func forkInterruptedCases() []struct {
 		toForkBuildSchema(t, ctx, db, drop)
 		execAll(t, ctx, db, "ALTER TABLE issues ADD COLUMN everturn_action VARCHAR(255) GENERATED ALWAYS AS (LEFT(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.everturn.action')), 255)) STORED")
 	}})
+	// A database of 1.3.5-dev.3 (every key column but everturn_worktree) whose
+	// upgrade stopped after the issues column ALTER: before its index and
+	// before the wisps column (bd-0y3xe).
+	cases = append(cases, struct {
+		name    string
+		prepare func(t *testing.T, ctx context.Context, db *sql.DB)
+	}{"dev.3 everturn_worktree on issues, no index, not on wisps", func(t *testing.T, ctx context.Context, db *sql.DB) {
+		toForkBuildSchema(t, ctx, db, []string{"everturn_worktree"})
+		execAll(t, ctx, db, forkKeyStatements("issues")[len(everturnMailKeyColumns)-1])
+	}})
 	return cases
 }
 
@@ -1093,7 +1166,7 @@ func TestForkIndexesInterruptedUpgradeFinished(t *testing.T) {
 			}
 			assertEverturnKeys(t, ctx, store.db, "issues", forkSeedKeys, wantAllEverturnKeys("wake", "seed"))
 			assertEverturnKeys(t, ctx, store.db, "issues", forkSeedNone, map[string]sql.NullString{
-				"everturn_action": {}, "everturn_key": {}, "everturn_relay_source": {}, "everturn_bead": {}, "everturn_corrects": {},
+				"everturn_action": {}, "everturn_key": {}, "everturn_relay_source": {}, "everturn_bead": {}, "everturn_corrects": {}, "everturn_worktree": {},
 			})
 
 			head, issues, wisps := doltHead(t, ctx, store.db), showCreateTable(t, ctx, store.db, "issues"), showCreateTable(t, ctx, store.db, "wisps")
@@ -1523,10 +1596,7 @@ func TestForkIndexesCommitBoundaryFinished(t *testing.T) {
 		// The wisps statements too (wisps is dolt_ignored, so they leave
 		// nothing in dolt_status): with any of them missing, wisps alone would
 		// send the open down the pass and hide what the gate reads of issues.
-		stmts := forkMailKeyStatements()
-		for _, s := range forkMailKeyStatements() {
-			stmts = append(stmts, strings.ReplaceAll(s, "issues", "wisps"))
-		}
+		stmts := append(forkMailKeyStatements(), forkKeyStatements("wisps")...)
 		execAll(t, ctx, store.db, stmts...)
 		assertEverturnForkSchema(t, ctx, store.db, "with every statement applied")
 		if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n == 0 {
@@ -2004,7 +2074,7 @@ func TestForkIndexCloneLocalCancelledFinished(t *testing.T) {
 			if alters != 1 {
 				t.Errorf("the two waiting opens sent the step's ALTER %d times between them, want 1 (one finishes, the other finds nothing to do)", alters)
 			}
-			if got := tableIndexColumns(t, ctx, store.db, target.table, target.index); !slices.Equal(got, target.columns) {
+			if got := target.shape(t, ctx, store.db); !slices.Equal(got, target.columns) {
 				t.Errorf("%s columns after the waiting opens = %v, want %v", target.index, got, target.columns)
 			}
 			if n := doltStatusRowsFor(t, ctx, store.db, target.table); n != 0 {
@@ -2048,13 +2118,34 @@ func TestForkIndexWispDepExternalTargetOtherDefinitionKept(t *testing.T) {
 // cloneLocalForkTarget is a fork index on a dolt_ignored, clone-local table:
 // the open whose only need it is takes the short clone-local step
 // (schema.ensureCloneLocalForkObjects, bd-30lnk), not the whole pass.
+//
+// A column target (column set) is a fork column with no index on that table
+// (wisps.everturn_worktree): index then names the column, columns is just it,
+// and the target is present when the column is.
 type cloneLocalForkTarget struct {
 	name, table, index, ddl string
 	columns                 []string
+	column                  bool
 }
 
 func (c cloneLocalForkTarget) drop() string {
+	if c.column {
+		return "ALTER TABLE " + c.table + " DROP COLUMN " + c.index
+	}
 	return "ALTER TABLE " + c.table + " DROP INDEX " + c.index
+}
+
+// shape is what the target's object holds in the working table: the index's
+// column list, or the column alone; nil when it is absent.
+func (c cloneLocalForkTarget) shape(t *testing.T, ctx context.Context, db *sql.DB) []string {
+	t.Helper()
+	if !c.column {
+		return tableIndexColumns(t, ctx, db, c.table, c.index)
+	}
+	if tableColumnExists(t, ctx, db, c.table, c.index) {
+		return []string{c.index}
+	}
+	return nil
 }
 
 var cloneLocalForkTargets = []cloneLocalForkTarget{
@@ -2062,6 +2153,9 @@ var cloneLocalForkTargets = []cloneLocalForkTarget{
 		columns: []string{"depends_on_external"}},
 	{name: "wisps key index", table: "wisps", index: "idx_wisps_everturn_key", ddl: "ALTER TABLE wisps ADD INDEX idx_wisps_everturn_key (everturn_key, created_at)",
 		columns: []string{"everturn_key", "created_at"}},
+	{name: "wisps worktree column", table: "wisps", index: "everturn_worktree", column: true,
+		ddl:     "ALTER TABLE wisps ADD COLUMN everturn_worktree VARCHAR(255) GENERATED ALWAYS AS (LEFT(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.everturn.worktree')), 255)) STORED",
+		columns: []string{"everturn_worktree"}},
 }
 
 // settleForkFixture commits what the concurrent fixture leaves uncommitted
@@ -2119,7 +2213,7 @@ func TestForkIndexCloneLocalKeepsStagedRows(t *testing.T) {
 				t.Fatalf("read the working title: %v", err)
 			}
 			t.Logf("staged_rows=%d STAGED_title=%q WORKING_title=%q DDL=%q", stagedRows(), stagedTitle, workingTitle, log.all())
-			if got := tableIndexColumns(t, ctx, store.db, target.table, target.index); !slices.Equal(got, target.columns) {
+			if got := target.shape(t, ctx, store.db); !slices.Equal(got, target.columns) {
 				t.Errorf("%s columns after the open = %v, want %v", target.index, got, target.columns)
 			}
 			if ddls := log.all(); !slices.Equal(ddls, []string{target.ddl}) {
@@ -2180,7 +2274,7 @@ func TestForkIndexCloneLocalLeavesDirtyDependency(t *testing.T) {
 				if ddls := log.all(); !slices.Equal(ddls, want) {
 					t.Errorf("writable open %d sent DDL %q, want %q", i+1, ddls, want)
 				}
-				if got := tableIndexColumns(t, ctx, store.db, target.table, target.index); !slices.Equal(got, target.columns) {
+				if got := target.shape(t, ctx, store.db); !slices.Equal(got, target.columns) {
 					t.Errorf("%s columns after open %d = %v, want %v", target.index, i+1, got, target.columns)
 				}
 				if got := key(""); got != before {
@@ -2238,13 +2332,17 @@ func TestForkIndexCommittedAndCloneLocalTakeWholePass(t *testing.T) {
 				t.Fatalf("writable open: %v", err)
 			}
 			const issuesDDL = "ALTER TABLE issues ADD INDEX idx_issues_closed_at (closed_at)"
-			if ddls := log.all(); !slices.Equal(ddls, []string{issuesDDL, target.ddl}) {
-				t.Errorf("the open sent DDL %q, want %q", ddls, []string{issuesDDL, target.ddl})
+			want := []string{issuesDDL, target.ddl}
+			if target.column { // the step adds every column before any index
+				want = []string{target.ddl, issuesDDL}
+			}
+			if ddls := log.all(); !slices.Equal(ddls, want) {
+				t.Errorf("the open sent DDL %q, want %q", ddls, want)
 			}
 			if !issuesIndexExists(t, ctx, store.db, "idx_issues_closed_at") {
 				t.Errorf("idx_issues_closed_at not added by the whole pass")
 			}
-			if got := tableIndexColumns(t, ctx, store.db, target.table, target.index); !slices.Equal(got, target.columns) {
+			if got := target.shape(t, ctx, store.db); !slices.Equal(got, target.columns) {
 				t.Errorf("%s columns after the whole pass = %v, want %v", target.index, got, target.columns)
 			}
 			if got := doltHead(t, ctx, store.db); got == head {
@@ -2295,6 +2393,16 @@ func TestForkIndexCaseVariantIsConverged(t *testing.T) {
 			"ALTER TABLE issues ADD INDEX idx_issues_everturn_bead (EVERTURN_BEAD, created_at)",
 			"CALL DOLT_ADD('issues')",
 			"CALL DOLT_COMMIT('-m', 'test: issues.everturn_bead spelled in upper case')",
+		}},
+		{"worktree column and index", []string{
+			"ALTER TABLE issues DROP INDEX idx_issues_everturn_worktree",
+			"ALTER TABLE issues DROP COLUMN everturn_worktree",
+			"ALTER TABLE issues ADD COLUMN EVERTURN_WORKTREE VARCHAR(255) GENERATED ALWAYS AS (LEFT(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.everturn.worktree')), 255)) STORED",
+			"ALTER TABLE issues ADD INDEX IDX_ISSUES_EVERTURN_WORKTREE (EVERTURN_WORKTREE, created_at)",
+			"CALL DOLT_ADD('issues')",
+			"CALL DOLT_COMMIT('-m', 'test: issues.everturn_worktree and its index spelled in upper case')",
+			"ALTER TABLE wisps DROP COLUMN everturn_worktree",
+			"ALTER TABLE wisps ADD COLUMN EVERTURN_WORKTREE VARCHAR(255) GENERATED ALWAYS AS (LEFT(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.everturn.worktree')), 255)) STORED",
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2574,8 +2682,8 @@ func TestForkIndexTrackedCloneLocalTakesWholePass(t *testing.T) {
 			}
 			afterFirst := doltHead(t, ctx, db)
 			t.Logf("open 1: HEAD_moved=%v HEAD_index=%v WORKING_index=%v status_rows=%d DDL=%q",
-				afterFirst != head, headHasIndex(), tableIndexColumns(t, ctx, db, target.table, target.index), wispStatusRows(), log.all())
-			if got := tableIndexColumns(t, ctx, db, target.table, target.index); !slices.Equal(got, target.columns) {
+				afterFirst != head, headHasIndex(), target.shape(t, ctx, db), wispStatusRows(), log.all())
+			if got := target.shape(t, ctx, db); !slices.Equal(got, target.columns) {
 				t.Errorf("%s columns in WORKING = %v, want %v", target.index, got, target.columns)
 			}
 			if !headHasIndex() {
@@ -2601,3 +2709,425 @@ func TestForkIndexTrackedCloneLocalTakesWholePass(t *testing.T) {
 		})
 	}
 }
+
+// The landing runner's read of the beads keyed to ten worktrees (bd-0y3xe), in
+// three forms: the raw JSON predicate (the oracle: it compares as utf8mb4_bin
+// and reads the row itself), the named column alone, and the reader's
+// contract (schema/fork_indexes.go, review bd-h755xs): the named column for
+// the seek and the JSON predicate as a residual.
+const (
+	worktreeReaderRaw = "SELECT i.id FROM issues i WHERE i.status <> 'tombstone'" +
+		" AND i.metadata->>'$.everturn.worktree' IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ORDER BY i.id"
+	worktreeReaderNamed = "SELECT i.id FROM issues i WHERE i.status <> 'tombstone'" +
+		" AND i.everturn_worktree IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ORDER BY i.id"
+	worktreeReaderResidual = "SELECT i.id FROM issues i WHERE i.status <> 'tombstone'" +
+		" AND i.everturn_worktree IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" +
+		" AND i.metadata->>'$.everturn.worktree' IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" +
+		" ORDER BY i.id"
+)
+
+// worktreeReaderKeys is key and nine absent keys, the runner's ten.
+func worktreeReaderKeys(key string) []any {
+	keys := []any{key}
+	for i := 1; i < 10; i++ {
+		keys = append(keys, fmt.Sprintf("wt/bd-absent-%d", i))
+	}
+	return keys
+}
+
+// worktreeReaderArgs binds keys once per IN list of query, as the reader's
+// contract says (schema/fork_indexes.go, review bd-dguthy): the named-column
+// list takes each key cut to the column's 255 characters
+// (worktreeColumnCut), the JSON list the whole key. The named list comes
+// first in worktreeReaderResidual.
+func worktreeReaderArgs(query string, keys []any) []any {
+	cut := make([]any, len(keys))
+	for i, k := range keys {
+		cut[i] = worktreeColumnCut(k.(string))
+	}
+	switch query {
+	case worktreeReaderNamed:
+		return cut
+	case worktreeReaderResidual:
+		return append(cut, keys...)
+	}
+	var args []any
+	for i := 0; i < strings.Count(query, "?")/len(keys); i++ {
+		args = append(args, keys...)
+	}
+	return args
+}
+
+// worktreeColumnCut is key as the column stores it: its first 255
+// characters, counted as LEFT(..., 255) counts them (code points, not bytes).
+func worktreeColumnCut(key string) string {
+	if r := []rune(key); len(r) > 255 {
+		return string(r[:255])
+	}
+	return key
+}
+
+// worktreeReaderIDs runs query with the ten keys and returns the ids in order.
+func worktreeReaderIDs(t *testing.T, ctx context.Context, db *sql.DB, query string, keys []any) []string {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, query, worktreeReaderArgs(query, keys)...)
+	if err != nil {
+		t.Fatalf("run %s: %v", query, err)
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan %s: %v", query, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read %s: %v", query, err)
+	}
+	return ids
+}
+
+// explainBoundPlan is explainPlan with the statement's arguments bound, as the
+// runner sends it.
+func explainBoundPlan(t *testing.T, ctx context.Context, db *sql.DB, query string, args []any) string {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, "EXPLAIN FORMAT=TREE "+query, args...)
+	if err != nil {
+		t.Fatalf("EXPLAIN %s: %v", query, err)
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("EXPLAIN columns: %v", err)
+	}
+	var out []string
+	for rows.Next() {
+		holders := make([]sql.RawBytes, len(cols))
+		cells := make([]any, len(cols))
+		for i := range cells {
+			cells[i] = &holders[i]
+		}
+		if err := rows.Scan(cells...); err != nil {
+			t.Fatalf("EXPLAIN scan: %v", err)
+		}
+		for _, h := range holders {
+			if len(h) > 0 {
+				out = append(out, string(h))
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("EXPLAIN read: %v", err)
+	}
+	return strings.Join(out, "\n")
+}
+
+// doltServerAtLeast26 reports whether the server is Dolt 2.6 or later.
+func doltServerAtLeast26(t *testing.T, ctx context.Context, db *sql.DB) (string, bool) {
+	t.Helper()
+	var version string
+	if err := db.QueryRowContext(ctx, "SELECT dolt_version()").Scan(&version); err != nil {
+		t.Fatalf("read dolt_version(): %v", err)
+	}
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) < 2 {
+		t.Fatalf("dolt_version() = %q, want major.minor[.patch]", version)
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minor, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		t.Fatalf("dolt_version() = %q, want numeric major.minor", version)
+	}
+	return version, major > 2 || (major == 2 && minor >= 6)
+}
+
+// TestForkIndexWorktreeReaderResidual (review bd-h755xs, findings 1 and 2)
+// pins the reader's contract for everturn_worktree: the named column for the
+// seek with the JSON predicate kept as a residual returns what the raw JSON
+// read returns, ids in the same order, under the default (binary) collation
+// and under a database created with utf8mb4_0900_ai_ci, while still seeking
+// idx_issues_everturn_worktree; and after a DOLT_MERGE that changes a key it
+// never returns the issue for the old key. On Dolt before 2.6 the merged
+// issue is missed for its new key (the engine's stale index entry, held draft
+// bd-jj58j): logged, not failed.
+func TestForkIndexWorktreeReaderResidual(t *testing.T) {
+	const (
+		exact     = "fx-wt-exact"        // wt/bd-abc12, the asked key
+		variant   = "fx-wt-case-variant" // wt/bd-ABC12: another worktree
+		tombstone = "fx-wt-tombstone"    // wt/bd-abc12, status tombstone
+		noKey     = "fx-wt-no-key"
+	)
+	for _, tc := range []struct {
+		name, collate string
+		namedAlone    []string // the named column without the residual
+	}{
+		// The column takes the database's binary default: the named column
+		// alone already matches the exact key only.
+		{name: "default", namedAlone: []string{exact}},
+		// The column takes utf8mb4_0900_ai_ci, the JSON extraction stays
+		// utf8mb4_bin: the named column alone also matches the case variant.
+		// A COLLATE on the column, or an engine change, shows here.
+		{name: "utf8mb4_0900_ai_ci", collate: " COLLATE utf8mb4_0900_ai_ci", namedAlone: []string{variant, exact}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			skipIfNoDolt(t)
+			acquireTestSlot()
+			t.Cleanup(releaseTestSlot)
+			ctx, cancel := testContext(t)
+			defer cancel()
+			name := uniqueTestDBName(t)
+			cfg := &Config{Path: t.TempDir(), Database: name, ServerHost: "127.0.0.1", ServerPort: testServerPort,
+				ServerUser: "root", CommitterName: "test", CommitterEmail: "test@example.com"}
+			admin, err := sql.Open("mysql", buildServerDSN(cfg, ""))
+			if err != nil {
+				t.Fatalf("open admin connection: %v", err)
+			}
+			defer admin.Close()
+			execAll(t, ctx, admin, "CREATE DATABASE "+name+tc.collate)
+			store, err := New(ctx, cfg)
+			if err != nil {
+				t.Fatalf("writable open: %v", err)
+			}
+			defer store.Close()
+			db := store.db
+			execAll(t, ctx, db,
+				"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, metadata) VALUES "+
+					"('"+exact+"', 'the asked worktree', '', '', '', '', 'open', 2, 'task', '{\"everturn\":{\"worktree\":\"wt/bd-abc12\"}}'), "+
+					"('"+variant+"', 'another worktree', '', '', '', '', 'open', 2, 'task', '{\"everturn\":{\"worktree\":\"wt/bd-ABC12\"}}'), "+
+					"('"+tombstone+"', 'a tombstone', '', '', '', '', 'tombstone', 2, 'task', '{\"everturn\":{\"worktree\":\"wt/bd-abc12\"}}'), "+
+					"('"+noKey+"', 'no key', '', '', '', '', 'open', 2, 'task', '{}')")
+			var dbColl, colColl, jsonColl string
+			if err := db.QueryRowContext(ctx, "SELECT @@collation_database, COLLATION(everturn_worktree), COLLATION(metadata->>'$.everturn.worktree') FROM issues WHERE id = ?", exact).Scan(&dbColl, &colColl, &jsonColl); err != nil {
+				t.Fatalf("read collations: %v", err)
+			}
+			t.Logf("collations: database %s, everturn_worktree %s, JSON extraction %s", dbColl, colColl, jsonColl)
+
+			keys := worktreeReaderKeys("wt/bd-abc12")
+			raw := worktreeReaderIDs(t, ctx, db, worktreeReaderRaw, keys)
+			named := worktreeReaderIDs(t, ctx, db, worktreeReaderNamed, keys)
+			residual := worktreeReaderIDs(t, ctx, db, worktreeReaderResidual, keys)
+			t.Logf("ids for wt/bd-abc12: raw %v, named alone %v, residual %v", raw, named, residual)
+			if !slices.Equal(raw, []string{exact}) {
+				t.Fatalf("raw JSON read (the oracle) = %v, want [%s]: the fixture is wrong", raw, exact)
+			}
+			if !slices.Equal(residual, raw) {
+				t.Errorf("residual form = %v, want the raw JSON read's %v (extra: %v)", residual, raw, idsNotIn(residual, raw))
+			}
+			if !slices.Equal(named, tc.namedAlone) {
+				t.Errorf("named column alone = %v, want %v on a %s database", named, tc.namedAlone, tc.name)
+			}
+
+			plan := explainBoundPlan(t, ctx, db, worktreeReaderResidual, worktreeReaderArgs(worktreeReaderResidual, keys))
+			t.Logf("EXPLAIN FORMAT=TREE %s\n%s", worktreeReaderResidual, plan)
+			if !strings.Contains(plan, "IndexedTableAccess(issues)") || !strings.Contains(plan, "[issues.everturn_worktree,issues.created_at]") {
+				t.Errorf("the residual form does not seek idx_issues_everturn_worktree, plan:\n%s", plan)
+			}
+			if n := worktreePointRanges(plan); n != 10 {
+				t.Errorf("the residual form's seek has %d point ranges, want 10, plan:\n%s", n, plan)
+			}
+
+			worktreeReaderLongKeys(t, ctx, db)
+		})
+	}
+
+	// The reviewer's merge sequence: the source branch changes the issue's
+	// key from wt/bd-seed to wt/bd-peer-update and commits, the destination
+	// changes another issue's title and commits, then CALL DOLT_MERGE.
+	for _, sourceUpgraded := range []bool{false, true} {
+		t.Run(fmt.Sprintf("merge/source_upgraded=%v", sourceUpgraded), func(t *testing.T) {
+			store, cleanup := setupConcurrentTestStore(t)
+			defer cleanup()
+			ctx, cancel := testContext(t)
+			defer cancel()
+			root := store.db
+			toForkBuildSchema(t, ctx, root, []string{"everturn_worktree"})
+			execAll(t, ctx, root, "CALL DOLT_BRANCH('wt_source')", "CALL DOLT_BRANCH('wt_dest')")
+			branch := func(name string) *sql.DB {
+				t.Helper()
+				db, err := sql.Open("mysql", buildServerDSN(forkOpenConfig(t, store, testServerPort), store.database+"/"+name))
+				if err != nil {
+					t.Fatalf("open branch %s: %v", name, err)
+				}
+				t.Cleanup(func() { _ = db.Close() })
+				var active string
+				if err := db.QueryRowContext(ctx, "SELECT active_branch()").Scan(&active); err != nil || active != name {
+					t.Fatalf("active_branch() = %q (%v), want %q", active, err, name)
+				}
+				return db
+			}
+			source, dest := branch("wt_source"), branch("wt_dest")
+			if sourceUpgraded {
+				if _, err := initSchemaOnDB(ctx, source); err != nil {
+					t.Fatalf("upgrade the source branch: %v", err)
+				}
+			}
+			if _, err := initSchemaOnDB(ctx, dest); err != nil {
+				t.Fatalf("upgrade the destination branch: %v", err)
+			}
+			execAll(t, ctx, source,
+				"UPDATE issues SET metadata = JSON_SET(metadata, '$.everturn.worktree', 'wt/bd-peer-update') WHERE id = '"+forkSeedKeys+"'",
+				"CALL DOLT_COMMIT('-am', 'test: the source changes the worktree key')")
+			execAll(t, ctx, dest,
+				"UPDATE issues SET title = 'edited on the destination' WHERE id = '"+forkSeedNone+"'",
+				"CALL DOLT_COMMIT('-am', 'test: the destination edits another issue')")
+			execAll(t, ctx, dest, "CALL DOLT_MERGE('wt_source')")
+			var conflicts int
+			if err := dest.QueryRowContext(ctx, "SELECT COUNT(*) FROM dolt_conflicts").Scan(&conflicts); err != nil || conflicts != 0 {
+				t.Fatalf("dolt_conflicts = %d (%v), want 0", conflicts, err)
+			}
+			var stored string
+			if err := dest.QueryRowContext(ctx, "SELECT everturn_worktree FROM issues WHERE id = ?", forkSeedKeys).Scan(&stored); err != nil || stored != "wt/bd-peer-update" {
+				t.Fatalf("merged row's everturn_worktree = %q (%v), want wt/bd-peer-update", stored, err)
+			}
+
+			oldKeys, newKeys := worktreeReaderKeys("wt/bd-seed"), worktreeReaderKeys("wt/bd-peer-update")
+			oldRaw := worktreeReaderIDs(t, ctx, dest, worktreeReaderRaw, oldKeys)
+			oldResidual := worktreeReaderIDs(t, ctx, dest, worktreeReaderResidual, oldKeys)
+			oldNamed := worktreeReaderIDs(t, ctx, dest, worktreeReaderNamed, oldKeys)
+			newRaw := worktreeReaderIDs(t, ctx, dest, worktreeReaderRaw, newKeys)
+			newResidual := worktreeReaderIDs(t, ctx, dest, worktreeReaderResidual, newKeys)
+			version, fixed := doltServerAtLeast26(t, ctx, dest)
+			t.Logf("Dolt %s after the merge: old key raw %v, named alone %v, residual %v; new key raw %v, residual %v",
+				version, oldRaw, oldNamed, oldResidual, newRaw, newResidual)
+			if len(oldRaw) != 0 || !slices.Equal(newRaw, []string{forkSeedKeys}) {
+				t.Fatalf("raw JSON read (the oracle): old key %v, new key %v, want [] and [%s]", oldRaw, newRaw, forkSeedKeys)
+			}
+			if len(oldResidual) != 0 {
+				t.Errorf("residual form returns %v for the old key wt/bd-seed after the merge, want none", oldResidual)
+			}
+			switch {
+			case slices.Equal(newResidual, newRaw):
+			case fixed:
+				t.Errorf("Dolt %s: residual form = %v for the new key after the merge, want the raw read's %v", version, newResidual, newRaw)
+			case len(newResidual) == 0:
+				t.Logf("Dolt %s (before 2.6): the merged issue %s is missed for its new key: the engine's stale index entry after DOLT_MERGE (review bd-h755xs finding 1, held draft bd-jj58j), a known defect, not a failure", version, forkSeedKeys)
+			default:
+				t.Errorf("Dolt %s: residual form = %v for the new key after the merge, want %v or none", version, newResidual, newRaw)
+			}
+		})
+	}
+}
+
+// worktreeReaderLongKeys (review bd-dguthy) runs the reader's contract
+// (worktreeReaderArgs: the named list cut to 255 characters, the JSON list
+// whole) against the raw JSON read, the oracle, for keys around the column's
+// 255-character cut, a key that is not a string, seeded random keys, and the
+// trailing-space and empty keys, on db (a fresh store, one collation).
+func worktreeReaderLongKeys(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+	long := "wt/" + strings.Repeat("a", 125) + "/" + strings.Repeat("b", 126) + "c" // the reviewer's 256
+	if n := len([]rune(long)); n != 256 {
+		t.Fatalf("long key has %d characters, want 256", n)
+	}
+	rows := []struct{ id, key string }{
+		{"fx-wt-long", long},
+		{"fx-wt-cut", long[:255]}, // long's first 255 characters
+		{"fx-wt-mb256", "wt/" + strings.Repeat("é", 126) + strings.Repeat("中", 126) + "ß"},
+		{"fx-wt-exact255", "wt/" + strings.Repeat("x", 252)},
+		{"fx-wt-pad", "wt/bd-pad"},
+		{"fx-wt-pad-space", "wt/bd-pad "},
+		{"fx-wt-empty", ""},
+	}
+	// Seeded random keys around the cut, ASCII and multi-byte.
+	rng := rand.New(rand.NewSource(20261119))
+	alphabets := [][]rune{[]rune("abcdefghijklmnopqrstuvwxyz0123456789-/"), []rune("aéü中ßñ😀z")}
+	for i := 0; i < 24; i++ {
+		alpha := alphabets[i%2]
+		n := 250 + rng.Intn(12) // 250..261 characters in all
+		key := []rune(fmt.Sprintf("wt/r%02d-", i))
+		for len(key) < n {
+			key = append(key, alpha[rng.Intn(len(alpha))])
+		}
+		rows = append(rows, struct{ id, key string }{fmt.Sprintf("fx-wt-rand-%02d", i), string(key)})
+	}
+	for _, r := range rows {
+		if _, err := db.ExecContext(ctx, "INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, metadata)"+
+			" VALUES (?, 'long key', '', '', '', '', 'open', 2, 'task', JSON_OBJECT('everturn', JSON_OBJECT('worktree', ?)))", r.id, r.key); err != nil {
+			t.Fatalf("insert %s: %v", r.id, err)
+		}
+	}
+	// A key that is not a string: an array whose JSON text is longer than the
+	// cut. The reader binds that text, as ->> renders it.
+	var parts []string
+	for i := 0; i < 24; i++ {
+		parts = append(parts, fmt.Sprintf("'elem-%02d-long'", i))
+	}
+	execAll(t, ctx, db, "INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, metadata)"+
+		" VALUES ('fx-wt-array', 'array key', '', '', '', '', 'open', 2, 'task', JSON_OBJECT('everturn', JSON_OBJECT('worktree', JSON_ARRAY("+strings.Join(parts, ", ")+"))))")
+	var arrayText string
+	if err := db.QueryRowContext(ctx, "SELECT metadata->>'$.everturn.worktree' FROM issues WHERE id = 'fx-wt-array'").Scan(&arrayText); err != nil {
+		t.Fatalf("read the array key's text: %v", err)
+	}
+	if n := len([]rune(arrayText)); n <= 255 {
+		t.Fatalf("the array key's text has %d characters, want more than 255", n)
+	}
+	t.Logf("array key text: %d characters", len([]rune(arrayText)))
+	rows = append(rows, struct{ id, key string }{"fx-wt-array", arrayText})
+
+	probe := map[string]bool{"fx-wt-pad": true, "fx-wt-pad-space": true, "fx-wt-empty": true}
+	for _, r := range rows {
+		keys := worktreeReaderKeys(r.key)
+		raw := worktreeReaderIDs(t, ctx, db, worktreeReaderRaw, keys)
+		named := worktreeReaderIDs(t, ctx, db, worktreeReaderNamed, keys)
+		residual := worktreeReaderIDs(t, ctx, db, worktreeReaderResidual, keys)
+		if probe[r.id] {
+			// Neither the JSON extraction (utf8mb4_bin) nor the column pads:
+			// "wt/bd-pad " and "wt/bd-pad" are two keys, and the empty key
+			// matches only the row that holds it, on both collations.
+			t.Logf("PROBE key %q (%s): raw %v, named alone %v, residual %v", r.key, r.id, raw, named, residual)
+			if !slices.Equal(named, []string{r.id}) {
+				t.Errorf("%s: named column alone for %q = %v, want [%s]: the column pads or folds this key", r.id, r.key, named, r.id)
+			}
+		}
+		if !slices.Equal(raw, []string{r.id}) {
+			t.Fatalf("raw JSON read (the oracle) for %s's key = %v, want [%s]: the fixture is wrong", r.id, raw, r.id)
+		}
+		if !slices.Equal(residual, raw) {
+			t.Errorf("%s (key of %d characters): residual form = %v, want the raw JSON read's %v", r.id, len([]rune(r.key)), residual, raw)
+		}
+		switch r.id {
+		case "fx-wt-long", "fx-wt-cut":
+			// The named column alone cannot tell the two apart: both store
+			// long's first 255 characters.
+			if want := []string{"fx-wt-cut", "fx-wt-long"}; !slices.Equal(named, want) {
+				t.Errorf("%s: named column alone = %v, want %v (both store the same 255 characters)", r.id, named, want)
+			}
+		}
+	}
+
+	plan := explainBoundPlan(t, ctx, db, worktreeReaderResidual, worktreeReaderArgs(worktreeReaderResidual, worktreeReaderKeys(long)))
+	if !strings.Contains(plan, "IndexedTableAccess(issues)") || !strings.Contains(plan, "[issues.everturn_worktree,issues.created_at]") {
+		t.Errorf("the residual form with the long key does not seek idx_issues_everturn_worktree, plan:\n%s", plan)
+	}
+	if n := worktreePointRanges(plan); n != 10 {
+		t.Errorf("the residual form with the long key has %d point ranges, want 10, plan:\n%s", n, plan)
+	}
+}
+
+// idsNotIn is the ids of got that want lacks.
+func idsNotIn(got, want []string) []string {
+	var out []string
+	for _, id := range got {
+		if !slices.Contains(want, id) {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// worktreePointRanges counts the point ranges on everturn_worktree in a plan:
+// "[x, x]" pairs with the same bound.
+func worktreePointRanges(plan string) int {
+	n := 0
+	for _, m := range worktreePointRangeRE.FindAllStringSubmatch(plan, -1) {
+		if m[1] == m[2] {
+			n++
+		}
+	}
+	return n
+}
+
+// worktreePointRangeRE matches a range on a worktree key in a Dolt plan.
+var worktreePointRangeRE = regexp.MustCompile(`\[(wt/[^,\]]*), (wt/[^,\]]*)\]`)

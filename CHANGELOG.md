@@ -52,6 +52,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal from a managed (local sidecar) backend keep the full transient
   retry.
 
+## [1.3.5-dev.4] - 2026-11-19
+
+Fork pre-release above [1.3.5-dev.3], stamped so a caller can tell by
+`bd version` a build whose databases have the `everturn_worktree` column and
+its index: everturn's landing runner names the column in its read once its pin
+reaches this version. It also marks the wisp dependency index, the short
+clone-local schema step and the `types.custom` fix landed since 1.3.5-dev.3.
+
+### Added
+
+- **An indexed `everturn_worktree` key column on `issues` and `wisps`**: a
+  stored generated column holding the metadata key `$.everturn.worktree`
+  (`VARCHAR(255)`, the definition of the other everturn key columns), and
+  `idx_issues_everturn_worktree (everturn_worktree, created_at)` on `issues`
+  only, so a read of the beads keyed to a worktree seeks the index instead of
+  walking every issue's JSON (1.5-1.7 s at 108,000 issues). The reader must
+  name the column: `WHERE everturn_worktree IN (...)` seeks the index, while
+  `metadata->>'$.everturn.worktree' IN (...)` still reads every non-tombstone
+  row. A reader that needs the exact key (a key column takes the table's
+  collation, so on a `utf8mb4_0900_ai_ci` database it also matches
+  `wt/bd-ABC12` for `wt/bd-abc12`) names the column for the seek and keeps
+  the JSON predicate as a residual: `SELECT i.id FROM issues i WHERE
+  i.status <> 'tombstone' AND i.everturn_worktree IN (?, ...) AND
+  i.metadata->>'$.everturn.worktree' IN (?, ...) ORDER BY i.id`, binding in
+  the named-column list each key cut to its first 255 characters (the
+  column stores `LEFT(..., 255)`, so a longer whole key would seek nothing)
+  and in the JSON list the whole key. A database gets the column and index
+  at its first writable open by this build, which fills the old rows; every
+  bd process of that database waits behind the migration lock meanwhile (on Dolt 2.2.0: 9.7 s for the
+  `issues` column at 100,000 issues, 1.6 s for the `wisps` column at 20,000
+  wisps, 0.3 s for the index). A 1.3.5-dev.3 build on a database that has the
+  column sends no DDL, and its writes, upserts and wisp promotion fill the
+  column as before.
+
+### Changed
+
+- **The fork schema step indexes `wisp_dependencies` by its external target**
+  (fork 38720fbbf): `idx_wisp_dep_external_target`, with the name and
+  definition of migrations 0047 and `ignored/0003`, so a database that came
+  through them sends no DDL. The external branch of the dependents count and
+  of `bd show --json`'s dependents rows seeks it instead of scanning the
+  table. A writable open's probe sends one more statement, `SHOW INDEX FROM
+  wisp_dependencies` (31 commands); a read-only open sends none more.
+- **A database that lacks only clone-local fork objects takes a short schema
+  step** (fork 38720fbbf): at the latest version, with only the fork objects
+  on the dolt_ignored `wisps` and `wisp_dependencies` missing, the open runs
+  the ALTERs under the migration lock with no unstage, re-key, `DOLT_ADD` or
+  commit, so a user's staged rows and uncommitted durable dependencies are
+  left as they are. A missing fork object on `issues`, or on a wisp table
+  that is not actively ignored, still takes the whole pass, which stages and
+  commits it.
+- **A filtered `bd list` page reads its ids first, then only their counts**
+  (fork cd1225ddf, in builds since 1.3.5-dev.2): a window of at most one
+  by-IDs batch (200 ids), or an unbounded read whose `LIMIT 201` probe holds
+  at most 200, selects the ordered id window with the plain id scan, then
+  reads the counts of exactly those ids, instead of aggregating the labels,
+  dependency and comment counts, parent and dependency JSON and reverse
+  blockers of the whole corpus for a ten-row page (GH#4370). No emitted value
+  changes; wider windows, Go-side sort keys and label filters with empty
+  entries keep the old form. The `dependencies` array of `bd list --json` and
+  `bd ready --json` has one defined order, sorted by the dependency row's
+  primary key; before, its order could change with the query plan.
+- **The scoped `is_blocked` recompute of `bd create` and `bd close` is pinned
+  to lookup joins** (fork 161bbf554, in builds since 1.3.5-dev.2): the
+  should-be-blocked union's legs carry `JOIN_ORDER` and `LOOKUP_JOIN` hints
+  and the waits-for gate's spawner check is one indexed `EXISTS` per
+  dependency table and spawner column, so a statistics refresh can no longer
+  flip the plan to a scan of every open issue (about 3 s a leg and 6-10 s a
+  statement over an import's few thousand uncommitted issues, against about
+  0.1 s). The unscoped union (full repair, doctor count) keeps the planner's
+  choice.
+
+### Fixed
+
+- **An upper-case fork index name no longer sends a duplicate `ALTER` on
+  every open** (fork 38720fbbf): fork object names are matched
+  case-insensitively. The `dolt_ignore` seed commit on the short step and on
+  the no-work branch is skipped while another table is staged, so it no
+  longer carries the user's staged rows.
+- **`bd config set types.custom` with a repeated name no longer fails**
+  (fork a668eac83): `'a,a'` got a raw `Error 1062` duplicate primary key,
+  because the `custom_types` table sync inserted each parsed name, repeats
+  included. Each name is now stored once, keeping the first occurrence and
+  the order. The config value is stored as typed, and names compare
+  byte-wise, so `'Broken Pipe,broken pipe'` still stores two rows.
+
 ## [1.3.5-dev.3] - 2026-11-19
 
 Fork pre-release above [1.3.5-dev.2], stamped so a caller can tell by

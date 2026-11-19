@@ -67,14 +67,66 @@ type forkColumn struct{ Table, Name, DDL string } // DDL: the whole ALTER TABLE 
 // everturnKeyColumns are the generated columns everturn reads through an
 // index, by column name and the metadata path it holds. The names and paths
 // are everturn's reader contract: do not rename. everturn_action serves the
-// audit lookups; the other four serve the mail reads, which filter on a key
-// inside metadata and would otherwise read every message row (bd-iqmdg).
-var everturnKeyColumns = []struct{ Name, Path string }{
-	{Name: "everturn_action", Path: "$.everturn.action"},
+// audit lookups; the next four serve the mail reads, which filter on a key
+// inside metadata and would otherwise read every message row (bd-iqmdg);
+// everturn_worktree serves the landing runner's read of the beads keyed to a
+// worktree (WHERE everturn_worktree IN (...)), which walked every issue's
+// JSON (bd-0y3xe). IssuesOnly: indexed on issues alone, since its reader
+// reads issues only and a wisps index would be a write cost with no reader;
+// the column is on both tables either way (column parity).
+//
+// The reader's contract (review bd-h755xs). A key column takes its table's
+// collation (utf8mb4_0900_ai_ci on a database created with it), while the
+// JSON extraction compares as utf8mb4_bin, so on such a database
+// `everturn_worktree IN ('wt/bd-abc12')` also matches `wt/bd-ABC12`. A
+// reader that needs the exact key names the column for the seek and keeps
+// the JSON predicate as a residual beside it:
+//
+//	SELECT i.id FROM issues i
+//	WHERE i.status <> 'tombstone'
+//	  AND i.everturn_worktree IN (?, ...)
+//	  AND i.metadata->>'$.everturn.worktree' IN (?, ...)
+//	ORDER BY i.id
+//
+// The plan still seeks idx_issues_everturn_worktree, and the residual drops
+// every row whose exact key is not asked for.
+//
+// The reader binds each key twice, differently (review bd-dguthy). In the
+// named-column list it binds the key cut to its first 255 characters,
+// counted as the column's LEFT(..., 255) counts them (characters, not
+// bytes); in the residual list it binds the whole key. The column stores
+// only that cut, so a whole key longer than 255 characters seeks nothing
+// and the residual never sees the row; the residual then tells apart two
+// keys that share their first 255 characters. A key that is not a string
+// is bound as the text ->> renders for it. The rule holds for every key
+// column (everturnKeyColumns), since all store LEFT(..., 255). Neither side
+// pads (measured on Dolt 2.2.0 and 2.6.2, binary and utf8mb4_0900_ai_ci
+// databases): a key with a trailing space and the same key without it are
+// two keys, and the empty key matches only the row that holds it, in the
+// raw read, the column and this form alike.
+//
+// On Dolt before 2.6, a
+// DOLT_MERGE that changes a key leaves the fork index with the old entry
+// (measured on 2.2.0 by review bd-h755xs, with both sides upgraded; 2.6.2 is
+// correct): the residual removes the old-key row, but the new-key row is
+// missed until the index is rebuilt (DROP INDEX, then ADD INDEX). A
+// database that merges must run Dolt 2.6 or later (held draft bd-jj58j
+// covers every key column).
+//
+// No COLLATE on the column: the six key columns share one definition
+// (everturnKeyColumnDef), and a definition that differs would either
+// rewrite the deployed columns or split how the step classifies its own
+// work, column by column.
+var everturnKeyColumns = []struct {
+	Name, Path string
+	IssuesOnly bool
+}{
+	{Name: "everturn_action", Path: "$.everturn.action", IssuesOnly: true},
 	{Name: "everturn_key", Path: "$.everturn.key"},
 	{Name: "everturn_relay_source", Path: "$.everturn.relay.source"},
 	{Name: "everturn_bead", Path: "$.everturn.bead"},
 	{Name: "everturn_corrects", Path: "$.everturn.corrects"},
+	{Name: "everturn_worktree", Path: "$.everturn.worktree", IssuesOnly: true},
 }
 
 // everturnKeyColumnDef is the column definition of an everturnKeyColumns
@@ -86,7 +138,7 @@ func everturnKeyColumnDef(name, path string) string {
 
 // forkColumns is every everturn key column on issues, then on wisps, one
 // whole ALTER each: one ALTER adding five columns measured slower than five
-// ALTERs. wisps is clone-local (dolt_ignore'd) and missing on a fresh database
+// ALTERs (six columns now). wisps is clone-local (dolt_ignore'd) and missing on a fresh database
 // until the ignored series creates it; the fresh CLI bundle creates no wisps,
 // so forkIndexesSQL leaves the wisps columns out.
 var forkColumns = func() []forkColumn {
@@ -106,9 +158,9 @@ var forkColumns = func() []forkColumn {
 type forkIndex struct{ Table, Name, DDL string } // DDL: the whole ALTER TABLE statement
 
 // forkIndexes lists the issues indexes, then the wisps ones, then the
-// wisp_dependencies one. Every everturn key column but everturn_action is
-// indexed on both tables as (column, created_at); everturn_action is indexed
-// on issues only.
+// wisp_dependencies one. Every everturn key column is indexed on issues as
+// (column, created_at), and on wisps too unless it is IssuesOnly
+// (everturn_action, everturn_worktree).
 var forkIndexes = func() []forkIndex {
 	idx := []forkIndex{
 		{
@@ -131,7 +183,7 @@ var forkIndexes = func() []forkIndex {
 	}
 	for _, table := range []string{"issues", "wisps"} {
 		for _, c := range everturnKeyColumns {
-			if table == "wisps" && c.Name == "everturn_action" {
+			if table == "wisps" && c.IssuesOnly {
 				continue
 			}
 			name := "idx_" + table + "_" + c.Name
