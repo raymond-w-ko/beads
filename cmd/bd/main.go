@@ -2410,6 +2410,16 @@ func validateWorkspaceIdentity(ctx context.Context, beadsDir string) error {
 		return nil // No project_id in config (pre-identity era)
 	}
 
+	// The server-mode store already compared this metadata.json's project id
+	// with the database's _project_id when it opened, and refused to open on
+	// a mismatch. When it says that comparison ran and matched for this same
+	// beads directory, reading the key again is a repeat of a check that
+	// passed moments ago (bd-7c0u4 rank 4). A store that does not say so
+	// (embedded, a soft-skipped or gateway open) is checked here as before.
+	if identityVerifiedAtOpen(store, beadsDir) {
+		return nil
+	}
+
 	// Get project_id from database
 	dbProjectID, err := store.GetMetadata(ctx, "_project_id")
 	if err != nil || dbProjectID == "" {
@@ -2432,6 +2442,23 @@ func validateWorkspaceIdentity(ctx context.Context, beadsDir string) error {
 		return SilentExit()
 	}
 	return nil
+}
+
+// identityVerifier is implemented by a store whose open verified project
+// identity (dolt.DoltStore in server mode). It is optional and asserted here,
+// not part of internal/storage's interfaces.
+type identityVerifier interface {
+	IdentityVerifiedAtOpen(beadsDir string) bool
+}
+
+// identityVerifiedAtOpen reports whether st, peeled of decorators, says its
+// open already verified project identity for beadsDir.
+func identityVerifiedAtOpen(st storage.DoltStorage, beadsDir string) bool {
+	if st == nil {
+		return false
+	}
+	v, ok := storage.UnwrapStore(st).(identityVerifier)
+	return ok && v.IdentityVerifiedAtOpen(beadsDir)
 }
 
 func main() {

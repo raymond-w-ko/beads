@@ -365,6 +365,13 @@ type DoltStore struct {
 	// createdDatabase reports whether this store's open created its database
 	// (serverConnFacts.created); see CreatedDatabase.
 	createdDatabase bool
+
+	// identityVerifiedBeadsDir is the cleaned beads directory whose
+	// metadata.json project id verifyProjectIdentity compared with the
+	// database's _project_id at open and found equal; empty when no such
+	// comparison ran (soft skips, gateway, global database, a database this
+	// open created). See IdentityVerifiedAtOpen.
+	identityVerifiedBeadsDir string
 }
 
 // Config holds Dolt database configuration
@@ -2212,9 +2219,13 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 		}
 	}()
 
-	// Test connection
-	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("failed to ping Dolt database: %w", err)
+	// Test connection, unless openServerConnection already pinged this pool:
+	// a second ping on the same pooled connection is one more round trip on
+	// every open (bd-7c0u4 rank 6). TestServerOpenStatementBudget counts it.
+	if !dbFacts.pinged {
+		if err := db.PingContext(ctx); err != nil {
+			return nil, fmt.Errorf("failed to ping Dolt database: %w", err)
+		}
 	}
 
 	beadsDir := cfg.BeadsDir
@@ -2318,7 +2329,7 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 			// migrating), so the rebuild below stays correct either way.
 		}
 		// initSchema runs migrations over a separate pool (openMigrationDB).
-		// The Ping above already pinned a connection in store.db to the
+		// The open's ping already pinned a connection in store.db to the
 		// pre-migration session root; without a rebuild, the first read
 		// through that stale connection returns 0 rows / table-not-found
 		// and does not self-heal on retry (be-itm5). Only a migrating open
@@ -2472,8 +2483,11 @@ func (s *DoltStore) verifyProjectIdentity(ctx context.Context, beadsDir string) 
 		return nil // old-style metadata.json without project_id — skip
 	}
 
-	// Read project ID from database metadata table
-	dbID, err := s.GetMetadata(ctx, "_project_id")
+	// Read project ID from database metadata table: one autocommit SELECT on
+	// the pool, not GetMetadata's START TRANSACTION / SELECT / ROLLBACK, which
+	// cost two extra round trips on every open (bd-7c0u4 rank 3). A single
+	// statement reads one snapshot either way.
+	dbID, err := s.readStartupMetadata(ctx, "_project_id")
 	if err != nil || dbID == "" {
 		return nil // old database without project_id — skip
 	}
@@ -2491,7 +2505,34 @@ func (s *DoltStore) verifyProjectIdentity(ctx context.Context, beadsDir string) 
 				"Do NOT run 'bd init' — your data likely exists, just on a different server.",
 			localID, dbID)
 	}
+	s.identityVerifiedBeadsDir = filepath.Clean(beadsDir)
 	return nil
+}
+
+// readStartupMetadata reads one metadata value as a single autocommit
+// statement on the pool, retried like the other open-time reads. It is for
+// the open path only; GetMetadata stays transactional for every other caller.
+func (s *DoltStore) readStartupMetadata(ctx context.Context, key string) (string, error) {
+	var value string
+	err := s.withRetry(ctx, func() error {
+		var err error
+		value, err = issueops.GetMetadataInTx(ctx, s.db, key)
+		return err
+	})
+	return value, err
+}
+
+// IdentityVerifiedAtOpen reports whether this store's open compared
+// beadsDir's metadata.json project id with the database's _project_id and
+// found them equal. cmd/bd's write-command identity check makes that same
+// comparison, so when this returns true it skips its own database read
+// (bd-7c0u4 rank 4). False whenever the open made no comparison (no local
+// metadata or project id, an empty database project id, gateway, the global
+// database, a database the open created) or verified a different beads
+// directory, so the caller checks as before.
+func (s *DoltStore) IdentityVerifiedAtOpen(beadsDir string) bool {
+	return s.identityVerifiedBeadsDir != "" && beadsDir != "" &&
+		filepath.Clean(beadsDir) == s.identityVerifiedBeadsDir
 }
 
 func (s *DoltStore) verifyGlobalProjectIdentity(ctx context.Context, beadsDir string) error {
@@ -2719,6 +2760,12 @@ type serverConnFacts struct {
 	// when CreateIfMissing is true (see the newServerMode gate around
 	// verifyProjectIdentity, GH#4637).
 	alreadyExisted bool
+
+	// pinged reports that a db.PingContext on the returned pool succeeded
+	// inside this call (the gateway connect, the fast path, or the
+	// post-CREATE availability wait), so newServerMode need not ping the same
+	// pooled connection again (bd-7c0u4 rank 6, #5273 item 3).
+	pinged bool
 }
 
 // assertGatewaySessionDatabase verifies the gateway actually placed this
@@ -2813,8 +2860,9 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, se
 		// cmd/bd/init.go's resolveInitProjectID, which adopts the
 		// server-authoritative _project_id onto a stale or missing local one
 		// on every init, including re-init. It is also correct for `created`:
-		// an unproven creator must never arm fresh-bootstrap heal.
-		return db, connStr, serverConnFacts{}, nil
+		// an unproven creator must never arm fresh-bootstrap heal. The ping
+		// above did succeed, so pinged is the one fact this path reports.
+		return db, connStr, serverConnFacts{pinged: true}, nil
 	}
 
 	// Validate database name to prevent SQL injection via backtick escaping
@@ -2853,7 +2901,7 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, se
 	pingErr := db.PingContext(ctx)
 	if pingErr == nil {
 		connReady = true
-		return db, connStr, serverConnFacts{alreadyExisted: true}, nil
+		return db, connStr, serverConnFacts{alreadyExisted: true, pinged: true}, nil
 	}
 
 	// Advisory only: the probe-then-create path below is the historical open,
@@ -2978,6 +3026,7 @@ func openServerConnection(ctx context.Context, cfg *Config) (*sql.DB, string, se
 		created:        created,
 		bootstrapHeal:  bootstrapHeal,
 		alreadyExisted: dbExists,
+		pinged:         true, // the availability wait above ended on a successful ping
 	}, nil
 }
 

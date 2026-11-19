@@ -748,6 +748,10 @@ func TestCrossProject_IdentityCheck_ExistingDatabase_ForeignRejected(t *testing.
 	if err != nil {
 		t.Fatalf("create owner store: %v", err)
 	}
+	// The open that created the database had nothing to compare against.
+	if ownerStore.IdentityVerifiedAtOpen(f.beadsDir) {
+		t.Errorf("IdentityVerifiedAtOpen = true on the open that created the database, want false")
+	}
 	if err := ownerStore.SetMetadata(ctx, "_project_id", ownerID); err != nil {
 		ownerStore.Close()
 		t.Fatalf("seed _project_id: %v", err)
@@ -802,7 +806,15 @@ func TestCrossProject_IdentityCheck_ExistingDatabase_MatchingSucceeds(t *testing
 	if err != nil {
 		t.Fatalf("reconnect with matching project id must succeed, got: %v", err)
 	}
-	secondStore.Close()
+	defer secondStore.Close()
+	// The open compared the ids and they matched, so cmd/bd may skip its
+	// write-command check for this beads directory, and only for it.
+	if !secondStore.IdentityVerifiedAtOpen(f.beadsDir) {
+		t.Errorf("IdentityVerifiedAtOpen(%q) = false after a matching comparison, want true", f.beadsDir)
+	}
+	if other := filepath.Join(f.tmpDir, "other", ".beads"); secondStore.IdentityVerifiedAtOpen(other) {
+		t.Errorf("IdentityVerifiedAtOpen(%q) = true for a beads directory the open did not verify, want false", other)
+	}
 }
 
 func TestCrossProject_IdentityCheck_NewDatabase_Succeeds(t *testing.T) {
@@ -819,7 +831,10 @@ func TestCrossProject_IdentityCheck_NewDatabase_Succeeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating a brand-new database must still succeed: %v", err)
 	}
-	store.Close()
+	defer store.Close()
+	if store.IdentityVerifiedAtOpen(f.beadsDir) {
+		t.Errorf("IdentityVerifiedAtOpen = true on a brand-new database, want false (nothing compared)")
+	}
 }
 
 // TestCrossProject_IdentityCheck_SoftSkip_NoLocalMetadata covers
@@ -850,7 +865,10 @@ func TestCrossProject_IdentityCheck_SoftSkip_NoLocalMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected soft-skip (no local metadata.json), got error: %v", err)
 	}
-	reopenStore.Close()
+	defer reopenStore.Close()
+	if reopenStore.IdentityVerifiedAtOpen(f.beadsDir) {
+		t.Errorf("IdentityVerifiedAtOpen = true after the no-local-metadata soft skip, want false")
+	}
 }
 
 // TestCrossProject_IdentityCheck_SoftSkip_EmptyDBProjectID covers
@@ -881,7 +899,10 @@ func TestCrossProject_IdentityCheck_SoftSkip_EmptyDBProjectID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected soft-skip (database has no _project_id), got error: %v", err)
 	}
-	reopenStore.Close()
+	defer reopenStore.Close()
+	if reopenStore.IdentityVerifiedAtOpen(f.beadsDir) {
+		t.Errorf("IdentityVerifiedAtOpen = true after the empty-database-id soft skip, want false")
+	}
 }
 
 // TestCrossProject_IdentityCheck_Gateway_SkipsVerification covers the one
@@ -932,5 +953,8 @@ func TestCrossProject_IdentityCheck_Gateway_SkipsVerification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gateway open must skip identity verification (reconciled by resolveInitProjectID instead), got error: %v", err)
 	}
-	gatewayStore.Close()
+	defer gatewayStore.Close()
+	if gatewayStore.IdentityVerifiedAtOpen(f.beadsDir) {
+		t.Errorf("IdentityVerifiedAtOpen = true on a gateway open, want false (identity not verified there)")
+	}
 }
