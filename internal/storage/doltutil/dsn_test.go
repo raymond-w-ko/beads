@@ -3,9 +3,29 @@ package doltutil
 import (
 	"strings"
 	"testing"
+	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
 )
+
+// TestServerDSN_DefaultConnectTimeout pins the driver's connect timeout. A
+// remote server has no preflight dial (dolt newServerMode, bd-wy35k), so this
+// timeout is what reports a dead remote host.
+func TestServerDSN_DefaultConnectTimeout(t *testing.T) {
+	dsn := ServerDSN{
+		Host: "dolt.example.com",
+		Port: 3307,
+		User: "root",
+	}.String()
+
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		t.Fatalf("ParseDSN(%q): %v", dsn, err)
+	}
+	if cfg.Timeout != 5*time.Second {
+		t.Fatalf("default connect timeout = %s, want 5s", cfg.Timeout)
+	}
+}
 
 func TestServerDSN_TLSExplicitlyDisabledByDefault(t *testing.T) {
 	dsn := ServerDSN{
