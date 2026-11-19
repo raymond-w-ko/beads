@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -208,9 +209,71 @@ func CheckSchemaCompatibilityWithStore(ss *SharedStore) DoctorCheck {
 }
 
 func checkSchemaCompatibilityWithStore(store *dolt.DoltStore) DoctorCheck {
+	return schemaCompatibilityCheck(store)
+}
+
+// schemaCompatibilityProbes make the server do, on at most one row and with
+// no aggregate, what the statistics query this check used to run
+// (GetStatistics: issueops.ScanIssueCountsInTx, then the blocked count) does
+// with the issues table, so the check fails wherever that query failed
+// (bd-mh4fb, bd-pbioz, bd-b4n1i).
+//
+// The first is the counts query's select list without its SUMs, plus the
+// blocked filter's comparisons, compared on the one row it reads: status
+// altered to DATE fails there ("Incorrect datetime value: 'closed'") only when
+// a row exists. Its plan is Limit(1) over an unfiltered read of issues, so it
+// reads one row whatever the table's indexes.
+//
+// The second plans the blocked count's filter as written and reads no row:
+// EXPLAIN runs the analyzer, not the statement. With status or is_blocked
+// altered to DATE, the blocked count fails on an empty table too, while the
+// server builds an index range from the filter's literals; it does so only
+// when an index on that column serves the filter (with idx_issues_is_blocked
+// and the status indexes dropped, it does not fail). EXPLAIN builds the same
+// ranges from the same indexes, so it fails exactly then. A SELECT of the
+// filter itself stopped at LIMIT 1 only through idx_issues_is_blocked:
+// without it, it scanned every open issue past a residual Filter.
+//
+// Naming the columns fails for a missing issues table or column. The
+// statistics query counted every issue, 0.45 s on the fleet's store on every
+// bd init of an existing database (bd-53atb, bd-v5qbz).
+var schemaCompatibilityProbes = []string{
+	"SELECT status = 'open', status = 'in_progress', status = 'closed', status = 'deferred', pinned = 1, " +
+		"is_blocked = 1, status <> 'pinned' FROM issues LIMIT 1",
+	"EXPLAIN FORMAT=TREE SELECT 1 FROM issues WHERE is_blocked = 1 AND status <> 'closed' AND status <> 'pinned'",
+}
+
+// schemaProbeQuerier is the part of a store the schema check needs.
+// *dolt.DoltStore satisfies it; tests use a mock.
+type schemaProbeQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func runSchemaCompatibilityProbe(ctx context.Context, q schemaProbeQuerier) error {
+	for _, probe := range schemaCompatibilityProbes {
+		rows, err := q.QueryContext(ctx, probe)
+		if err != nil {
+			return err
+		}
+		// Reading the first row makes the server evaluate the comparisons
+		// on it (LIMIT 1), or return the first plan line (EXPLAIN); an
+		// empty table leaves only the plan's error.
+		_ = rows.Next()
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func schemaCompatibilityCheck(q schemaProbeQuerier) DoctorCheck {
 	ctx := context.Background()
-	// Exercise core tables/views.
-	if _, err := store.GetStatistics(ctx); err != nil {
+	// Exercise the core table and columns.
+	if err := runSchemaCompatibilityProbe(ctx, q); err != nil {
 		return DoctorCheck{
 			Name:    "Schema Compatibility",
 			Status:  StatusError,
