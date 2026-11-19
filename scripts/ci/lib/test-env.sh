@@ -72,6 +72,7 @@ beads_test_env_enter() {
     unset BD_AGENT_MODE
     unset BD_NON_INTERACTIVE
     unset BEADS_MAIL_DELEGATE
+    unset BD_LIST_LIMIT
 
     if command -v dolt >/dev/null 2>&1; then
         dolt config --global --add user.name "beads-test" >/dev/null 2>&1 || true
