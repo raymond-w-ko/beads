@@ -469,19 +469,98 @@ func cleanStaleCircuitBreakerFilesIn(dir string, removeClosed bool) {
 	}
 }
 
+// isServerOutagePacket reports whether a decoded error packet says the server
+// itself is unavailable rather than refusing this statement. A server that
+// sends an error packet answered, so every other number is a definite response
+// whatever its text says: its message can quote a key value, a user name or a
+// database name the user chose (duplicate primary key given: [gone away]), and
+// matching words in it opened the breaker against a healthy server
+// (bd-wi3uv, bd-a2wbd). The two kept are:
+//   - 1053 ER_SERVER_SHUTDOWN: Dolt's vitess layer answers COM_PING with it once
+//     its listener is shutting down (go/mysql/conn.go, ComPing).
+//   - the beads db proxy's report of an unreachable external upstream
+//     (proxy.IsUpstreamOutageError: 2003 with the "beads db proxy: " prefix;
+//     2003 without the prefix is a response like any other).
+func isServerOutagePacket(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	return mysqlErr.Number == mysqlServerShutdown ||
+		(mysqlErr.Number == proxyUpstreamErrorNumber && strings.HasPrefix(mysqlErr.Message, proxyUpstreamErrorPrefix))
+}
+
+// mysqlServerShutdown is ER_SERVER_SHUTDOWN ("Server shutdown in progress").
+const mysqlServerShutdown = 1053
+
+// proxyUpstreamErrorNumber and proxyUpstreamErrorPrefix are the beads db
+// proxy's UpstreamErrorNumber and UpstreamErrorPrefix
+// (internal/storage/dbproxy/proxy/upstream_error.go). They are copied, not
+// imported: importing that package would add it and six more (its server,
+// pidfile, identity and util packages, atomicfile, procid) to this package's
+// import graph. TestOutagePacketsProxyConstantsMatchProxy pins the copies.
+const (
+	proxyUpstreamErrorNumber = 2003
+	proxyUpstreamErrorPrefix = "beads db proxy: "
+)
+
 // isConnectionError returns true if the error indicates the Dolt server is
 // unreachable or down. Only these errors trip the circuit breaker — query-level
 // errors (syntax, missing table, etc.) do not.
 func isConnectionError(err error) bool {
+	// A decoded server error packet is a response, not a lost connection; only
+	// the outage packets in isServerOutagePacket count, and the text of a
+	// packet or of a wrapper above one is never consulted. A lost connection
+	// joined beside a packet (a failed statement whose ROLLBACK then lost the
+	// socket) still counts: see classifyErrorTree.
+	return classifyErrorTree(err, isServerOutagePacketValue, isUntypedConnectionError)
+}
+
+func isServerOutagePacketValue(packet *mysql.MySQLError) bool {
+	return isServerOutagePacket(packet)
+}
+
+// classifyErrorTree judges an error tree by its parts rather than by the first
+// decoded packet errors.As finds (bd-49oko, bd-dcwku). One error can hold both
+// a server's answer and a lost connection: commitWriteTx joins a statement's
+// typed 1062 with the mysql.ErrInvalidConn of a ROLLBACK whose socket dropped.
+// The rule, for an error e:
+//   - e holds no *mysql.MySQLError anywhere: untyped(e), on its whole text;
+//   - e is itself a *mysql.MySQLError: typed(e);
+//   - e has Unwrap() []error (errors.Join, fmt.Errorf with two %w): true when
+//     any non-nil element is true by this rule;
+//   - e has Unwrap() error: this rule applied to what it wraps, so a wrapper's
+//     own text above a packet is never matched.
+//
+// An error that holds a packet only through an As method of its own gets the
+// answer of the packet errors.As finds.
+func classifyErrorTree(err error, typed func(*mysql.MySQLError) bool, untyped func(error) bool) bool {
 	if err == nil {
 		return false
 	}
-	// A typed 1105 is a semantic response from Dolt, not evidence that the
-	// server is unavailable, even if its message happens to mention a connection.
-	var mysqlErr *mysql.MySQLError
-	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1105 {
-		return false
+	var packet *mysql.MySQLError
+	if !errors.As(err, &packet) {
+		return untyped(err)
 	}
+	switch e := err.(type) {
+	case *mysql.MySQLError:
+		return e != nil && typed(e)
+	case interface{ Unwrap() []error }:
+		for _, part := range e.Unwrap() {
+			if classifyErrorTree(part, typed, untyped) {
+				return true
+			}
+		}
+		return false
+	case interface{ Unwrap() error }:
+		return classifyErrorTree(e.Unwrap(), typed, untyped)
+	}
+	return packet != nil && typed(packet)
+}
+
+// isUntypedConnectionError is isConnectionError's answer for an error that
+// holds no decoded server packet: words of a transport failure in its text.
+func isUntypedConnectionError(err error) bool {
 	errStr := strings.ToLower(err.Error())
 
 	// TCP-level failures

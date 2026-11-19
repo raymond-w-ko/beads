@@ -656,19 +656,35 @@ func isRetryableError(err error) bool {
 	if schema.IsMigrationLockError(err) {
 		return true
 	}
-	// A decoded 1105 is a definite server response. Preserve the two explicit
-	// server-startup recoveries below, but do not let any other 1105 enter the
-	// general retry or circuit-breaker path just because its message happens to
-	// contain connection-like wording.
-	var mysqlErr *mysql.MySQLError
-	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1105 {
-		message := strings.ToLower(mysqlErr.Message)
-		if strings.Contains(message, "no root value found") ||
-			strings.Contains(message, "database is read only") {
-			return true
-		}
-		return false
+	// A decoded error packet is a definite server response. Preserve the
+	// explicit recoveries below, but do not let any other typed error enter the
+	// general retry or circuit-breaker path just because its text happens to
+	// contain connection-like wording: the message can quote a value the user
+	// chose (duplicate primary key given: [gone away]), and so can a wrapper
+	// (bd-a2wbd). A transient failure joined beside a packet (a failed
+	// statement whose ROLLBACK then lost the socket) still counts: the tree is
+	// judged by its parts (classifyErrorTree, bd-dcwku).
+	return classifyErrorTree(err, isRetryableServerPacket, isUntypedRetryableError)
+}
+
+// isRetryableServerPacket is isRetryableError's answer for one decoded server
+// packet: the explicit recoveries and the outage packets.
+func isRetryableServerPacket(packet *mysql.MySQLError) bool {
+	message := strings.ToLower(packet.Message)
+	switch packet.Number {
+	case 1105:
+		return strings.Contains(message, "no root value found") ||
+			strings.Contains(message, "database is read only")
+	case 1049:
+		// ER_BAD_DB_ERROR right after CREATE DATABASE: the catalog race below (GH-1851).
+		return strings.Contains(message, "unknown database")
 	}
+	return isServerOutagePacket(packet)
+}
+
+// isUntypedRetryableError is isRetryableError's answer for an error that holds
+// no decoded server packet: words of a transient failure in its text.
+func isUntypedRetryableError(err error) bool {
 	errStr := strings.ToLower(err.Error())
 	// MySQL driver transient errors
 	if strings.Contains(errStr, "driver: bad connection") {
