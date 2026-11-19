@@ -95,6 +95,62 @@ func resolveAndGetIssueWithRoutingAccess(ctx context.Context, localStore storage
 	return nil, err
 }
 
+// resolveAndGetIssueForShow is resolveAndGetIssueWithRouting for the
+// `bd show <id>` loop alone (show.go). Its local step reads an exact id once:
+// utils.ResolvePartialIDWithIssue hands back the issue its GetIssue of the
+// input read when that issue's ID equals the input byte for byte, so the
+// RoutedResult needs no second GetIssue; any other input takes HEAD's path
+// (the exact search, the fallback, then GetIssue). The prefix-route and
+// contributor auto-route fall-backs are resolveAndGetIssueWithRouting's.
+//
+// No other caller may use it. On an id held by a durable issue and a wisp,
+// or on a case-insensitive id collation, the one read can pick another row or
+// spelling than HEAD's search-then-GetIssue (review bd-tpix8: bd close
+// printed another spelling of the id), which bd show renders the same but a
+// mutating or label-reading command would not. Every other command resolves
+// through resolveAndGetFromStore, HEAD's statements.
+func resolveAndGetIssueForShow(ctx context.Context, localStore storage.DoltStorage, id string) (*RoutedResult, error) {
+	result, err := resolveAndGetFromStoreForShow(ctx, localStore, id)
+	if err == nil {
+		return result, nil
+	}
+	if isNotFoundErr(err) {
+		if prefixResult, prefixErr := resolveViaPrefixRoutingWithAccess(ctx, id, false, false); prefixErr == nil {
+			return prefixResult, nil
+		}
+	}
+	if isNotFoundErr(err) {
+		if autoResult, autoErr := resolveViaAutoRouting(ctx, localStore, id, false); autoErr == nil {
+			return autoResult, nil
+		}
+	}
+	return nil, err
+}
+
+// showResolveIssue is the resolver the `bd show <id>` loop calls; a test
+// swaps in resolveAndGetIssueWithRouting to render HEAD's side.
+var showResolveIssue = resolveAndGetIssueForShow
+
+// resolveAndGetFromStoreForShow is resolveAndGetFromStore with the one-read
+// exact id of resolveAndGetIssueForShow; only that function may call it.
+func resolveAndGetFromStoreForShow(ctx context.Context, s storage.DoltStorage, id string) (*RoutedResult, error) {
+	resolvedID, issue, err := utils.ResolvePartialIDWithIssue(ctx, s, id)
+	if err != nil {
+		return nil, err
+	}
+	if issue == nil {
+		issue, err = s.GetIssue(ctx, resolvedID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &RoutedResult{
+		Issue:      issue,
+		Store:      s,
+		ResolvedID: resolvedID,
+	}, nil
+}
+
 // resolveAndGetFromStore resolves a partial ID and gets the issue from a specific store.
 func resolveAndGetFromStore(ctx context.Context, s storage.DoltStorage, id string, routed bool) (*RoutedResult, error) {
 	// First, resolve the partial ID

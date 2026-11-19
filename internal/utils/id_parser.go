@@ -101,6 +101,38 @@ func ResolvePartialIDExact(ctx context.Context, store PartialIDResolverStore, in
 	return resolvePartialID(ctx, store, input, false)
 }
 
+// PartialIDIssueStore is a PartialIDResolverStore that can also read one
+// issue by its id, which ResolvePartialIDWithIssue tries first.
+type PartialIDIssueStore interface {
+	PartialIDResolverStore
+	GetIssue(ctx context.Context, id string) (*types.Issue, error)
+}
+
+// ResolvePartialIDWithIssue is ResolvePartialID that also hands back the
+// issue when input is the exact id of one, so a caller that wants the issue
+// need not read it twice. It reads GetIssue(input) first and keeps that issue
+// only when its ID equals input byte for byte: the issue is then the one
+// GetIssue(resolved id) returns, field for field (on an id held by both a
+// durable issue and a wisp, the durable row, as GetIssue picks it), and input
+// is the id ResolvePartialID resolves to.
+//
+// On a miss, an error or an issue stored under another spelling of input (a
+// case-insensitive id collation), it hands back no issue and resolves as
+// ResolvePartialID does, exact-ID search first, then the fallback; the caller
+// reads the issue with GetIssue. A GetIssue miss never becomes "not found"
+// here: GetIssue once missed ids the exact search found (GH#942), so the
+// search still decides.
+func ResolvePartialIDWithIssue(ctx context.Context, store PartialIDIssueStore, input string) (string, *types.Issue, error) {
+	if store == nil {
+		return "", nil, fmt.Errorf("cannot resolve issue ID %q: storage is nil", input)
+	}
+	if issue, err := store.GetIssue(ctx, input); err == nil && issue != nil && issue.ID == input {
+		return input, issue, nil
+	}
+	id, err := resolvePartialID(ctx, store, input, true)
+	return id, nil, err
+}
+
 func resolvePartialID(ctx context.Context, store PartialIDResolverStore, input string, allowAbbrev bool) (string, error) {
 	if store == nil {
 		return "", fmt.Errorf("cannot resolve issue ID %q: storage is nil", input)

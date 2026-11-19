@@ -971,3 +971,36 @@ func TestResolvePartialID_TitleFalsePositive(t *testing.T) {
 }
 
 // TestLooksLikePrefixedID tests the helper function for detecting prefixed IDs
+
+// TestResolvePartialIDWithIssue pins which resolutions hand back the issue:
+// an exact id, read by GetIssue(input) (callers skip a second GetIssue), does;
+// a fallback resolution does not.
+func TestResolvePartialIDWithIssue(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	issue1 := &types.Issue{ID: "bd-1", Title: "Test Issue", Status: types.StatusOpen, Priority: 1, IssueType: types.TypeTask, Labels: []string{"alpha"}}
+	if err := store.CreateIssue(ctx, issue1, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	id, got, err := utils.ResolvePartialIDWithIssue(ctx, store, "bd-1")
+	if err != nil || id != "bd-1" || got == nil || got.ID != "bd-1" {
+		t.Fatalf("exact: id=%q issue=%v err=%v, want bd-1 with its issue", id, got, err)
+	}
+	want, err := store.GetIssue(ctx, "bd-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != want.Title || len(got.Labels) != len(want.Labels) {
+		t.Errorf("exact: issue = %+v, want the GetIssue issue %+v", got, want)
+	}
+
+	id, got, err = utils.ResolvePartialIDWithIssue(ctx, store, "1")
+	if err != nil || id != "bd-1" || got != nil {
+		t.Fatalf("fallback: id=%q issue=%v err=%v, want bd-1 and a nil issue", id, got, err)
+	}
+
+	if _, _, err := utils.ResolvePartialIDWithIssue(ctx, nil, "bd-1"); err == nil {
+		t.Fatal("nil storage: want an error")
+	}
+}
