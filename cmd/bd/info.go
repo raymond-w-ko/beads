@@ -221,6 +221,15 @@ type VersionChange struct {
 // versionChanges contains agent-actionable changes for recent versions
 var versionChanges = []VersionChange{
 	{
+		Version: "1.3.5-dev.5",
+		Date:    "2026-11-19",
+		Changes: []string{
+			"DEV: fork pre-release above 1.3.5-dev.4, stamped so a caller can tell by 'bd version' a build that writes the bd-time line when BD_TIME_LOG names a file. It also marks the wisp label-pattern fix landed since 1.3.5-dev.4.",
+			"NEW: with BD_TIME_LOG naming a file by an absolute path, bd appends one JSON line as its last act, {\"tool\":\"bd-time\",\"at\":...,\"verb\":...,\"exit\":...,\"ms\":...,\"open_ms\":...}: at is the end (RFC 3339 UTC, milliseconds), verb the command's canonical path joined by '-' ('dep-add'; 'bd' for a bare or unknown command), exit the code bd exits with, ms the whole run and open_ms the command's own store open, absent when it made none. One write under 512 bytes, appended with mode 0600 at bd's five own exits after the hook wait and metrics flush; a failed open or write is silent and keeps the exit code, and a FIFO with no reader costs no wait. A BD_TIME_LOG in a project's .beads/.env is refused, and the detached 'bd send-metrics' child writes no line. Unset or empty, bd does nothing new.",
+			"FIX: 'bd ready --label-pattern' and '--label-regex' now filter ready wisps on wisp_labels too; before, every ready wisp came back whatever its labels, and a patterned claim could take one. The issues half of the ready read is hydrated from issues alone, so an id a wisp also holds no longer reads that wisp (2f40b7e8b).",
+		},
+	},
+	{
 		Version: "1.3.5-dev.4",
 		Date:    "2026-11-19",
 		Changes: []string{

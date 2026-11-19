@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/steveyegge/beads/internal/timelog"
 )
 
 const SendMetricsSubcommand = "send-metrics"
@@ -222,11 +224,20 @@ func startDetached(cmd *exec.Cmd) (int, error) {
 // endpoint and the flusher marker set. Any inherited BEADS_METRICS_ENDPOINT (for
 // example one a project .beads/.env loaded into the parent process) is dropped
 // so the detached flusher cannot be redirected by project-controlled
-// environment.
+// environment. BD_TIME_LOG is dropped too, so the flusher writes no bd-time
+// line of its own.
 func flusherChildEnv(env []string, endpoint string) []string {
 	out := make([]string, 0, len(env)+2)
-	for _, kv := range env {
+	// The detached flusher is bd's own upload, not a call the operator made:
+	// it writes no bd-time line (timelog.EnvWithout).
+	for _, kv := range timelog.EnvWithout(env) {
 		if strings.HasPrefix(kv, EnvEndpoint+"=") || strings.HasPrefix(kv, EnvIsFlusher+"=") {
+			continue
+		}
+		// Wider than the helper's exact Unix match: this filter dropped the
+		// name in every letter case before the helper existed, and its output
+		// stays as it was.
+		if key, _, ok := strings.Cut(kv, "="); ok && strings.EqualFold(key, timelog.EnvVar) {
 			continue
 		}
 		out = append(out, kv)

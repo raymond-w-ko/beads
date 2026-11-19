@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"os"
+	"slices"
 	"testing"
 )
 
@@ -89,4 +90,24 @@ func TestMaybeSpawnFlusherNoOpInTestMode(t *testing.T) {
 	// guard (smoke path).
 	t.Setenv(EnvTestMode, "1")
 	MaybeSpawnFlusher()
+}
+
+// TestFlusherChildEnvDropsTimeLog: the detached `bd send-metrics` child must
+// not inherit BD_TIME_LOG, so it appends no bd-time line of its own. Its
+// filter drops the name in every letter case on every platform, wider than
+// timelog.EnvWithout's exact Unix match, and keeps every other entry in order.
+func TestFlusherChildEnvDropsTimeLog(t *testing.T) {
+	parent := []string{
+		"HOME=/home/u",
+		"BD_TIME_LOG=/tmp/bd-time.log",
+		"bd_time_log=/tmp/lower.log",
+		"BD_TIME_LOGX=/kept",
+		"Bd_Time_Log=/tmp/mixed.log",
+		"PATH=/usr/bin",
+	}
+	got := flusherChildEnv(parent, "")
+	want := []string{"HOME=/home/u", "BD_TIME_LOGX=/kept", "PATH=/usr/bin", EnvIsFlusher + "=1"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("flusherChildEnv(%q)\n got %q\nwant %q", parent, got, want)
+	}
 }

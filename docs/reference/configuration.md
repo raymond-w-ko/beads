@@ -477,6 +477,7 @@ Selected commonly-used variables:
 | `BD_NO_PAGER`, `BD_PAGER` | Pager behavior |
 | `BD_NON_INTERACTIVE` | Disable prompts |
 | `BD_DEBUG` | Enable debug logging |
+| `BD_TIME_LOG` | Append one bd-time JSON line per bd process to this file, an absolute path, as its last act (see [bd-time line](#bd-time-line)); unset, empty or relative writes nothing. Read only from the shell environment: a `.beads/.env` value is refused |
 | `BD_MIGRATION_FREEZE_FILE` | Check this exact path for the freeze marker instead of walking ancestor directories; authoritative when set (see [Migration Freeze](#migration-freeze)) |
 | `BEADS_DIR` | Force the active beads workspace directory |
 | `BEADS_ACTOR` | Actor identity (preferred over `BD_ACTOR`, which is a deprecated alias) |
@@ -484,6 +485,31 @@ Selected commonly-used variables:
 | `BEADS_FSCK_TIMEOUT` | Runtime-only timeout for the pre-push `dolt fsck --quiet` integrity check (default `30s`) |
 | `BEADS_DOLT_SERVER_MODE`, `BEADS_DOLT_SHARED_SERVER`, `BEADS_DOLT_DATA_DIR`, `BEADS_DOLT_PORT`, ... | Embedded/server Dolt overrides |
 | `BEADS_DOLT_BIN` | Pin the exact external `dolt` CLI binary managed proxied-server mode spawns, overriding PATH lookup (highest precedence; an explicit path that fails validation is an error, not a silent fallback to PATH). On Windows the executable extension may be omitted — `C:\tools\dolt` finds `C:\tools\dolt.exe` via PATHEXT, though a file at the exact spelled path wins if both exist |
+
+### bd-time line
+
+When `BD_TIME_LOG` names a file, each bd process appends one line to it as it exits, so a monitor can time bd calls by verb without adding a statement to the server:
+
+```json
+{"tool":"bd-time","at":"2026-11-19T18:49:29.123Z","verb":"dep-add","exit":0,"ms":412,"open_ms":97}
+```
+
+| Field | Meaning |
+|---|---|
+| `tool` | Always `bd-time` |
+| `at` | When the line was written: RFC 3339, UTC, milliseconds |
+| `verb` | The command's path below the root by its canonical name (never an alias), joined by `-`: `update`, `dep-add`, `dolt-commit`. `bd` for a bare `bd` or an unknown command, whatever `BD_NAME` renames the root to. A flag error or `--help` carries its command's verb |
+| `exit` | The code bd exits with |
+| `ms` | Whole milliseconds from process start to the write |
+| `open_ms` | Whole milliseconds from process start to the return of the command's own store open: the one bd makes before the command runs, or, for a command that skips that open and opens its store later through the shared late-open path (`bd prime`, for one), that late open. Absent when the command made no such open (a failed open counts as none). Other opens never set it: `init` creating a database, bootstrap, doctor's own open, config drift and apply, schema migrations, a routed or preview second store, the read-only reopen, and the proxied-server `init` and `prime` |
+
+The file is created with mode `0600` and appended to with one write. bd never reads, locks, syncs or rotates it. A failed write is silent and never changes the exit code. A FIFO with no reader or a full pipe is skipped without waiting, and a line of 512 bytes or more is not written. A process killed by a signal, a second interrupt or a panic writes no line, and neither do the processes bd starts detached for itself (the metrics uploader and the db proxy child).
+
+Only an absolute path names the file: a relative value is treated as unset, since it would resolve against the working directory, which can be a checkout someone else prepared. Where the platform has `O_NOFOLLOW` (not Windows), a symlink as the path's last component is refused and nothing is written. Every directory of the path is yours: bd follows a symlinked directory inside it, so name a path whose directories you own.
+
+Two limits are stated, not handled. The append is one synchronous open, write and close: the non-blocking open covers a FIFO and a pipe only, so a filesystem that stalls holds bd's exit as it holds any of bd's own file reads. With no read and no lock, a write cut short (a file-size limit, a full disk) leaves a fragment with no newline, and the next line lands on the same physical line, so a reader loses that record with it.
+
+The variable is read once, at startup, from the shell environment. A `BD_TIME_LOG` in a project's `.beads/.env` is refused with `beads: ignoring BD_TIME_LOG from .beads/.env (output file paths must come from your shell environment)`, so a cloned repository cannot make your bd append to a file of its choosing.
 
 Integration secrets follow tracker-specific conventions: `LINEAR_API_KEY`, `GITHUB_TOKEN`, `GITLAB_TOKEN`, `JIRA_API_TOKEN`, `AZURE_DEVOPS_PAT`, `ANTHROPIC_API_KEY`. These are preferred over storing the value in `config.yaml` for git-tracked projects.
 

@@ -42,6 +42,14 @@ var CredentialRedirectEnvKeys = []string{
 	"BEADS_HTTP_CA_FILE",
 }
 
+// OutputPathEnvKeys names environment settings whose value is a path bd
+// writes to. BD_TIME_LOG names the file each bd process appends its bd-time
+// line to; a .beads/.env in a cloned repository that set it would make the
+// user's bd append to a file of the repository's choosing.
+var OutputPathEnvKeys = []string{
+	"BD_TIME_LOG",
+}
+
 // AllowedDoltEnvKeys names the only bare DOLT_* variables a project
 // .beads/.env may import: the Dolt remote credential pair, the documented
 // per-project credential use case (GH#2520). The DOLT_* namespace as a whole
@@ -105,6 +113,11 @@ func AllowedProjectEnvKey(key string) (bool, string) {
 	for _, k := range CredentialRedirectEnvKeys {
 		if upper == k {
 			return false, "credential target settings must come from your shell environment or user config"
+		}
+	}
+	for _, k := range OutputPathEnvKeys {
+		if upper == k {
+			return false, "output file paths must come from your shell environment"
 		}
 	}
 	for _, k := range AllowedDoltEnvKeys {

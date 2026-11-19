@@ -43,6 +43,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/storage/uow"
 	"github.com/steveyegge/beads/internal/telemetry"
+	"github.com/steveyegge/beads/internal/timelog"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
 	"go.opentelemetry.io/otel/attribute"
@@ -1032,6 +1033,10 @@ var rootCmd = &cobra.Command{
 		_ = cmd.Help() // Help() always returns nil for cobra commands
 	},
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) (retErr error) {
+		// The verb the bd-time line names if this command exits inside its
+		// run (CheckReadonly) rather than through main().
+		timeLogCommand = cmd
+
 		applyNoColorFlag()
 
 		// Initialize CommandContext to hold runtime state (replaces scattered globals)
@@ -1842,6 +1847,8 @@ var rootCmd = &cobra.Command{
 				}
 				return HandleError("failed to open uow provider: %v", err)
 			}
+			// The bd-time line's open_ms: the store open returned.
+			timelog.MarkOpen()
 			// Fire the workspace's script hooks after commits on the
 			// unit-of-work plumbing, which notified no one: hooks now fire on
 			// both write plumbings, from the plumbing rather than from each
@@ -1917,6 +1924,8 @@ var rootCmd = &cobra.Command{
 			}
 			return HandleError("failed to open database: %v", err)
 		}
+		// The bd-time line's open_ms: the store open returned.
+		timelog.MarkOpen()
 
 		// Mark store as active for flush goroutine safety
 		storeMutex.Lock()
@@ -2492,15 +2501,20 @@ func main() {
 	// same way instead of only the clean RunE/ExecuteC return.
 	metrics.CloseAndFlush()
 
+	// Each exit below appends the bd-time line (BD_TIME_LOG) as its last
+	// act, after the hook wait and the metrics flush; see time_log.go.
 	if err != nil {
 		if code, ok := exitCodeFromError(err); ok {
+			writeTimeLog(executedCmd, code)
 			os.Exit(code)
 		}
 		if executedCmd != nil && executedCmd.SilenceErrors {
 			fmt.Fprintf(os.Stderr, "Error: %s\n", err.Error())
 		}
+		writeTimeLog(executedCmd, 1)
 		os.Exit(1)
 	}
+	writeTimeLog(executedCmd, 0)
 }
 
 func resolveMetricsEnabled() bool {

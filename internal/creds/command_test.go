@@ -126,3 +126,21 @@ func TestCommandSourceRealShell(t *testing.T) {
 		t.Fatalf("source = %q, want TEST_CMD", cred.Source)
 	}
 }
+
+// TestAllowedProjectEnvKeyRefusesTimeLog: a project .beads/.env must never
+// name the file bd appends its bd-time line to, in any letter case.
+func TestAllowedProjectEnvKeyRefusesTimeLog(t *testing.T) {
+	for _, key := range []string{"BD_TIME_LOG", "bd_time_log", "Bd_Time_Log", " BD_TIME_LOG "} {
+		ok, reason := AllowedProjectEnvKey(key)
+		if ok {
+			t.Fatalf("AllowedProjectEnvKey(%q) admitted the key", key)
+		}
+		if reason != "output file paths must come from your shell environment" {
+			t.Fatalf("AllowedProjectEnvKey(%q) reason = %q", key, reason)
+		}
+	}
+	// Neighbouring BD_* keys stay admitted.
+	if ok, reason := AllowedProjectEnvKey("BD_TIME_LOGS"); !ok {
+		t.Fatalf("AllowedProjectEnvKey(BD_TIME_LOGS) refused: %s", reason)
+	}
+}

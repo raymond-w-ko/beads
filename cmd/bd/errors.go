@@ -257,10 +257,12 @@ func CheckReadonly(operation string) {
 	if readonlyMode {
 		fmt.Fprintf(os.Stderr, "Error: operation '%s' is not allowed in read-only mode\n", operation)
 		metrics.CloseAndFlush()
+		writeTimeLog(timeLogCommand, 1)
 		os.Exit(1)
 	}
 	if err := migrationFreezeError(operation); err != nil {
 		metrics.CloseAndFlush()
+		writeTimeLog(timeLogCommand, ExitMigrationFrozen)
 		os.Exit(ExitMigrationFrozen)
 	}
 }

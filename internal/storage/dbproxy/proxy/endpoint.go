@@ -25,6 +25,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/dbproxy/pidfile"
 	"github.com/steveyegge/beads/internal/storage/dbproxy/server"
 	"github.com/steveyegge/beads/internal/storage/dbproxy/util"
+	"github.com/steveyegge/beads/internal/timelog"
 )
 
 type ErrUpstreamMismatch struct {
@@ -425,6 +426,18 @@ type spawnedProxyChild struct {
 	marker spawnMarker
 }
 
+// proxyChildCommand builds the detached db-proxy-child command: no stdin,
+// detached process attributes, and this process's environment without
+// BD_TIME_LOG, since the child is no call an operator made and must write
+// no bd-time line of its own. The caller sets Stdout and Stderr.
+func proxyChildCommand(self string, args []string) *exec.Cmd {
+	cmd := exec.Command(self, args...)
+	cmd.Env = timelog.EnvWithout(os.Environ())
+	cmd.Stdin = nil
+	cmd.SysProcAttr = procAttrDetached()
+	return cmd
+}
+
 func forkExecChild(rootDir string, opts OpenOpts, port int, stopEpoch string, lock *util.Lock) (*spawnedProxyChild, error) {
 	released := false
 	defer func() {
@@ -484,11 +497,9 @@ func forkExecChild(rootDir string, opts OpenOpts, port int, stopEpoch string, lo
 		return nil, fmt.Errorf("open log file %q: %w", opts.LogFilePath, err)
 	}
 
-	cmd := exec.Command(self, args...)
-	cmd.Stdin = nil
+	cmd := proxyChildCommand(self, args)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
-	cmd.SysProcAttr = procAttrDetached()
 
 	birth, err := procid.Capture(os.Getpid())
 	if err != nil {

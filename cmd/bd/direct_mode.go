@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/timelog"
 )
 
 // ErrNoBeadsDatabase reports that no beads workspace could be resolved at all,
@@ -50,6 +51,9 @@ func ensureStoreActiveWithContext(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w\nHint: %s", err, diagHint())
 	}
+	// A command that opens its store late, here, still times the open in its
+	// bd-time line; a process's first mark stands.
+	timelog.MarkOpen()
 
 	// Update the database path for compatibility with code that expects it
 	if dbPath := beads.FindDatabasePath(); dbPath != "" {

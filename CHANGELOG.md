@@ -52,6 +52,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal from a managed (local sidecar) backend keep the full transient
   retry.
 
+## [1.3.5-dev.5] - 2026-11-19
+
+Fork pre-release above [1.3.5-dev.4], stamped so a caller can tell by
+`bd version` a build that writes the `bd-time` line when `BD_TIME_LOG` names
+a file: everturn's store load monitor folds the lines once its pin reaches
+this version. It also marks the wisp label-pattern fix landed since
+1.3.5-dev.4.
+
+### Added
+
+- **`BD_TIME_LOG` times each bd process**: when the variable names a file
+  by an absolute path, bd appends one JSON line to it as its last act, for example
+  `{"tool":"bd-time","at":"2026-11-19T18:49:29.123Z","verb":"dep-add","exit":0,"ms":412,"open_ms":97}`.
+  `at` is the end, RFC 3339 in UTC with milliseconds; `verb` is the executed
+  command's path below the root by cobra's canonical names, joined by `-`
+  (`update`, `dep-add`, `dolt-commit`; `bd` for a bare or unknown command; a
+  flag error or `--help` carries its command's verb); `exit` is the code bd
+  exits with; `ms` is the whole milliseconds since one of bd's first package
+  initialisations; `open_ms` is the milliseconds to the return of the
+  command's own store open (the one bd makes before the command runs, or a
+  command's late open through the shared late-open path, `bd prime` for
+  one), absent when the command made no such open; other opens (`init`
+  creating a database, bootstrap, doctor's own open, migrations, a routed or
+  preview second store, the proxied-server `init` and `prime`) write none.
+  The line is written at bd's
+  five own exits (the three of `main()` and the two of the read-only check),
+  after the command hook wait and the metrics flush, read-only refusals
+  included, and by a signal bd catches, which returns through `main()`. A
+  process a signal kills, the forced exit on a second signal and a panic
+  write none. The append is one `write` of one line under 512 bytes, opened
+  for append and create with mode 0600, with no rotation, lock, read or
+  sync; a failed open or write is silent and keeps bd's exit code, a FIFO
+  with no reader or a full pipe costs no wait, and a line of 512 bytes or
+  more is not written. The path comes only from the environment bd started
+  with: a `BD_TIME_LOG` in a project's `.beads/.env` is refused, so a cloned
+  repository cannot make bd append to a file of its choosing. Only an
+  absolute path names the file: a relative value is the same as unset, and
+  where the platform has `O_NOFOLLOW` (not Windows) a symlink as the path's
+  last component is refused; a symlinked directory inside the path is
+  followed. The detached children bd starts for itself, `bd db-proxy-child`
+  and `bd send-metrics`, get no `BD_TIME_LOG` and write no line. Two limits
+  are stated, not handled: the append is one synchronous open, write and
+  close, so a filesystem that stalls holds bd's exit; and a write cut short
+  (a file-size limit, a full disk) leaves a fragment with no newline, so the
+  next line lands on the same physical line and that record is lost with it.
+  Unset, empty or relative, bd does nothing new, and no statement is sent to
+  the server.
+
+### Fixed
+
+- **`bd ready --label-pattern` and `--label-regex` filter ready wisps too**
+  (fork 2f40b7e8b): the wisps half of the ready read did not carry either
+  filter, so every ready wisp came back whatever its labels, and a patterned
+  claim could take one. It now applies both on `wisp_labels`, as the issues
+  half and the list read do. The issues half is hydrated from `issues`
+  alone, so an id a wisp also holds no longer reads that wisp, which the
+  wisps half may have excluded; a ready claim on such an id keeps upstream's
+  routing.
+
 ## [1.3.5-dev.4] - 2026-11-19
 
 Fork pre-release above [1.3.5-dev.3], stamped so a caller can tell by
