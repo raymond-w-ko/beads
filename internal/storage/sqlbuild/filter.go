@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
@@ -215,8 +216,9 @@ func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables Filt
 		whereClauses = append(whereClauses, fmt.Sprintf("id NOT IN (SELECT DISTINCT issue_id FROM %s)", tables.Labels))
 	}
 	if filter.LabelPattern != "" {
-		whereClauses = append(whereClauses, fmt.Sprintf("id IN (SELECT issue_id FROM %s WHERE label LIKE ? ESCAPE '|')", tables.Labels))
-		args = append(args, globToLikePattern(filter.LabelPattern))
+		clause, pattern := labelPatternClause(tables.Labels, filter.LabelPattern)
+		whereClauses = append(whereClauses, clause)
+		args = append(args, pattern)
 	}
 	if filter.LabelRegex != "" {
 		whereClauses = append(whereClauses, fmt.Sprintf("id IN (SELECT issue_id FROM %s WHERE label REGEXP ?)", tables.Labels))
@@ -368,6 +370,40 @@ func AppendMetadataClauses(where []string, args []any, hasKey string, fields map
 		}
 	}
 	return where, args, nil
+}
+
+// labelPatternClause renders the --label-pattern predicate over labelsTable
+// and the LIKE pattern it binds. A valid UTF-8 glob holding no literal %, _,
+// \ or | needs no escape character, so it is sent as a bare LIKE: the engine
+// rewrites a bare `LIKE 'class:%'` into a range of idx_labels_label, while
+// any ESCAPE clause keeps the LIKE a filter over every label row (bd-ypak8:
+// the ready read `bd ready --label-pattern 'class:*'` 122 ms -> 42 ms at 20k
+// issues and 33k labels on Dolt 2.6.2). Every other glob keeps the ESCAPE '|'
+// form, bound to globToLikePattern, so the bare pattern is always byte-equal
+// to globToLikePattern's and the two forms differ only by the ESCAPE clause
+// (bd-q6rw5):
+//   - %, _ and \: the go-mysql-server bd embeds rewrites a bare LIKE whose
+//     prefix holds an escaped literal into a wrong range and returns no rows;
+//   - |: globToLikePattern doubles the escape character, which a bare LIKE
+//     would read as two literal bars (such a glob gives up the seek);
+//   - invalid UTF-8 (bd-kx6uj): globToLikePattern walks runes and so sends
+//     each invalid byte as U+FFFD, while a bare pattern would send the raw
+//     byte, which the server refuses ("Incorrect string value"), aborting the
+//     read.
+func labelPatternClause(labelsTable, glob string) (clause, pattern string) {
+	if strings.ContainsAny(glob, `%_\|`) || !utf8.ValidString(glob) {
+		return fmt.Sprintf("id IN (SELECT issue_id FROM %s WHERE label LIKE ? ESCAPE '|')", labelsTable), globToLikePattern(glob)
+	}
+	return fmt.Sprintf("id IN (SELECT issue_id FROM %s WHERE label LIKE ?)", labelsTable), bareGlobToLikePattern(glob)
+}
+
+// bareGlobToLikePattern converts a valid UTF-8 glob holding no %, _, \ or |
+// to a LIKE pattern for a LIKE without ESCAPE: * and ? become % and _, and
+// every other byte stands for itself. It works on bytes, not runes, so a
+// caller that skipped labelPatternClause's gate would send an invalid byte
+// as it is rather than repair it.
+func bareGlobToLikePattern(glob string) string {
+	return strings.NewReplacer("*", "%", "?", "_").Replace(glob)
 }
 
 // globToLikePattern converts a shell-style glob (* and ?) to a SQL LIKE

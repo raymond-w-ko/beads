@@ -304,8 +304,8 @@ func TestBuildIssueFilterClauses_LabelPattern(t *testing.T) {
 	if len(clauses) != 1 {
 		t.Fatalf("expected 1 clause for LabelPattern, got %d: %v", len(clauses), clauses)
 	}
-	if !strings.Contains(clauses[0], "label LIKE ? ESCAPE '|'") {
-		t.Errorf("expected LIKE ESCAPE clause, got %q", clauses[0])
+	if !strings.Contains(clauses[0], "label LIKE ?)") {
+		t.Errorf("expected a bare LIKE clause (no ESCAPE) for a glob without literal %%, _ or \\, got %q", clauses[0])
 	}
 	if !strings.Contains(clauses[0], "FROM labels") {
 		t.Errorf("expected subquery against labels table, got %q", clauses[0])

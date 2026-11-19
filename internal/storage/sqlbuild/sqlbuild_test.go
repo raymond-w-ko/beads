@@ -239,7 +239,8 @@ func TestBuildReadyWorkWhereLabelsAny(t *testing.T) {
 // code on the ready path and silently returned unfiltered results.
 // BuildIssueFilterClauses coverage for LabelPattern/LabelRegex lives with
 // the list path (be402a022, #3971); this covers only the ready path's own
-// clause shape, which mirrors filter.go's LIKE ... ESCAPE '|' pattern.
+// clause shape, which mirrors filter.go's labelPatternClause: a bare LIKE for
+// a glob without literal %, _ or \ (bd-ypak8).
 func TestBuildReadyWorkWhereLabelPattern(t *testing.T) {
 	t.Parallel()
 
@@ -247,7 +248,7 @@ func TestBuildReadyWorkWhereLabelPattern(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	wantClause := "id IN (SELECT issue_id FROM " + IssuesFilterTables.Labels + " WHERE label LIKE ? ESCAPE '|')"
+	wantClause := "id IN (SELECT issue_id FROM " + IssuesFilterTables.Labels + " WHERE label LIKE ?)"
 	if !strings.Contains(where, wantClause) {
 		t.Errorf("LabelPattern clause missing.\n where = %s\n want substring = %s", where, wantClause)
 	}

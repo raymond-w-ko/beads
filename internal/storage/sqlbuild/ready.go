@@ -268,8 +268,9 @@ func BuildReadyWorkWhere(filter types.WorkFilter, tables FilterTables, in ReadyW
 		whereClauses = append(whereClauses, fmt.Sprintf("id NOT IN (SELECT issue_id FROM %s WHERE label IN (%s))", tables.Labels, strings.Join(placeholders, ", ")))
 	}
 	if filter.LabelPattern != "" {
-		whereClauses = append(whereClauses, fmt.Sprintf("id IN (SELECT issue_id FROM %s WHERE label LIKE ? ESCAPE '|')", tables.Labels))
-		args = append(args, globToLikePattern(filter.LabelPattern))
+		clause, pattern := labelPatternClause(tables.Labels, filter.LabelPattern)
+		whereClauses = append(whereClauses, clause)
+		args = append(args, pattern)
 	}
 	if filter.LabelRegex != "" {
 		whereClauses = append(whereClauses, fmt.Sprintf("id IN (SELECT issue_id FROM %s WHERE label REGEXP ?)", tables.Labels))
