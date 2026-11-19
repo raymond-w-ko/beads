@@ -423,6 +423,7 @@ func expectConvergedProbeWithWispsGone(mock sqlmock.Sqlmock, database string) {
 	expectForkCreateTable(mock, "issues", " AS OF 'HEAD'", nil)
 	mock.ExpectQuery(regexp.QuoteMeta("SHOW COLUMNS FROM `wisps`")).
 		WillReturnError(errors.New("Error 1146 (HY000): table not found: wisps"))
+	expectForkIndexNamesPresent(mock, "wisp_dependencies")
 	expectDoltIgnoreRead(mock, unqualifiedDoltIgnore, seededIgnorePatterns(LatestVersion()))
 	expectIgnoredCursorGate(mock, "", false, nil, false)
 	expectMigrationLockProbe(mock, database, 1)

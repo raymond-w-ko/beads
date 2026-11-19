@@ -105,9 +105,10 @@ var forkColumns = func() []forkColumn {
 
 type forkIndex struct{ Table, Name, DDL string } // DDL: the whole ALTER TABLE statement
 
-// forkIndexes lists the issues indexes, then the wisps ones. Every everturn
-// key column but everturn_action is indexed on both tables as
-// (column, created_at); everturn_action is indexed on issues only.
+// forkIndexes lists the issues indexes, then the wisps ones, then the
+// wisp_dependencies one. Every everturn key column but everturn_action is
+// indexed on both tables as (column, created_at); everturn_action is indexed
+// on issues only.
 var forkIndexes = func() []forkIndex {
 	idx := []forkIndex{
 		{
@@ -141,15 +142,34 @@ var forkIndexes = func() []forkIndex {
 			})
 		}
 	}
+	// The external branch of the dependents count and of the dependents rows
+	// (depends_on_external = ? with no type) seeks this index; without it that
+	// branch reads all of wisp_dependencies on every bd show --json (23,000 to
+	// 24,000 rows on the fleet's databases, bd-1gxdn). Migration 0021 creates
+	// wisp_dependencies already split, with no index led by depends_on_external
+	// (its issue and wisp targets are led by their foreign keys' indexes); only
+	// the upgrade paths 0047 and ignored/0003 add this one, and both skip a
+	// table that already has the split columns. Name and definition are theirs,
+	// so a database that came through them already has it and the step sends no
+	// DDL there; the step goes by name, so an index of that name with another
+	// column list is left as it is. wisp_dependencies is dolt_ignored like wisps:
+	// each clone adds its own, and nothing is staged or committed for it. It has
+	// no fork column, so the probe reads only its SHOW INDEX.
+	idx = append(idx, forkIndex{
+		Table: "wisp_dependencies",
+		Name:  "idx_wisp_dep_external_target",
+		DDL:   "ALTER TABLE wisp_dependencies ADD INDEX idx_wisp_dep_external_target (depends_on_external)",
+	})
 	return idx
 }()
 
 // needsForkIndexes reports whether any listed column or index is missing. A
 // column or index on a table that does not exist yet does not count, and a
 // table found absent gets no further probe. It runs on every open
-// (migrationWorkNeeded, alreadyConverged), so it reads SHOWs, two per table:
-// an INFORMATION_SCHEMA query costs ~20ms on a server hosting many databases,
-// a SHOW under 1ms.
+// (migrationWorkNeeded, alreadyConverged), so it reads SHOWs, two per table
+// (one, SHOW INDEX, for a table with no fork column: wisp_dependencies): an
+// INFORMATION_SCHEMA query costs ~20ms on a server hosting many databases, a
+// SHOW under 1ms.
 //
 // A table the step commits (forkCommittedTables: issues) is read twice, as
 // SHOW CREATE TABLE of the working table and of HEAD, and work is needed when
@@ -167,65 +187,141 @@ var forkIndexes = func() []forkIndex {
 // statements as before. A table that is not at HEAD (a database whose first
 // pass never committed) counts by its working table alone. A dolt_ignored
 // table (wisps) is never at HEAD: SHOW COLUMNS and SHOW INDEX, as before.
+//
+// Names are compared without regard to case, as the server compares them
+// (review bd-8b72l finding 3): an IDX_WISP_DEP_EXTERNAL_TARGET counts as the
+// step's index, where an exact look-up sent every writable open down the
+// locked path to retry a duplicate ALTER.
 func needsForkIndexes(ctx context.Context, db DBConn) (bool, error) {
-	for _, table := range forkTables() {
-		if forkCommittedTables[table] {
-			work, err := forkCreateTableNames(ctx, db, table, "")
-			if err != nil {
-				return false, err
-			}
-			if work == nil {
-				continue // the table does not exist
-			}
-			if work.lacksForkObject(table) {
-				return true, nil
-			}
-			head, err := forkCreateTableNames(ctx, db, table, " AS OF 'HEAD'")
-			if err != nil {
-				return false, err
-			}
-			if head != nil && head.lacksForkObject(table) {
-				return true, nil
-			}
+	need, err := forkIndexesNeed(ctx, db)
+	return need != forkNeedNone, err
+}
+
+// forkNeed is what needsForkIndexes found missing.
+type forkNeed int
+
+const (
+	forkNeedNone forkNeed = iota
+	// forkNeedCloneLocal: only objects on dolt_ignored, clone-local tables
+	// (wisps, wisp_dependencies) are missing. They are never staged or
+	// committed, so adding them needs none of the whole pass
+	// (ensureCloneLocalForkObjects, bd-30lnk), when this database ignores
+	// them: migrationWork asks dolt_ignore before taking that step (review
+	// bd-8fwl1 finding 2).
+	forkNeedCloneLocal
+	// forkNeedCommitted: an object on a table the pass commits (issues) is
+	// missing from its working table or from HEAD: the whole pass.
+	forkNeedCommitted
+)
+
+// forkIndexesNeed is needsForkIndexes's probe, telling a missing object on a
+// committed table from one on a clone-local table only. The committed tables
+// are probed first, so the answer costs no statement more than the yes/no
+// question did: the first missing clone-local object ends the probe as before.
+func forkIndexesNeed(ctx context.Context, db DBConn) (forkNeed, error) {
+	need, _, err := forkIndexesNeedTables(ctx, db, false)
+	return need, err
+}
+
+// forkIndexesNeedTables is forkIndexesNeed that, with all set, goes on past
+// the first clone-local table lacking an object and also returns every
+// clone-local table that lacks one, in forkTables order: migrationWork asks
+// whether each is ignored in this database. It reads more than forkIndexesNeed
+// only once an object is missing (the rest of the clone-local tables' SHOWs);
+// on a database with every object present both send the same statements.
+func forkIndexesNeedTables(ctx context.Context, db DBConn, all bool) (forkNeed, []string, error) {
+	tables := forkTables()
+	for _, table := range tables {
+		if !forkCommittedTables[table] {
 			continue
 		}
+		work, err := forkCreateTableNames(ctx, db, table, "")
+		if err != nil {
+			return forkNeedNone, nil, err
+		}
+		if work == nil {
+			continue // the table does not exist
+		}
+		if work.lacksForkObject(table) {
+			return forkNeedCommitted, nil, nil
+		}
+		head, err := forkCreateTableNames(ctx, db, table, " AS OF 'HEAD'")
+		if err != nil {
+			return forkNeedNone, nil, err
+		}
+		if head != nil && head.lacksForkObject(table) {
+			return forkNeedCommitted, nil, nil
+		}
+	}
+	var lacking []string
+	for _, table := range tables {
+		if forkCommittedTables[table] {
+			continue
+		}
+		lacks, err := cloneLocalTableLacksForkObject(ctx, db, table)
+		if err != nil {
+			return forkNeedNone, nil, err
+		}
+		if !lacks {
+			continue
+		}
+		if !all {
+			return forkNeedCloneLocal, nil, nil
+		}
+		lacking = append(lacking, table)
+	}
+	if len(lacking) > 0 {
+		return forkNeedCloneLocal, lacking, nil
+	}
+	return forkNeedNone, nil, nil
+}
+
+// cloneLocalTableLacksForkObject probes one table that is not at HEAD: its
+// SHOW COLUMNS (when it has a fork column), then its SHOW INDEX; a missing
+// column ends the probe. A table that does not exist lacks nothing.
+func cloneLocalTableLacksForkObject(ctx context.Context, db DBConn, table string) (bool, error) {
+	if forkTableHasColumns(table) {
 		columns, err := forkTableColumnNames(ctx, db, table)
 		if err != nil {
 			return false, err
 		}
 		if columns == nil {
-			continue // the table does not exist
+			return false, nil // the table does not exist
 		}
 		for _, col := range forkColumns {
-			if col.Table == table && !columns[col.Name] {
-				return true, nil
-			}
-		}
-		if !forkTableHasIndexes(table) {
-			continue
-		}
-		indexes, err := forkTableIndexNames(ctx, db, table)
-		if err != nil {
-			return false, err
-		}
-		if indexes == nil {
-			continue // the table does not exist
-		}
-		for _, idx := range forkIndexes {
-			if idx.Table == table && !indexes[idx.Name] {
+			if col.Table == table && !columns[forkName(col.Name)] {
 				return true, nil
 			}
 		}
 	}
+	if !forkTableHasIndexes(table) {
+		return false, nil
+	}
+	indexes, err := forkTableIndexNames(ctx, db, table)
+	if err != nil {
+		return false, err
+	}
+	if indexes == nil {
+		return false, nil // the table does not exist
+	}
+	for _, idx := range forkIndexes {
+		if idx.Table == table && !indexes[forkName(idx.Name)] {
+			return true, nil
+		}
+	}
 	return false, nil
 }
+
+// forkName is the key of a column or index name in the step's name sets: the
+// server compares those names without regard to case, so the step does too.
+func forkName(name string) string { return strings.ToLower(name) }
 
 // forkCommittedTables are the fork tables the migration pass stages and
 // commits. wisps is dolt_ignored (clone-local): never staged, never at HEAD.
 var forkCommittedTables = map[string]bool{"issues": true}
 
 // forkTables is every table with a fork column or index, in forkColumns then
-// forkIndexes order (issues, then wisps).
+// forkIndexes order (issues, wisps, then wisp_dependencies).
 func forkTables() []string {
 	var tables []string
 	seen := make(map[string]bool)
@@ -244,6 +340,15 @@ func forkTables() []string {
 	return tables
 }
 
+func forkTableHasColumns(table string) bool {
+	for _, col := range forkColumns {
+		if col.Table == table {
+			return true
+		}
+	}
+	return false
+}
+
 func forkTableHasIndexes(table string) bool {
 	for _, idx := range forkIndexes {
 		if idx.Table == table {
@@ -258,12 +363,12 @@ type forkTableNames struct{ columns, indexes map[string]bool }
 
 func (n *forkTableNames) lacksForkObject(table string) bool {
 	for _, col := range forkColumns {
-		if col.Table == table && !n.columns[col.Name] {
+		if col.Table == table && !n.columns[forkName(col.Name)] {
 			return true
 		}
 	}
 	for _, idx := range forkIndexes {
-		if idx.Table == table && !n.indexes[idx.Name] {
+		if idx.Table == table && !n.indexes[forkName(idx.Name)] {
 			return true
 		}
 	}
@@ -286,16 +391,16 @@ func forkCreateTableNames(ctx context.Context, db DBConn, table, asOf string) (*
 	names := &forkTableNames{columns: make(map[string]bool), indexes: make(map[string]bool)}
 	for line := range createTableLines(ddl) {
 		if m := forkColumnNameRE.FindStringSubmatch(line); m != nil {
-			names.columns[m[1]] = true
+			names.columns[forkName(m[1])] = true
 		} else if m := createTableIndexRE.FindStringSubmatch(line); m != nil {
-			names.indexes[m[1]] = true
+			names.indexes[forkName(m[1])] = true
 		}
 	}
 	return names, nil
 }
 
-// forkTableColumnNames returns the column names on table, read with one
-// SHOW COLUMNS, or nil when the table does not exist.
+// forkTableColumnNames returns the column names on table (forkName keys),
+// read with one SHOW COLUMNS, or nil when the table does not exist.
 func forkTableColumnNames(ctx context.Context, db DBConn, table string) (map[string]bool, error) {
 	rows, err := db.QueryContext(ctx, "SHOW COLUMNS FROM `"+table+"`")
 	if err != nil {
@@ -324,7 +429,7 @@ func forkTableColumnNames(ctx context.Context, db DBConn, table string) (map[str
 			return nil, fmt.Errorf("listing columns on %s: %w", table, err)
 		}
 		if len(cells) > 0 {
-			names[string(cells[0])] = true
+			names[forkName(string(cells[0]))] = true
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -333,8 +438,8 @@ func forkTableColumnNames(ctx context.Context, db DBConn, table string) (map[str
 	return names, nil
 }
 
-// forkTableIndexNames returns the index names on table, read with one
-// SHOW INDEX, or nil when the table does not exist.
+// forkTableIndexNames returns the index names on table (forkName keys), read
+// with one SHOW INDEX, or nil when the table does not exist.
 func forkTableIndexNames(ctx context.Context, db DBConn, table string) (map[string]bool, error) {
 	rows, err := db.QueryContext(ctx, "SHOW INDEX FROM `"+table+"`")
 	if err != nil {
@@ -370,7 +475,7 @@ func forkTableIndexNames(ctx context.Context, db DBConn, table string) (map[stri
 		if err := rows.Scan(dest...); err != nil {
 			return nil, fmt.Errorf("listing indexes on %s: %w", table, err)
 		}
-		names[string(cells[keyCol])] = true
+		names[forkName(string(cells[keyCol]))] = true
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("listing indexes on %s: %w", table, err)
@@ -394,6 +499,25 @@ func forkTableIndexNames(ctx context.Context, db DBConn, table string) (map[stri
 // protects never see it; and a wisps that stays dirty indefinitely would keep
 // needsForkIndexes true, putting every open on the locked migration path.
 func ensureForkIndexes(ctx context.Context, db DBConn, dirtyBefore map[string]dirtyTableState, resume map[string]bool) (changed bool, err error) {
+	return ensureForkObjects(ctx, db, dirtyBefore, resume, func(string) bool { return true })
+}
+
+// ensureCloneLocalForkObjects adds the missing fork columns and indexes of the
+// dolt_ignored, clone-local tables (wisps, wisp_dependencies) and of no other
+// table. It is the whole of the migration work of an open whose only need is
+// there (forkNeedCloneLocal, bd-30lnk, review bd-8b72l findings 1 and 2): those
+// tables are never staged or committed, so the open takes none of the pass's
+// steps for committed data. It does not unstage a user's staged tables, it
+// does not refuse a dirty dependencies, it does not re-key dependency ids, and
+// it runs no DOLT_ADD and no commit, so HEAD does not move. No table it
+// touches is in a dirty-table map (they are not committable), so it runs with
+// none.
+func ensureCloneLocalForkObjects(ctx context.Context, db DBConn) (bool, error) {
+	return ensureForkObjects(ctx, db, nil, nil, func(table string) bool { return !forkCommittedTables[table] })
+}
+
+// ensureForkObjects is ensureForkIndexes on the tables include accepts.
+func ensureForkObjects(ctx context.Context, db DBConn, dirtyBefore map[string]dirtyTableState, resume map[string]bool, include func(table string) bool) (changed bool, err error) {
 	skipped := make(map[string]bool)
 	// skipDirty reports a committable table with uncommitted changes that are
 	// not the step's own; a dolt_ignored table is never in dirtyBefore (see
@@ -411,7 +535,7 @@ func ensureForkIndexes(ctx context.Context, db DBConn, dirtyBefore map[string]di
 
 	columns := make(map[string]map[string]bool)
 	for _, col := range forkColumns {
-		if skipDirty(col.Table) {
+		if !include(col.Table) || skipDirty(col.Table) {
 			continue
 		}
 		names, ok := columns[col.Table]
@@ -421,7 +545,7 @@ func ensureForkIndexes(ctx context.Context, db DBConn, dirtyBefore map[string]di
 			}
 			columns[col.Table] = names
 		}
-		if names == nil || names[col.Name] {
+		if names == nil || names[forkName(col.Name)] {
 			continue
 		}
 		if _, execErr := db.ExecContext(ctx, col.DDL); execErr != nil {
@@ -440,7 +564,7 @@ func ensureForkIndexes(ctx context.Context, db DBConn, dirtyBefore map[string]di
 
 	present := make(map[string]map[string]bool)
 	for _, idx := range forkIndexes {
-		if skipDirty(idx.Table) {
+		if !include(idx.Table) || skipDirty(idx.Table) {
 			continue
 		}
 		if names, probed := columns[idx.Table]; probed && names == nil {
@@ -453,7 +577,7 @@ func ensureForkIndexes(ctx context.Context, db DBConn, dirtyBefore map[string]di
 			}
 			present[idx.Table] = names
 		}
-		if names == nil || names[idx.Name] {
+		if names == nil || names[forkName(idx.Name)] {
 			continue
 		}
 		if _, execErr := db.ExecContext(ctx, idx.DDL); execErr != nil {
@@ -810,9 +934,9 @@ func normalizeDefinition(s string) string {
 }
 
 // forkIndexesSQL returns the DDL statements, each ending in ";\n", for the
-// fresh bundle: the issues columns, then the issues indexes. The bundle
-// creates no wisps, so the wisps columns and indexes are left to the runtime
-// step.
+// fresh bundle: the issues columns, then the issues indexes. The wisps and
+// wisp_dependencies columns and indexes are left to the runtime step, which
+// adds them at the first writable open: those tables are clone-local.
 func forkIndexesSQL() string {
 	var b strings.Builder
 	for _, col := range forkColumns {

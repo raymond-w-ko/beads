@@ -542,7 +542,41 @@ func seedDoltIgnorePatterns(ctx context.Context, db DBConn) (bool, error) {
 // short-circuit nothing downstream would ever commit the seed, and on the
 // migration path the seed must be committed before the first step so an
 // interrupted pass leaves a clean working set (#4566 self-heal contract).
+//
+// DOLT_ADD('dolt_ignore') stages only the seed, but DOLT_COMMIT commits the
+// whole staging area: with a user's table staged, the seed commit carried that
+// table into HEAD (review bd-8fwl1 finding 1). So when any table but
+// dolt_ignore is staged, the seed is not committed and nothing is unstaged for
+// it: it stays a working-set change of dolt_ignore, which the next commit of
+// the working set takes (DoltStore.Commit stages every dirty committable
+// table, dolt_ignore with them; a whole migration pass stages it in its final
+// commit). A later open does not report it again: seedDoltIgnorePatterns finds
+// the rows present in the working set and inserts none, so it reports a seed
+// change only for a row still missing, and then commits dolt_ignore with the
+// rows left here. The callers that do not unstage first get this: the no-work
+// branch and the clone-local step. The whole pass unstages pre-existing tables
+// first and commits with commitDoltIgnoreSeed.
 func commitSeededDoltIgnore(ctx context.Context, db DBConn) error {
+	dirty, err := dirtyTables(ctx, db, false)
+	if err != nil {
+		return fmt.Errorf("reading staged tables before the dolt_ignore seed commit: %w", err)
+	}
+	var staged []string
+	for _, table := range sortedDirtyTableNames(dirty) {
+		if dirty[table].staged && !strings.EqualFold(table, "dolt_ignore") {
+			staged = append(staged, table)
+		}
+	}
+	if len(staged) > 0 {
+		log.Printf("schema: left the dolt_ignore seed uncommitted: tables are staged (%s); the next commit of the working set takes it", strings.Join(staged, ", "))
+		return nil
+	}
+	return commitDoltIgnoreSeed(ctx, db)
+}
+
+// commitDoltIgnoreSeed stages dolt_ignore and commits the staging area. Only a
+// caller that knows nothing else is staged calls it directly.
+func commitDoltIgnoreSeed(ctx context.Context, db DBConn) error {
 	if err := DrainCall(ctx, db, "CALL DOLT_ADD('dolt_ignore')"); err != nil {
 		return fmt.Errorf("staging seeded dolt_ignore patterns: %w", err)
 	}
@@ -701,11 +735,34 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 // the open-time reconciles above it have exactly one place to contribute to
 // the reported total.
 func migrateUpAfterReconcile(ctx context.Context, db DBConn, seedChanged bool) (int, error) {
-	needed, err := migrationWorkNeeded(ctx, db)
+	work, err := migrationWork(ctx, db)
 	if err != nil {
 		return 0, fmt.Errorf("checking schema migration work: %w", err)
 	}
-	if !needed {
+	if work == migrationWorkCloneLocal {
+		// The only work is a fork column or index on a dolt_ignored,
+		// clone-local table (bd-30lnk, review bd-8b72l findings 1 and 2). Such
+		// a table is never staged or committed, so none of the pass below
+		// applies to it: entering the pass unstaged a user's staged tables,
+		// refused a dirty dependencies and re-keyed dependency ids into a new
+		// HEAD, all for an index no commit carries. Add the objects and
+		// nothing else, still under the caller's migration lock. The seed is
+		// committed as the no-work branch commits it, and like there not
+		// while another table is staged (commitSeededDoltIgnore). migrationWork
+		// routes here only when every table it adds to is ignored in this
+		// database, so the objects of a tracked wisps or wisp_dependencies
+		// are the whole pass's, which commits them.
+		if seedChanged {
+			if err := commitSeededDoltIgnore(ctx, db); err != nil {
+				return 0, err
+			}
+		}
+		if _, err := ensureCloneLocalForkObjects(ctx, db); err != nil {
+			return 0, fmt.Errorf("fork indexes: %w", err)
+		}
+		return 0, nil
+	}
+	if work == migrationWorkNone {
 		// No migration pass will run, so nothing downstream commits the seed:
 		// it would sit as an uncommitted working-set diff until an unrelated
 		// write/pull sweeps it into its commit (and a read-only repo carries
@@ -738,8 +795,9 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, seedChanged bool) (
 	// retry sees a dirty working set and refuses to converge. Commit the seed
 	// scoped and labeled now, after pre-existing staged tables were unstaged
 	// (so nothing else rides into the commit) and before the first step runs.
+	// Nothing else is staged here, so it needs no staged-table check.
 	if seedChanged {
-		if err := commitSeededDoltIgnore(ctx, db); err != nil {
+		if err := commitDoltIgnoreSeed(ctx, db); err != nil {
 			return 0, err
 		}
 	}
@@ -990,6 +1048,76 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, seedChanged bool) (
 // pass (see rekeyAuxRowIDsPending). Making a repaired DB re-converge immediately
 // would mean folding that drift record in here — a deliberate non-goal for now.
 func migrationWorkNeeded(ctx context.Context, db DBConn) (bool, error) {
+	needed, err := numberedMigrationWorkNeeded(ctx, db)
+	if err != nil || needed {
+		return needed, err
+	}
+	// The fork indexes add no pending version, so without this an at-latest
+	// database returns at the top of the pass and never gets them.
+	return needsForkIndexes(ctx, db)
+}
+
+// migrationWorkKind is what migrationWork found to do.
+type migrationWorkKind int
+
+const (
+	migrationWorkNone migrationWorkKind = iota
+	// migrationWorkCloneLocal: nothing but fork columns or indexes on
+	// clone-local tables (forkNeedCloneLocal) that this database's dolt_ignore
+	// ignores, which migrateUpAfterReconcile adds without the whole pass.
+	migrationWorkCloneLocal
+	// migrationWorkFull: anything else; the whole pass, which also adds the
+	// clone-local fork objects.
+	migrationWorkFull
+)
+
+// migrationWork is migrationWorkNeeded's question with the kind of work in the
+// answer. On a database with no fork object missing it sends the same
+// statements in the same order; only when one is missing does it read more.
+//
+// Clone-local is what this database ignores, not a table's name (review
+// bd-8fwl1 finding 2): an operator can un-ignore wisps or wisp_% in
+// dolt_ignore (the seeder keeps such an ignored=false row), and such a table is
+// versioned, so an object added to it must reach HEAD, which only the whole
+// pass does. The short step is taken only when every clone-local table that
+// lacks a fork object is actively ignored here (tableActivelyIgnored, which
+// declines, and so sends the open to the whole pass, where a wildcard
+// ignored=false row matches and no exact row decides). Otherwise the table
+// counts as a committed one: the whole pass stages and commits the object.
+func migrationWork(ctx context.Context, db DBConn) (migrationWorkKind, error) {
+	needed, err := numberedMigrationWorkNeeded(ctx, db)
+	if err != nil {
+		return migrationWorkNone, err
+	}
+	if needed {
+		return migrationWorkFull, nil
+	}
+	// The fork indexes add no pending version, so without this an at-latest
+	// database returns at the top of the pass and never gets them.
+	need, lacking, err := forkIndexesNeedTables(ctx, db, true)
+	switch {
+	case err != nil:
+		return migrationWorkNone, err
+	case need == forkNeedCommitted:
+		return migrationWorkFull, nil
+	case need == forkNeedNone:
+		return migrationWorkNone, nil
+	}
+	for _, table := range lacking {
+		ignored, err := tableActivelyIgnored(ctx, db, "", table)
+		if err != nil {
+			return migrationWorkNone, fmt.Errorf("reading whether %s is ignored: %w", table, err)
+		}
+		if !ignored {
+			return migrationWorkFull, nil
+		}
+	}
+	return migrationWorkCloneLocal, nil
+}
+
+// numberedMigrationWorkNeeded is migrationWorkNeeded without the fork step:
+// the cursors, the content_hash columns and the custom-table backfill.
+func numberedMigrationWorkNeeded(ctx context.Context, db DBConn) (bool, error) {
 	if !mainSource.atLatest(ctx, db) || !ignoredSource.atLatest(ctx, db) {
 		return true, nil
 	}
@@ -1012,13 +1140,7 @@ func migrationWorkNeeded(ctx context.Context, db DBConn) (bool, error) {
 	if !hasIgnoredHash {
 		return true, nil
 	}
-	needsBackfill, err := needsBackfilledCustomStatusesCustomTypes(ctx, db)
-	if err != nil || needsBackfill {
-		return needsBackfill, err
-	}
-	// The fork indexes add no pending version, so without this an at-latest
-	// database returns at the top of the pass and never gets them.
-	return needsForkIndexes(ctx, db)
+	return needsBackfilledCustomStatusesCustomTypes(ctx, db)
 }
 
 func committableDirtyTables(ctx context.Context, db DBConn) (map[string]dirtyTableState, error) {

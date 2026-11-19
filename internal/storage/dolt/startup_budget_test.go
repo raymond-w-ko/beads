@@ -44,7 +44,10 @@ import (
 //     finding 1) replaced SHOW COLUMNS FROM `issues` and SHOW INDEX FROM
 //     `issues` with SHOW CREATE TABLE `issues` and SHOW CREATE TABLE `issues`
 //     AS OF 'HEAD' (the gate reads HEAD too, so a lost schema commit is
-//     seen), so the count stays 30.
+//     seen), so the count stays 30. bd-hapoo's idx_wisp_dep_external_target
+//     (the dependents count's external branch on wisp_dependencies) added one
+//     probe, 30 to 31: SHOW INDEX FROM `wisp_dependencies` (no SHOW COLUMNS:
+//     the table has no fork column).
 func TestServerOpenStatementBudget(t *testing.T) {
 	skipIfNoDolt(t)
 	acquireTestSlot()
@@ -79,7 +82,7 @@ func TestServerOpenStatementBudget(t *testing.T) {
 		wantCmds  int
 	}{
 		{name: "read-only", readOnly: true, wantConns: 2, wantCmds: 4},
-		{name: "writable", readOnly: false, wantConns: 2, wantCmds: 30},
+		{name: "writable", readOnly: false, wantConns: 2, wantCmds: 31},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			cfg := f.config()

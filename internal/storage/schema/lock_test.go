@@ -257,6 +257,7 @@ func TestMigrateUpSeedsIgnorePatternsWhenNoWorkNeeded(t *testing.T) {
 	expectForkIndexesPresent(mock)
 	// The seed inserted rows and no migration pass follows to commit them, so
 	// MigrateUp must commit the heal itself, scoped and labeled.
+	expectDoltStatusRows(mock) // nothing else is staged (review bd-8fwl1 finding 1)
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD('dolt_ignore')")).
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', 'schema: seed dolt_ignore patterns')")).
@@ -271,6 +272,45 @@ func TestMigrateUpSeedsIgnorePatternsWhenNoWorkNeeded(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet SQL expectations (ignore-pattern seed must run before the no-work short-circuit and be committed when it changed rows): %v", err)
+	}
+}
+
+// TestMigrateUpLeavesSeedUncommittedWhileStaged is the no-work branch of
+// TestMigrateUpSeedsIgnorePatternsWhenNoWorkNeeded with a user's table staged
+// (review bd-8fwl1 finding 1): DOLT_COMMIT commits the whole staging area, so
+// the seed commit would carry that table into HEAD. The seed is left a
+// working-set change of dolt_ignore: no DOLT_ADD and no DOLT_COMMIT.
+func TestMigrateUpLeavesSeedUncommittedWhileStaged(t *testing.T) {
+	failOnSwallowedAdvisory(t)
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer db.Close()
+
+	expectIgnorePatternSeed(mock, LatestVersion())
+	expectIgnoredCursorHealNoop(mock)
+	expectCursorProbe(mock, "schema_migrations", true)
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion())
+	expectCursorProbe(mock, "ignored_schema_migrations", true)
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", LatestIgnoredVersion())
+	expectIgnoredSentinelProbes(mock, true)
+	expectContentHashColumnExists(mock)
+	expectContentHashColumnExists(mock)
+	expectScalar(mock, "SELECT COUNT(*) FROM custom_types", "count", 1)
+	expectScalar(mock, "SELECT COUNT(*) FROM custom_statuses", "count", 1)
+	expectForkIndexesPresent(mock)
+	expectDirtyDoltStatusRow(mock, "issues", true)
+
+	applied, err := MigrateUp(context.Background(), db)
+	if err != nil {
+		t.Fatalf("MigrateUp() error = %v", err)
+	}
+	if applied != 0 {
+		t.Fatalf("MigrateUp() applied = %d, want 0", applied)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
 	}
 }
 

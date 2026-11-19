@@ -15,14 +15,9 @@ import (
 // expression read every edge: a full Table scan of `dependencies`, 150-220 ms
 // on a 112k-edge fleet database (bd-o24uj). The production statement is one
 // UNION ALL branch per target column, so each branch must seek the index on
-// its own column.
-//
-// `wisp_dependencies` as migration 0021 creates it (the shape this test
-// database has) has no index leading with depends_on_external outside the
-// (type, target) composites, so its external branch scans; only databases that
-// ran 0047 or ignored/0003 carry idx_wisp_dep_external_target. Adding that
-// index is a schema change this test does not ask for, so on
-// `wisp_dependencies` it asserts the issue and wisp branches only.
+// its own column, on both tables: the fork schema step adds
+// idx_wisp_dep_external_target to `wisp_dependencies` (schema/fork_indexes.go,
+// bd-hapoo), so its external branch seeks too.
 func TestCountDependentsPlanIsIndexed(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
@@ -56,7 +51,7 @@ func TestCountDependentsPlanIsIndexed(t *testing.T) {
 		columns []string
 	}{
 		{"dependencies", []string{"depends_on_issue_id", "depends_on_wisp_id", "depends_on_external"}},
-		{"wisp_dependencies", []string{"depends_on_issue_id", "depends_on_wisp_id"}},
+		{"wisp_dependencies", []string{"depends_on_issue_id", "depends_on_wisp_id", "depends_on_external"}},
 	} {
 		prod := issueops.DepTargetCountQuery(c.table, "")
 		// The target id at every ? (twice per branch).
@@ -72,8 +67,8 @@ func TestCountDependentsPlanIsIndexed(t *testing.T) {
 				t.Errorf("%s dependents count does not seek an index on %s (want %q in an IndexedTableAccess).\nSQL: %s\nplan:\n%s", c.table, col, want, prod, plan)
 			}
 		}
-		if c.table == "dependencies" && hasBareTableScan(plan) {
-			t.Errorf("dependencies dependents count still has a bare Table scan.\nSQL: %s\nplan:\n%s", prod, plan)
+		if hasBareTableScan(plan) {
+			t.Errorf("%s dependents count still has a bare Table scan.\nSQL: %s\nplan:\n%s", c.table, prod, plan)
 		}
 	}
 }

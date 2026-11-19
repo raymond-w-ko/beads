@@ -15,12 +15,8 @@ import (
 // Filtering on the COALESCE target expression read every edge: a full Table
 // scan of `dependencies`, 112k rows on a fleet database. Both statements are
 // one UNION ALL branch per target column, so each branch must seek the index
-// on its own column.
-//
-// As in TestCountDependentsPlanIsIndexed, `wisp_dependencies` as migration
-// 0021 creates it has no index led by depends_on_external, so its external
-// branch may scan; on that table only the issue and wisp branches are
-// asserted. A later batch adds the index and tightens this.
+// on its own column, on both tables (the fork schema step adds
+// idx_wisp_dep_external_target to `wisp_dependencies`, bd-hapoo).
 func TestDependentsRowsPlanIsIndexed(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
@@ -42,7 +38,6 @@ func TestDependentsRowsPlanIsIndexed(t *testing.T) {
 	}
 
 	allTargets := []string{"depends_on_issue_id", "depends_on_wisp_id", "depends_on_external"}
-	wispTargets := []string{"depends_on_issue_id", "depends_on_wisp_id"}
 
 	// Site 4: one statement per dependency table, the target id at each ?
 	// (three today, one per branch).
@@ -51,7 +46,7 @@ func TestDependentsRowsPlanIsIndexed(t *testing.T) {
 		columns []string
 	}{
 		{"dependencies", allTargets},
-		{"wisp_dependencies", wispTargets},
+		{"wisp_dependencies", allTargets},
 	} {
 		prod := issueops.DepTargetRowsQuery(c.table)
 		plan := explainPlan(t, ctx, store.db, literalizeParams(prod, targetLiterals(prod, "'dp-target'")...))
@@ -59,8 +54,8 @@ func TestDependentsRowsPlanIsIndexed(t *testing.T) {
 			t.Skipf("EXPLAIN output not in a recognized Dolt plan format, skipping index assertion; plan=\n%s", plan)
 		}
 		assertSeeksTargets(t, "dependents rows", c.table, c.columns, prod, plan)
-		if c.table == "dependencies" && hasBareTableScan(plan) {
-			t.Errorf("dependencies dependents rows still have a bare Table scan.\nSQL: %s\nplan:\n%s", prod, plan)
+		if hasBareTableScan(plan) {
+			t.Errorf("%s dependents rows still have a bare Table scan.\nSQL: %s\nplan:\n%s", c.table, prod, plan)
 		}
 	}
 
@@ -71,9 +66,11 @@ func TestDependentsRowsPlanIsIndexed(t *testing.T) {
 		t.Skipf("EXPLAIN output not in a recognized Dolt plan format, skipping index assertion; plan=\n%s", plan)
 	}
 	assertSeeksTargets(t, "dependents iter", "dependencies", allTargets, prod, plan)
-	assertSeeksTargets(t, "dependents iter", "wisp_dependencies", wispTargets, prod, plan)
-	if hasBareTableScanOf(plan, "dependencies") {
-		t.Errorf("dependents iter still has a bare Table scan of dependencies.\nSQL: %s\nplan:\n%s", prod, plan)
+	assertSeeksTargets(t, "dependents iter", "wisp_dependencies", allTargets, prod, plan)
+	for _, table := range []string{"dependencies", "wisp_dependencies"} {
+		if hasBareTableScanOf(plan, table) {
+			t.Errorf("dependents iter still has a bare Table scan of %s.\nSQL: %s\nplan:\n%s", table, prod, plan)
+		}
 	}
 }
 

@@ -77,7 +77,8 @@ func TestForkIndexesSQLNamesEveryIndexWithDirectDDL(t *testing.T) {
 // expectForkIndexesPresent mocks needsForkIndexes on a database that already
 // carries every fork column and index, committed: for issues (a table the
 // step commits) one SHOW CREATE TABLE of the working table and one of HEAD,
-// then for wisps (dolt_ignored) one SHOW COLUMNS and one SHOW INDEX.
+// then for wisps (dolt_ignored) one SHOW COLUMNS and one SHOW INDEX, then for
+// wisp_dependencies (dolt_ignored, no fork column) one SHOW INDEX.
 func expectForkIndexesPresent(mock sqlmock.Sqlmock) {
 	for _, table := range forkTables() {
 		if forkCommittedTables[table] {
@@ -85,17 +86,21 @@ func expectForkIndexesPresent(mock sqlmock.Sqlmock) {
 			expectForkCreateTable(mock, table, " AS OF 'HEAD'", nil)
 			continue
 		}
-		expectForkColumnsPresent(mock, table)
+		if forkTableHasColumns(table) {
+			expectForkColumnsPresent(mock, table)
+		}
 		expectForkIndexNamesPresent(mock, table)
 	}
 }
 
 // expectForkStepPresent mocks ensureForkIndexes, the step itself, on the same
-// database: one SHOW COLUMNS per column table, then one SHOW INDEX per index
-// table (issues, then wisps), and no DDL.
+// database: one SHOW COLUMNS per column table (issues, wisps), then one SHOW
+// INDEX per index table (issues, wisps, wisp_dependencies), and no DDL.
 func expectForkStepPresent(mock sqlmock.Sqlmock) {
 	for _, table := range forkTables() {
-		expectForkColumnsPresent(mock, table)
+		if forkTableHasColumns(table) {
+			expectForkColumnsPresent(mock, table)
+		}
 	}
 	for _, table := range forkTables() {
 		expectForkIndexNamesPresent(mock, table)
@@ -149,7 +154,8 @@ func expectForkCreateTable(mock sqlmock.Sqlmock, table, asOf string, omit map[st
 // fresh database before the ignored series makes it) needs no column or index:
 // needsForkIndexes says false without a SHOW INDEX FROM wisps, and
 // ensureForkIndexes runs no DDL and no error. A wisps whose column probe
-// answers and whose index probe finds it gone counts as absent too.
+// answers and whose index probe finds it gone counts as absent too. The
+// wisp_dependencies index is probed after wisps either way (present here).
 func TestForkIndexesSkipAbsentWisps(t *testing.T) {
 	notFound := errors.New("Error 1146 (HY000): table not found: wisps")
 	expectIssuesProbed := func(mock sqlmock.Sqlmock, probe string) {
@@ -169,9 +175,11 @@ func TestForkIndexesSkipAbsentWisps(t *testing.T) {
 			var got bool
 			var err error
 			if probe == "needsForkIndexes" {
+				expectForkIndexNamesPresent(mock, "wisp_dependencies")
 				got, err = needsForkIndexes(context.Background(), db)
 			} else {
 				expectForkIndexNamesPresent(mock, "issues")
+				expectForkIndexNamesPresent(mock, "wisp_dependencies")
 				got, err = ensureForkIndexes(context.Background(), db, nil, nil)
 			}
 			if got || err != nil {
@@ -188,8 +196,46 @@ func TestForkIndexesSkipAbsentWisps(t *testing.T) {
 		expectIssuesProbed(mock, "needsForkIndexes")
 		expectForkColumnsPresent(mock, "wisps")
 		mock.ExpectQuery(regexp.QuoteMeta("SHOW INDEX FROM `wisps`")).WillReturnError(notFound)
+		expectForkIndexNamesPresent(mock, "wisp_dependencies")
 		if got, err := needsForkIndexes(context.Background(), db); got || err != nil {
 			t.Errorf("needsForkIndexes with wisps gone = %v, %v; want false, nil", got, err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet SQL expectations: %v", err)
+		}
+	})
+}
+
+// TestForkIndexesSkipAbsentWispDependencies: a wisp_dependencies that does not
+// exist (the ignored series has not made it) is no probe failure and gets no
+// DDL: needsForkIndexes says false, and ensureForkIndexes runs no ALTER and
+// returns no error. wisp_dependencies has no fork column, so neither function
+// sends SHOW COLUMNS FROM it: its one probe is SHOW INDEX.
+func TestForkIndexesSkipAbsentWispDependencies(t *testing.T) {
+	notFound := errors.New("Error 1146 (HY000): table not found: wisp_dependencies")
+	t.Run("needsForkIndexes", func(t *testing.T) {
+		db, mock := newMockDB(t)
+		expectForkCreateTable(mock, "issues", "", nil)
+		expectForkCreateTable(mock, "issues", " AS OF 'HEAD'", nil)
+		expectForkColumnsPresent(mock, "wisps")
+		expectForkIndexNamesPresent(mock, "wisps")
+		mock.ExpectQuery(regexp.QuoteMeta("SHOW INDEX FROM `wisp_dependencies`")).WillReturnError(notFound)
+		if got, err := needsForkIndexes(context.Background(), db); got || err != nil {
+			t.Errorf("needsForkIndexes with no wisp_dependencies = %v, %v; want false, nil", got, err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet SQL expectations: %v", err)
+		}
+	})
+	t.Run("ensureForkIndexes", func(t *testing.T) {
+		db, mock := newMockDB(t)
+		expectForkColumnsPresent(mock, "issues")
+		expectForkColumnsPresent(mock, "wisps")
+		expectForkIndexNamesPresent(mock, "issues")
+		expectForkIndexNamesPresent(mock, "wisps")
+		mock.ExpectQuery(regexp.QuoteMeta("SHOW INDEX FROM `wisp_dependencies`")).WillReturnError(notFound)
+		if got, err := ensureForkIndexes(context.Background(), db, nil, nil); got || err != nil {
+			t.Errorf("ensureForkIndexes with no wisp_dependencies = %v, %v; want false, nil", got, err)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Errorf("unmet SQL expectations: %v", err)

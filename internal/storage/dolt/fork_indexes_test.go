@@ -1743,3 +1743,861 @@ func TestForkIndexesStandingUserRowsLeftAlone(t *testing.T) {
 		t.Errorf("issues has %d dolt_status rows after the user's commit and an open, want 0", n)
 	}
 }
+
+// wispDepExternalTarget is the wisp_dependencies index the fork step adds for
+// the dependents count's external branch (bd-1gxdn, bd-hapoo), with the name
+// and definition of migrations 0047 and ignored/0003.
+const (
+	wispDepExternalTarget    = "idx_wisp_dep_external_target"
+	wispDepExternalTargetDDL = "ALTER TABLE wisp_dependencies ADD INDEX idx_wisp_dep_external_target (depends_on_external)"
+)
+
+// wispDepExternalTargetColumns returns the column list of
+// idx_wisp_dep_external_target on wisp_dependencies, in index order, or nil
+// when it is absent.
+func wispDepExternalTargetColumns(t *testing.T, ctx context.Context, db *sql.DB) []string {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, `
+		SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'wisp_dependencies' AND INDEX_NAME = ?
+		ORDER BY SEQ_IN_INDEX`, wispDepExternalTarget)
+	if err != nil {
+		t.Fatalf("read %s columns: %v", wispDepExternalTarget, err)
+	}
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			t.Fatalf("scan %s column: %v", wispDepExternalTarget, err)
+		}
+		cols = append(cols, c)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read %s columns: %v", wispDepExternalTarget, err)
+	}
+	return cols
+}
+
+// forkStatementLog records the DDL statements an open sends through a gate
+// proxy (forkStatementProxy).
+type forkStatementLog struct {
+	mu   sync.Mutex
+	ddls []string
+}
+
+func (l *forkStatementLog) record(desc string) {
+	upper := strings.ToUpper(desc)
+	if strings.HasPrefix(upper, "ALTER TABLE") || strings.HasPrefix(upper, "CREATE INDEX") || strings.HasPrefix(upper, "DROP INDEX") {
+		l.mu.Lock()
+		l.ddls = append(l.ddls, desc)
+		l.mu.Unlock()
+	}
+}
+
+func (l *forkStatementLog) all() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.ddls)
+}
+
+// forkStatementProxy is a gate proxy to the test server that forwards every
+// command and records the DDL among them.
+func forkStatementProxy(t *testing.T) (int, *forkStatementLog) {
+	t.Helper()
+	log := &forkStatementLog{}
+	port := startForkGateProxy(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(testServerPort)), func(desc string) bool {
+		log.record(desc)
+		return true
+	})
+	return port, log
+}
+
+// forkOpenConfig is a writable open of the store's database through port.
+func forkOpenConfig(t *testing.T, store *DoltStore, port int) *Config {
+	return &Config{Path: t.TempDir(), Database: store.database, ServerHost: "127.0.0.1", ServerPort: port,
+		ServerUser: "root", CommitterName: "test", CommitterEmail: "test@example.com"}
+}
+
+// openAndClose runs one writable open of cfg and closes the store.
+func openAndClose(ctx context.Context, cfg *Config) error {
+	s, err := New(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	return s.Close()
+}
+
+// TestForkIndexWispDepExternalTarget (bd-1gxdn): migration 0021 creates
+// wisp_dependencies without an index led by depends_on_external; the fork step
+// adds idx_wisp_dep_external_target on a fresh database, and a dropped one
+// comes back at the next writable open with nothing added to dolt_status and
+// HEAD unchanged (the table is dolt_ignored: nothing is staged or committed).
+func TestForkIndexWispDepExternalTarget(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	if got := wispDepExternalTargetColumns(t, ctx, store.db); !slices.Equal(got, []string{"depends_on_external"}) {
+		t.Fatalf("a fresh database's %s columns = %v, want [depends_on_external]", wispDepExternalTarget, got)
+	}
+	execAll(t, ctx, store.db, "ALTER TABLE wisp_dependencies DROP INDEX "+wispDepExternalTarget)
+	if got := wispDepExternalTargetColumns(t, ctx, store.db); got != nil {
+		t.Fatalf("%s still present after DROP INDEX: %v", wispDepExternalTarget, got)
+	}
+	head, commits := doltHead(t, ctx, store.db), doltLogCount(t, ctx, store.db)
+	// The fixture's own rows (config) may sit in dolt_status; the step must
+	// add none, and wisp_dependencies, dolt_ignored, never shows.
+	status := doltStatusCount(t, ctx, store.db)
+	if n := doltStatusRowsFor(t, ctx, store.db, "wisp_dependencies"); n != 0 {
+		t.Fatalf("wisp_dependencies has %d dolt_status rows after dropping the index, want 0 (dolt_ignored)", n)
+	}
+
+	port, log := forkStatementProxy(t)
+	if err := openAndClose(ctx, forkOpenConfig(t, store, port)); err != nil {
+		t.Fatalf("writable open after the drop: %v", err)
+	}
+	if got := wispDepExternalTargetColumns(t, ctx, store.db); !slices.Equal(got, []string{"depends_on_external"}) {
+		t.Errorf("%s columns after the next open = %v, want [depends_on_external]", wispDepExternalTarget, got)
+	}
+	if ddls := log.all(); !slices.Equal(ddls, []string{wispDepExternalTargetDDL}) {
+		t.Errorf("the open sent DDL %q, want only %q", ddls, wispDepExternalTargetDDL)
+	}
+	if n := doltStatusRowsFor(t, ctx, store.db, "wisp_dependencies"); n != 0 {
+		t.Errorf("wisp_dependencies has %d dolt_status rows after the index came back, want 0", n)
+	}
+	if n := doltStatusCount(t, ctx, store.db); n != status {
+		t.Errorf("dolt_status has %d rows after the index came back, want the %d from before the open", n, status)
+	}
+	if got := doltHead(t, ctx, store.db); got != head {
+		t.Errorf("HEAD moved %s -> %s: something was committed for a dolt_ignored table", head, got)
+	}
+	if got := doltLogCount(t, ctx, store.db); got != commits {
+		t.Errorf("%d new commits, want 0", got-commits)
+	}
+}
+
+// TestForkIndexWispDepExternalTargetAlreadyPresent: a wisp_dependencies that
+// already has the index, as one that came through migration 0047 or
+// ignored/0003 does (their statement, run here by hand), gets no DDL at the
+// next writable open.
+func TestForkIndexWispDepExternalTargetAlreadyPresent(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	execAll(t, ctx, store.db, "ALTER TABLE wisp_dependencies DROP INDEX "+wispDepExternalTarget, wispDepExternalTargetDDL)
+	head := doltHead(t, ctx, store.db)
+	port, log := forkStatementProxy(t)
+	if err := openAndClose(ctx, forkOpenConfig(t, store, port)); err != nil {
+		t.Fatalf("writable open: %v", err)
+	}
+	if ddls := log.all(); len(ddls) != 0 {
+		t.Errorf("the open of a database that has %s sent DDL %q, want none", wispDepExternalTarget, ddls)
+	}
+	if got := wispDepExternalTargetColumns(t, ctx, store.db); !slices.Equal(got, []string{"depends_on_external"}) {
+		t.Errorf("%s columns = %v, want [depends_on_external]", wispDepExternalTarget, got)
+	}
+	if got := doltHead(t, ctx, store.db); got != head {
+		t.Errorf("HEAD moved %s -> %s on an open with nothing to do", head, got)
+	}
+}
+
+// TestForkIndexCloneLocalCancelledFinished: the first writable open after a
+// clone-local fork index is lost (the wisp_dependencies index; a wisps key
+// index) is cancelled at the step's ALTER while it holds the migration lock (a
+// gate proxy holds the statement until the cancel, then drops the session).
+// Two more writable opens wait for the lock meanwhile. When the first session
+// goes, one of them finishes the step, and the other, taking the lock after
+// it, finds nothing to do: the ALTER is sent once between them, the index is
+// back, nothing is added to dolt_status, and HEAD does not move (the short
+// clone-local step, bd-30lnk).
+func TestForkIndexCloneLocalCancelledFinished(t *testing.T) {
+	for _, target := range cloneLocalForkTargets {
+		t.Run(target.name, func(t *testing.T) {
+			store, cleanup := setupConcurrentTestStore(t)
+			defer cleanup()
+			ctx, cancel := testContext(t)
+			defer cancel()
+
+			execAll(t, ctx, store.db, target.drop())
+			head, status := doltHead(t, ctx, store.db), doltStatusCount(t, ctx, store.db)
+			upstream := net.JoinHostPort("127.0.0.1", strconv.Itoa(testServerPort))
+
+			firstCtx, cancelFirst := context.WithCancel(ctx)
+			defer cancelFirst()
+			atALTER := make(chan struct{})
+			var atOnce sync.Once
+			firstPort := startForkGateProxy(t, upstream, func(desc string) bool {
+				if desc != target.ddl {
+					return true
+				}
+				atOnce.Do(func() { close(atALTER) })
+				<-firstCtx.Done()
+				return false
+			})
+			first := make(chan error, 1)
+			go func() { first <- openAndClose(firstCtx, forkOpenConfig(t, store, firstPort)) }()
+			select {
+			case <-atALTER:
+			case err := <-first:
+				t.Fatalf("the first open returned before the step's ALTER: %v", err)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			var free int
+			if err := store.db.QueryRowContext(ctx, "SELECT IS_FREE_LOCK(?)", schema.MigrationLockName(store.database)).Scan(&free); err != nil || free != 0 {
+				t.Fatalf("the first open does not hold the migration lock at its ALTER: IS_FREE_LOCK = %d, %v", free, err)
+			}
+
+			type waiter struct {
+				log     *forkStatementLog
+				waiting chan struct{}
+				done    chan error
+			}
+			var waiters []*waiter
+			for range 2 {
+				w := &waiter{log: &forkStatementLog{}, waiting: make(chan struct{}), done: make(chan error, 1)}
+				var once sync.Once
+				port := startForkGateProxy(t, upstream, func(desc string) bool {
+					if strings.Contains(desc, "GET_LOCK(") {
+						once.Do(func() { close(w.waiting) })
+					}
+					w.log.record(desc)
+					return true
+				})
+				go func() { w.done <- openAndClose(ctx, forkOpenConfig(t, store, port)) }()
+				waiters = append(waiters, w)
+			}
+			for i, w := range waiters {
+				select {
+				case <-w.waiting:
+				case err := <-w.done:
+					t.Fatalf("waiting open %d returned before it asked for the migration lock: %v", i+1, err)
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+			}
+
+			cancelFirst()
+			if err := <-first; err == nil {
+				t.Errorf("the cancelled first open returned no error")
+			} else {
+				t.Logf("cancelled first open: %v", err)
+			}
+			alters := 0
+			for i, w := range waiters {
+				if err := <-w.done; err != nil {
+					t.Fatalf("waiting open %d: %v", i+1, err)
+				}
+				ddls := w.log.all()
+				t.Logf("waiting open %d sent DDL %q", i+1, ddls)
+				for _, d := range ddls {
+					if d != target.ddl {
+						t.Errorf("waiting open %d sent unexpected DDL %q", i+1, d)
+					}
+				}
+				alters += len(ddls)
+			}
+			if alters != 1 {
+				t.Errorf("the two waiting opens sent the step's ALTER %d times between them, want 1 (one finishes, the other finds nothing to do)", alters)
+			}
+			if got := tableIndexColumns(t, ctx, store.db, target.table, target.index); !slices.Equal(got, target.columns) {
+				t.Errorf("%s columns after the waiting opens = %v, want %v", target.index, got, target.columns)
+			}
+			if n := doltStatusRowsFor(t, ctx, store.db, target.table); n != 0 {
+				t.Errorf("%s has %d dolt_status rows after the waiting opens, want 0", target.table, n)
+			}
+			if n := doltStatusCount(t, ctx, store.db); n != status {
+				t.Errorf("dolt_status has %d rows after the waiting opens, want the %d from before", n, status)
+			}
+			if got := doltHead(t, ctx, store.db); got != head {
+				t.Errorf("HEAD moved %s -> %s: something was committed for a dolt_ignored table", head, got)
+			}
+		})
+	}
+}
+
+// TestForkIndexWispDepExternalTargetOtherDefinitionKept: the step goes by
+// name on wisp_dependencies, as it does on wisps. An index named
+// idx_wisp_dep_external_target with another column list is left as it is: the
+// open succeeds and sends no DDL.
+func TestForkIndexWispDepExternalTargetOtherDefinitionKept(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	execAll(t, ctx, store.db,
+		"ALTER TABLE wisp_dependencies DROP INDEX "+wispDepExternalTarget,
+		"ALTER TABLE wisp_dependencies ADD INDEX "+wispDepExternalTarget+" (type, depends_on_external)")
+	port, log := forkStatementProxy(t)
+	if err := openAndClose(ctx, forkOpenConfig(t, store, port)); err != nil {
+		t.Fatalf("writable open with a foreign %s: %v", wispDepExternalTarget, err)
+	}
+	if ddls := log.all(); len(ddls) != 0 {
+		t.Errorf("the open sent DDL %q, want none", ddls)
+	}
+	if got := wispDepExternalTargetColumns(t, ctx, store.db); !slices.Equal(got, []string{"type", "depends_on_external"}) {
+		t.Errorf("%s columns = %v, want the user's [type depends_on_external] left as it was", wispDepExternalTarget, got)
+	}
+}
+
+// cloneLocalForkTarget is a fork index on a dolt_ignored, clone-local table:
+// the open whose only need it is takes the short clone-local step
+// (schema.ensureCloneLocalForkObjects, bd-30lnk), not the whole pass.
+type cloneLocalForkTarget struct {
+	name, table, index, ddl string
+	columns                 []string
+}
+
+func (c cloneLocalForkTarget) drop() string {
+	return "ALTER TABLE " + c.table + " DROP INDEX " + c.index
+}
+
+var cloneLocalForkTargets = []cloneLocalForkTarget{
+	{name: "wisp_dependencies external target", table: "wisp_dependencies", index: wispDepExternalTarget, ddl: wispDepExternalTargetDDL,
+		columns: []string{"depends_on_external"}},
+	{name: "wisps key index", table: "wisps", index: "idx_wisps_everturn_key", ddl: "ALTER TABLE wisps ADD INDEX idx_wisps_everturn_key (everturn_key, created_at)",
+		columns: []string{"everturn_key", "created_at"}},
+}
+
+// settleForkFixture commits what the concurrent fixture leaves uncommitted
+// (its config rows), so the test's own uncommitted changes are the only ones.
+func settleForkFixture(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+	if doltStatusRowsFor(t, ctx, db, "config") > 0 {
+		execAll(t, ctx, db, "CALL DOLT_ADD('config')", "CALL DOLT_COMMIT('-m', 'test: settle fixture config')")
+	}
+}
+
+// TestForkIndexCloneLocalKeepsStagedRows is review bd-8b72l finding 1: on a
+// database whose only missing schema object is a clone-local fork index, a
+// user has staged one issues title and edited it again, unstaged. The open
+// adds the index and leaves the staging alone: issues is still staged, the
+// staged title is the one the user staged, the working title the one after,
+// and HEAD does not move. The whole pass unstaged it (unstagePreExistingTables).
+func TestForkIndexCloneLocalKeepsStagedRows(t *testing.T) {
+	for _, target := range cloneLocalForkTargets {
+		t.Run(target.name, func(t *testing.T) {
+			store, cleanup := setupConcurrentTestStore(t)
+			defer cleanup()
+			ctx, cancel := testContext(t)
+			defer cancel()
+
+			createPerm(t, ctx, store, "fx-staged")
+			settleForkFixture(t, ctx, store.db)
+			execAll(t, ctx, store.db,
+				"UPDATE issues SET title = 'chosen staging version' WHERE id = 'fx-staged'",
+				"CALL DOLT_ADD('issues')",
+				"UPDATE issues SET title = 'different working version' WHERE id = 'fx-staged'",
+				target.drop())
+			stagedRows := func() int {
+				t.Helper()
+				var n int
+				if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM dolt_status WHERE table_name = 'issues' AND staged").Scan(&n); err != nil {
+					t.Fatalf("count staged issues: %v", err)
+				}
+				return n
+			}
+			if stagedRows() != 1 {
+				t.Fatal("the fixture did not stage issues")
+			}
+			head := doltHead(t, ctx, store.db)
+
+			port, log := forkStatementProxy(t)
+			if err := openAndClose(ctx, forkOpenConfig(t, store, port)); err != nil {
+				t.Fatalf("writable open: %v", err)
+			}
+			var stagedTitle, workingTitle string
+			if err := store.db.QueryRowContext(ctx, "SELECT title FROM issues AS OF 'STAGED' WHERE id = 'fx-staged'").Scan(&stagedTitle); err != nil {
+				t.Fatalf("read the staged title: %v", err)
+			}
+			if err := store.db.QueryRowContext(ctx, "SELECT title FROM issues WHERE id = 'fx-staged'").Scan(&workingTitle); err != nil {
+				t.Fatalf("read the working title: %v", err)
+			}
+			t.Logf("staged_rows=%d STAGED_title=%q WORKING_title=%q DDL=%q", stagedRows(), stagedTitle, workingTitle, log.all())
+			if got := tableIndexColumns(t, ctx, store.db, target.table, target.index); !slices.Equal(got, target.columns) {
+				t.Errorf("%s columns after the open = %v, want %v", target.index, got, target.columns)
+			}
+			if ddls := log.all(); !slices.Equal(ddls, []string{target.ddl}) {
+				t.Errorf("the open sent DDL %q, want only %q", ddls, target.ddl)
+			}
+			if n := stagedRows(); n != 1 {
+				t.Errorf("issues staged rows = %d after the open, want 1 (the user's staging kept)", n)
+			}
+			if stagedTitle != "chosen staging version" {
+				t.Errorf("STAGED title = %q after the open, want the user's staged %q", stagedTitle, "chosen staging version")
+			}
+			if workingTitle != "different working version" {
+				t.Errorf("WORKING title = %q after the open, want %q", workingTitle, "different working version")
+			}
+			if got := doltHead(t, ctx, store.db); got != head {
+				t.Errorf("HEAD moved %s -> %s on an open whose only work is a clone-local index", head, got)
+			}
+		})
+	}
+}
+
+// TestForkIndexCloneLocalLeavesDirtyDependency is review bd-8b72l finding 2:
+// with a clone-local fork index missing and one uncommitted durable
+// dependency keyed by a random UUID, two writable opens succeed (the first
+// adds the index, the second has nothing to do) and leave the dependency's key
+// and HEAD alone; after the user commits it, the next open leaves the key and
+// the user's HEAD alone too. The whole pass refused the dirty dependencies
+// (re-key) and, after the user's commit, re-keyed it into a new HEAD.
+func TestForkIndexCloneLocalLeavesDirtyDependency(t *testing.T) {
+	for _, target := range cloneLocalForkTargets {
+		t.Run(target.name, func(t *testing.T) {
+			store, cleanup := setupConcurrentTestStore(t)
+			defer cleanup()
+			ctx, cancel := testContext(t)
+			defer cancel()
+
+			createPerm(t, ctx, store, "fx-dirty-src")
+			settleForkFixture(t, ctx, store.db)
+			execAll(t, ctx, store.db,
+				"INSERT INTO dependencies (id, issue_id, depends_on_external, created_by) VALUES (UUID(), 'fx-dirty-src', 'external:dirty:one', 'tester')",
+				target.drop())
+			head := doltHead(t, ctx, store.db)
+			key := func(asOf string) string {
+				t.Helper()
+				var id string
+				if err := store.db.QueryRowContext(ctx, "SELECT id FROM dependencies"+asOf+" WHERE issue_id = 'fx-dirty-src'").Scan(&id); err != nil {
+					t.Fatalf("read the dependency key%s: %v", asOf, err)
+				}
+				return id
+			}
+			before := key("")
+
+			for i, want := range [][]string{{target.ddl}, nil} {
+				port, log := forkStatementProxy(t)
+				if err := openAndClose(ctx, forkOpenConfig(t, store, port)); err != nil {
+					t.Fatalf("writable open %d with a dirty dependencies: %v", i+1, err)
+				}
+				if ddls := log.all(); !slices.Equal(ddls, want) {
+					t.Errorf("writable open %d sent DDL %q, want %q", i+1, ddls, want)
+				}
+				if got := tableIndexColumns(t, ctx, store.db, target.table, target.index); !slices.Equal(got, target.columns) {
+					t.Errorf("%s columns after open %d = %v, want %v", target.index, i+1, got, target.columns)
+				}
+				if got := key(""); got != before {
+					t.Errorf("open %d re-keyed the user's uncommitted dependency %s -> %s", i+1, before, got)
+				}
+				if got := doltHead(t, ctx, store.db); got != head {
+					t.Errorf("open %d moved HEAD %s -> %s", i+1, head, got)
+				}
+				if n := doltStatusRowsFor(t, ctx, store.db, "dependencies"); n != 1 {
+					t.Errorf("dependencies has %d dolt_status rows after open %d, want 1 (the user's row, uncommitted)", n, i+1)
+				}
+			}
+
+			execAll(t, ctx, store.db, "CALL DOLT_ADD('dependencies')", "CALL DOLT_COMMIT('-m', 'test: the user commits the dependency')")
+			committed := doltHead(t, ctx, store.db)
+			port, log := forkStatementProxy(t)
+			if err := openAndClose(ctx, forkOpenConfig(t, store, port)); err != nil {
+				t.Fatalf("writable open after the user's commit: %v", err)
+			}
+			if ddls := log.all(); len(ddls) != 0 {
+				t.Errorf("the open after the user's commit sent DDL %q, want none", ddls)
+			}
+			if got := doltHead(t, ctx, store.db); got != committed {
+				t.Errorf("the open after the user's commit moved HEAD %s -> %s", committed, got)
+			}
+			if got := key(" AS OF 'HEAD'"); got != before {
+				t.Errorf("the dependency key at HEAD = %s after the open, want the user's %s", got, before)
+			}
+		})
+	}
+}
+
+// TestForkIndexCommittedAndCloneLocalTakeWholePass: a database missing an
+// issues fork index (its drop committed, so issues is clean) and a clone-local
+// one takes the whole pass, as before bd-30lnk: the pass adds both, commits
+// issues once ('schema: apply migrations'), and leaves nothing dirty.
+func TestForkIndexCommittedAndCloneLocalTakeWholePass(t *testing.T) {
+	for _, target := range cloneLocalForkTargets {
+		t.Run(target.name, func(t *testing.T) {
+			store, cleanup := setupConcurrentTestStore(t)
+			defer cleanup()
+			ctx, cancel := testContext(t)
+			defer cancel()
+
+			settleForkFixture(t, ctx, store.db)
+			execAll(t, ctx, store.db,
+				"ALTER TABLE issues DROP INDEX idx_issues_closed_at",
+				"CALL DOLT_ADD('issues')",
+				"CALL DOLT_COMMIT('-m', 'test: drop idx_issues_closed_at')",
+				target.drop())
+			head, commits := doltHead(t, ctx, store.db), doltLogCount(t, ctx, store.db)
+
+			port, log := forkStatementProxy(t)
+			if err := openAndClose(ctx, forkOpenConfig(t, store, port)); err != nil {
+				t.Fatalf("writable open: %v", err)
+			}
+			const issuesDDL = "ALTER TABLE issues ADD INDEX idx_issues_closed_at (closed_at)"
+			if ddls := log.all(); !slices.Equal(ddls, []string{issuesDDL, target.ddl}) {
+				t.Errorf("the open sent DDL %q, want %q", ddls, []string{issuesDDL, target.ddl})
+			}
+			if !issuesIndexExists(t, ctx, store.db, "idx_issues_closed_at") {
+				t.Errorf("idx_issues_closed_at not added by the whole pass")
+			}
+			if got := tableIndexColumns(t, ctx, store.db, target.table, target.index); !slices.Equal(got, target.columns) {
+				t.Errorf("%s columns after the whole pass = %v, want %v", target.index, got, target.columns)
+			}
+			if got := doltHead(t, ctx, store.db); got == head {
+				t.Errorf("HEAD did not move: the whole pass did not commit issues")
+			}
+			if got := doltLogCount(t, ctx, store.db); got != commits+1 {
+				t.Errorf("%d new commits, want 1", got-commits)
+			}
+			var message string
+			if err := store.db.QueryRowContext(ctx, "SELECT message FROM dolt_log LIMIT 1").Scan(&message); err != nil || message != "schema: apply migrations" {
+				t.Errorf("HEAD commit message = %q, %v; want the pass's %q", message, err, "schema: apply migrations")
+			}
+			if n := doltStatusCount(t, ctx, store.db); n != 0 {
+				t.Errorf("dolt_status has %d rows after the whole pass, want 0", n)
+			}
+		})
+	}
+}
+
+// TestForkIndexCaseVariantIsConverged is review bd-8b72l finding 3: the
+// server compares index and column names without regard to case, so the step
+// does too. With a fork object present under another spelling, two writable
+// opens send no ALTER, take no migration lock, and send as many commands as
+// an open of the converged database did before the change of spelling.
+func TestForkIndexCaseVariantIsConverged(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stmts []string
+	}{
+		{"wisp_dependencies index", []string{
+			"ALTER TABLE wisp_dependencies DROP INDEX idx_wisp_dep_external_target",
+			"ALTER TABLE wisp_dependencies ADD INDEX IDX_WISP_DEP_EXTERNAL_TARGET (depends_on_external)",
+		}},
+		{"wisps key index", []string{
+			"ALTER TABLE wisps DROP INDEX idx_wisps_everturn_key",
+			"ALTER TABLE wisps ADD INDEX IDX_WISPS_EVERTURN_KEY (everturn_key, created_at)",
+		}},
+		{"issues index", []string{
+			"ALTER TABLE issues DROP INDEX idx_issues_closed_at",
+			"ALTER TABLE issues ADD INDEX IDX_ISSUES_CLOSED_AT (closed_at)",
+			"CALL DOLT_ADD('issues')",
+			"CALL DOLT_COMMIT('-m', 'test: idx_issues_closed_at spelled in upper case')",
+		}},
+		{"issues key column", []string{
+			"ALTER TABLE issues DROP INDEX idx_issues_everturn_bead",
+			"ALTER TABLE issues DROP COLUMN everturn_bead",
+			"ALTER TABLE issues ADD COLUMN EVERTURN_BEAD VARCHAR(255) GENERATED ALWAYS AS (LEFT(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.everturn.bead')), 255)) STORED",
+			"ALTER TABLE issues ADD INDEX idx_issues_everturn_bead (EVERTURN_BEAD, created_at)",
+			"CALL DOLT_ADD('issues')",
+			"CALL DOLT_COMMIT('-m', 'test: issues.everturn_bead spelled in upper case')",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, cleanup := setupConcurrentTestStore(t)
+			defer cleanup()
+			ctx, cancel := testContext(t)
+			defer cancel()
+
+			settleForkFixture(t, ctx, store.db)
+			rec := &openRecorder{}
+			port := startBudgetProxy(t, rec, net.JoinHostPort("127.0.0.1", strconv.Itoa(testServerPort)))
+			measure := func(when string) (int, int, []string) {
+				t.Helper()
+				rec.start()
+				err := openAndClose(ctx, forkOpenConfig(t, store, port))
+				_, cmds := rec.stop()
+				if err != nil {
+					t.Fatalf("writable open %s: %v", when, err)
+				}
+				locks := 0
+				var ddls []string
+				for _, cmd := range cmds {
+					if strings.Contains(cmd, "GET_LOCK(") {
+						locks++
+					}
+					if strings.Contains(strings.ToUpper(cmd), "ALTER TABLE") {
+						ddls = append(ddls, cmd)
+					}
+				}
+				return len(cmds), locks, ddls
+			}
+			converged, locks, ddls := measure("of the converged database")
+			if locks != 0 || len(ddls) != 0 {
+				t.Fatalf("the converged control took %d migration locks and sent DDL %q; the fixture is not converged", locks, ddls)
+			}
+			execAll(t, ctx, store.db, tc.stmts...)
+			head := doltHead(t, ctx, store.db)
+			for i := 1; i <= 2; i++ {
+				n, locks, ddls := measure(fmt.Sprintf("%d with the other spelling", i))
+				t.Logf("open %d: %d commands (converged %d), %d migration locks, DDL %q", i, n, converged, locks, ddls)
+				if locks != 0 {
+					t.Errorf("open %d took the migration lock %d times, want 0 (converged)", i, locks)
+				}
+				if len(ddls) != 0 {
+					t.Errorf("open %d sent DDL %q, want none", i, ddls)
+				}
+				if n != converged {
+					t.Errorf("open %d sent %d commands, want the converged %d", i, n, converged)
+				}
+			}
+			if got := doltHead(t, ctx, store.db); got != head {
+				t.Errorf("HEAD moved %s -> %s", head, got)
+			}
+		})
+	}
+}
+
+// forkSeedPattern is the canonical dolt_ignore row the seed fixtures leave out
+// of the committed baseline, so the open has a seed to write.
+const forkSeedPattern = "repo_mtimes"
+
+// forkSeedRows counts the dolt_ignore rows for forkSeedPattern at revision
+// ("WORKING", "HEAD").
+func forkSeedRows(t *testing.T, ctx context.Context, db *sql.DB, revision string) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM dolt_ignore AS OF '"+revision+"' WHERE pattern = ?", forkSeedPattern).Scan(&n); err != nil {
+		t.Fatalf("count the %s seed row at %s: %v", forkSeedPattern, revision, err)
+	}
+	return n
+}
+
+// forkIssueTitle reads fx-seed's title at revision ("HEAD", "STAGED", "WORKING").
+func forkIssueTitle(t *testing.T, ctx context.Context, db *sql.DB, revision string) string {
+	t.Helper()
+	var title string
+	if err := db.QueryRowContext(ctx, "SELECT title FROM issues AS OF '"+revision+"' WHERE id = 'fx-seed'").Scan(&title); err != nil {
+		t.Fatalf("read the %s title: %v", revision, err)
+	}
+	return title
+}
+
+// TestForkIndexSeedCommitCarriesNothingElse is review bd-8fwl1 finding 1: at
+// the latest cursors, the committed baseline lacks one canonical dolt_ignore
+// row, so the open has a seed to write, and an issues title is edited (staged
+// or not) and edited again unstaged. With a table staged, the seed commit took
+// the staging area into HEAD (DOLT_ADD('dolt_ignore') stages only the seed,
+// DOLT_COMMIT commits all that is staged). Now, with issues staged, the seed
+// is not committed: it stays a working-set change of dolt_ignore, HEAD (and
+// its title) does not move, and the staging and the working title are as the
+// user left them; a second open has no seed to write and leaves it so. With
+// nothing staged, the seed is committed as before, alone. Each runs with the
+// clone-local index missing (the clone-local step) and with nothing missing
+// (HEAD's no-work branch); both call commitSeededDoltIgnore.
+func TestForkIndexSeedCommitCarriesNothingElse(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		stage, dropIndex  bool
+		wantSeedCommitted bool
+	}{
+		{name: "clone-local step, issues staged", stage: true, dropIndex: true},
+		{name: "clone-local step, nothing staged", dropIndex: true, wantSeedCommitted: true},
+		{name: "no-work branch, issues staged", stage: true},
+		{name: "no-work branch, nothing staged", wantSeedCommitted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, cleanup := setupConcurrentTestStore(t)
+			defer cleanup()
+			ctx, cancel := testContext(t)
+			defer cancel()
+			db := store.db
+
+			createPerm(t, ctx, store, "fx-seed")
+			settleForkFixture(t, ctx, db)
+			execAll(t, ctx, db,
+				"DELETE FROM dolt_ignore WHERE pattern = '"+forkSeedPattern+"'",
+				"CALL DOLT_ADD('dolt_ignore')",
+				"CALL DOLT_COMMIT('-m', 'test: a baseline that lacks one canonical seed row')")
+			headTitle := forkIssueTitle(t, ctx, db, "HEAD")
+			stagedTitle := headTitle
+			if tc.stage {
+				stagedTitle = "staged title"
+				execAll(t, ctx, db,
+					"UPDATE issues SET title = 'staged title' WHERE id = 'fx-seed'",
+					"CALL DOLT_ADD('issues')")
+			}
+			execAll(t, ctx, db, "UPDATE issues SET title = 'working title' WHERE id = 'fx-seed'")
+			if tc.dropIndex {
+				execAll(t, ctx, db, "ALTER TABLE wisp_dependencies DROP INDEX "+wispDepExternalTarget)
+			}
+			stagedRows := func() int {
+				t.Helper()
+				var n int
+				if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM dolt_status WHERE table_name = 'issues' AND staged").Scan(&n); err != nil {
+					t.Fatalf("count staged issues: %v", err)
+				}
+				return n
+			}
+			wantStaged := 0
+			if tc.stage {
+				wantStaged = 1
+			}
+			if got := stagedRows(); got != wantStaged || forkSeedRows(t, ctx, db, "HEAD") != 0 {
+				t.Fatalf("fixture: staged issues rows = %d (want %d), HEAD seed rows = %d (want 0)", got, wantStaged, forkSeedRows(t, ctx, db, "HEAD"))
+			}
+			head, commits := doltHead(t, ctx, db), doltLogCount(t, ctx, db)
+
+			check := func(when string, wantSeedCommitted bool) {
+				t.Helper()
+				t.Logf("%s: HEAD_moved=%v commits=+%d HEAD_title=%q STAGED_title=%q WORKING_title=%q staged_rows=%d seed_WORKING=%d seed_HEAD=%d dolt_ignore_status=%d",
+					when, doltHead(t, ctx, db) != head, doltLogCount(t, ctx, db)-commits,
+					forkIssueTitle(t, ctx, db, "HEAD"), forkIssueTitle(t, ctx, db, "STAGED"), forkIssueTitle(t, ctx, db, "WORKING"),
+					stagedRows(), forkSeedRows(t, ctx, db, "WORKING"), forkSeedRows(t, ctx, db, "HEAD"), doltStatusRowsFor(t, ctx, db, "dolt_ignore"))
+				if got := wispDepExternalTargetColumns(t, ctx, db); !slices.Equal(got, []string{"depends_on_external"}) {
+					t.Errorf("%s: %s columns = %v, want [depends_on_external]", when, wispDepExternalTarget, got)
+				}
+				if got := forkIssueTitle(t, ctx, db, "HEAD"); got != headTitle {
+					t.Errorf("%s: HEAD title = %q, want the original %q (a staged title rode the seed commit)", when, got, headTitle)
+				}
+				if got := stagedRows(); got != wantStaged {
+					t.Errorf("%s: issues staged rows = %d, want %d", when, got, wantStaged)
+				}
+				if got := forkIssueTitle(t, ctx, db, "STAGED"); got != stagedTitle {
+					t.Errorf("%s: STAGED title = %q, want %q", when, got, stagedTitle)
+				}
+				if got := forkIssueTitle(t, ctx, db, "WORKING"); got != "working title" {
+					t.Errorf("%s: WORKING title = %q, want %q", when, got, "working title")
+				}
+				if got := forkSeedRows(t, ctx, db, "WORKING"); got != 1 {
+					t.Errorf("%s: dolt_ignore holds %d %s rows, want the seed row", when, got, forkSeedPattern)
+				}
+				if wantSeedCommitted {
+					if got := forkSeedRows(t, ctx, db, "HEAD"); got != 1 {
+						t.Errorf("%s: the seed row is not at HEAD with nothing else staged", when)
+					}
+					if n := doltStatusRowsFor(t, ctx, db, "dolt_ignore"); n != 0 {
+						t.Errorf("%s: dolt_ignore has %d status rows, want 0 (the seed committed)", when, n)
+					}
+					if got := doltLogCount(t, ctx, db) - commits; got != 1 {
+						t.Errorf("%s: %d new commits, want 1 (the seed commit)", when, got)
+					}
+					var message string
+					if err := db.QueryRowContext(ctx, "SELECT message FROM dolt_log LIMIT 1").Scan(&message); err != nil {
+						t.Fatalf("read the last commit: %v", err)
+					}
+					if message != "schema: seed dolt_ignore patterns" {
+						t.Errorf("%s: the last commit is %q, want the seed commit", when, message)
+					}
+					return
+				}
+				if got := forkSeedRows(t, ctx, db, "HEAD"); got != 0 {
+					t.Errorf("%s: the seed row reached HEAD while issues was staged", when)
+				}
+				if n := doltStatusRowsFor(t, ctx, db, "dolt_ignore"); n != 1 {
+					t.Errorf("%s: dolt_ignore has %d status rows, want 1 (the seed left uncommitted)", when, n)
+				}
+				if got := doltHead(t, ctx, db); got != head {
+					t.Errorf("%s: HEAD moved %s -> %s while issues was staged", when, head, got)
+				}
+			}
+
+			port, log := forkStatementProxy(t)
+			if err := openAndClose(ctx, forkOpenConfig(t, store, port)); err != nil {
+				t.Fatalf("writable open: %v", err)
+			}
+			wantDDL := []string(nil)
+			if tc.dropIndex {
+				wantDDL = []string{wispDepExternalTargetDDL}
+			}
+			if ddls := log.all(); !slices.Equal(ddls, wantDDL) {
+				t.Errorf("the open sent DDL %q, want %q", ddls, wantDDL)
+			}
+			check("after the open", tc.wantSeedCommitted)
+			if tc.wantSeedCommitted {
+				return
+			}
+			// The seed rows are in the working set now: the next open has no
+			// seed to write, so it commits nothing and leaves them as they are.
+			port, log = forkStatementProxy(t)
+			if err := openAndClose(ctx, forkOpenConfig(t, store, port)); err != nil {
+				t.Fatalf("second writable open: %v", err)
+			}
+			if ddls := log.all(); len(ddls) != 0 {
+				t.Errorf("the second open sent DDL %q, want none", ddls)
+			}
+			check("after a second open", false)
+		})
+	}
+}
+
+// TestForkIndexTrackedCloneLocalTakesWholePass is review bd-8fwl1 finding 2:
+// an operator has un-ignored the wisp tables (wisp_% and wisps set to
+// ignored=false in dolt_ignore, which the seeder keeps) and committed both
+// tables, so they are versioned here, and a clone-local fork index is missing
+// at HEAD. The open takes the whole pass, which commits the index: it is at
+// HEAD and in WORKING, and wisps and wisp_dependencies have no status row. Routed by its name, the
+// open added the index to WORKING only, and a later open, which probes only
+// WORKING for such a table, never committed it. A second open sends no DDL
+// and does not move HEAD.
+func TestForkIndexTrackedCloneLocalTakesWholePass(t *testing.T) {
+	for _, target := range cloneLocalForkTargets {
+		t.Run(target.name, func(t *testing.T) {
+			store, cleanup := setupConcurrentTestStore(t)
+			defer cleanup()
+			ctx, cancel := testContext(t)
+			defer cancel()
+			db := store.db
+
+			settleForkFixture(t, ctx, db)
+			execAll(t, ctx, db,
+				"UPDATE dolt_ignore SET ignored = false WHERE pattern IN ('wisp_%', 'wisps')",
+				target.drop(),
+				"CALL DOLT_ADD('dolt_ignore', 'wisps', 'wisp_dependencies')",
+				"CALL DOLT_COMMIT('-m', 'test: version the wisp tables')")
+			headHasIndex := func() bool {
+				t.Helper()
+				var name, ddl string
+				if err := db.QueryRowContext(ctx, "SHOW CREATE TABLE `"+target.table+"` AS OF 'HEAD'").Scan(&name, &ddl); err != nil {
+					t.Fatalf("SHOW CREATE TABLE %s AS OF HEAD: %v", target.table, err)
+				}
+				return strings.Contains(ddl, "`"+target.index+"`")
+			}
+			// Un-ignoring wisp_% also shows the other wisp_* tables as new,
+			// uncommitted tables; the two the test versions are counted.
+			wispStatusRows := func() int {
+				t.Helper()
+				return doltStatusRowsFor(t, ctx, db, "wisps") + doltStatusRowsFor(t, ctx, db, "wisp_dependencies")
+			}
+			if n := wispStatusRows(); n != 0 || headHasIndex() {
+				t.Fatalf("fixture: %d wisps and wisp_dependencies status rows (want 0), index at HEAD = %v (want false)", n, headHasIndex())
+			}
+			head := doltHead(t, ctx, db)
+
+			port, log := forkStatementProxy(t)
+			if err := openAndClose(ctx, forkOpenConfig(t, store, port)); err != nil {
+				t.Fatalf("writable open: %v", err)
+			}
+			afterFirst := doltHead(t, ctx, db)
+			t.Logf("open 1: HEAD_moved=%v HEAD_index=%v WORKING_index=%v status_rows=%d DDL=%q",
+				afterFirst != head, headHasIndex(), tableIndexColumns(t, ctx, db, target.table, target.index), wispStatusRows(), log.all())
+			if got := tableIndexColumns(t, ctx, db, target.table, target.index); !slices.Equal(got, target.columns) {
+				t.Errorf("%s columns in WORKING = %v, want %v", target.index, got, target.columns)
+			}
+			if !headHasIndex() {
+				t.Errorf("%s is not at HEAD after the open: a versioned %s was routed as clone-local", target.index, target.table)
+			}
+			if n := wispStatusRows(); n != 0 {
+				t.Errorf("%d wisps and wisp_dependencies status rows after the open, want 0", n)
+			}
+			if afterFirst == head {
+				t.Error("HEAD did not move: the whole pass commits the index")
+			}
+
+			port, log = forkStatementProxy(t)
+			if err := openAndClose(ctx, forkOpenConfig(t, store, port)); err != nil {
+				t.Fatalf("second writable open: %v", err)
+			}
+			if ddls := log.all(); len(ddls) != 0 {
+				t.Errorf("the second open sent DDL %q, want none", ddls)
+			}
+			if got := doltHead(t, ctx, db); got != afterFirst {
+				t.Errorf("the second open moved HEAD %s -> %s", afterFirst, got)
+			}
+		})
+	}
+}
