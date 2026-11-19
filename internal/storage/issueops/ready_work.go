@@ -65,6 +65,15 @@ func buildReadyWorkPredicates(ctx context.Context, tx DBTX, filter types.WorkFil
 		inputs.ParentDescendantIDs = descendantIDs
 	}
 
+	if sqlbuild.NeedsActiveCustomStatuses(filter) {
+		active, sameCollation, acErr := ActiveCustomStatusesInTx(ctx, tx, tables.Main)
+		if acErr != nil {
+			return nil, fmt.Errorf("get ready work: %w", acErr)
+		}
+		inputs.ActiveCustomStatuses = active
+		inputs.StatusCollationMatches = sameCollation
+	}
+
 	whereSQL, whereArgs, err := sqlbuild.BuildReadyWorkWhere(filter, tables, inputs)
 	if err != nil {
 		return nil, err
@@ -88,6 +97,40 @@ func buildReadyWorkPredicates(ctx context.Context, tx DBTX, filter types.WorkFil
 		args:             args,
 		deferredChildIDs: inputs.DeferredChildIDs,
 	}, nil
+}
+
+// ActiveCustomStatusesInTx returns the names of the category-active custom
+// statuses (sqlbuild.ActiveCustomStatusesSQL), the input the ready-work status
+// clause binds as literals, and whether custom_statuses.name has the same
+// collation as the status column of table, the table the clause reads. It
+// reads the custom_statuses table alone, exactly the rows the clause's former
+// subquery read: no config or YAML fallback, and an error when the table
+// cannot be read. sameCollation is false when any collation is unknown (an
+// empty table reports none) and when there are no names, where the clause
+// needs no list.
+func ActiveCustomStatusesInTx(ctx context.Context, tx DBTX, table string) (names []string, sameCollation bool, err error) {
+	rows, err := tx.QueryContext(ctx, sqlbuild.ActiveCustomStatusesSQL(table))
+	if err != nil {
+		return nil, false, fmt.Errorf("active custom statuses: %w", err)
+	}
+	defer rows.Close()
+	sameCollation = true
+	for rows.Next() {
+		var name string
+		var nameCollation, statusCollation sql.NullString
+		if err := rows.Scan(&name, &nameCollation, &statusCollation); err != nil {
+			return nil, false, fmt.Errorf("active custom statuses: scan: %w", err)
+		}
+		if !nameCollation.Valid || !statusCollation.Valid || nameCollation.String == "" ||
+			!strings.EqualFold(nameCollation.String, statusCollation.String) {
+			sameCollation = false
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("active custom statuses: %w", err)
+	}
+	return names, sameCollation && len(names) > 0, nil
 }
 
 //nolint:gosec // G201: whereSQL/orderBySQL built from hardcoded strings and ? placeholders

@@ -408,8 +408,9 @@ func TestBuildReadyWorkWhereStatusFilter(t *testing.T) {
 	tests := []struct {
 		name            string
 		filter          types.WorkFilter
+		in              ReadyWorkWhereInputs
 		wantClause      string
-		rejectClause    string // must NOT appear in the WHERE; "" skips the check
+		rejectClauses   []string // none may appear in the WHERE
 		wantLeadingArgs []any
 	}{
 		{
@@ -421,29 +422,65 @@ func TestBuildReadyWorkWhereStatusFilter(t *testing.T) {
 		{
 			name:            "SingularStatusWinsOverStatuses",
 			filter:          types.WorkFilter{Status: "open", Statuses: []types.Status{"blocked", "pinned"}},
-			wantClause:      "(status = ? OR status IN (SELECT name FROM custom_statuses WHERE category = 'active'))",
-			rejectClause:    "status IN (?",
+			in:              ReadyWorkWhereInputs{ActiveCustomStatuses: []string{"review"}, StatusCollationMatches: true},
+			wantClause:      "status IN (?,?) AND",
+			rejectClauses:   []string{"custom_statuses", "status IN (?,?,?)"},
+			wantLeadingArgs: []any{"open", "review"},
+		},
+		{
+			// The ready-eligible set is bound as literals, open first, so Dolt
+			// can bound the [is_blocked,status] range (bd-7c0u4 Q4); a
+			// custom_statuses subquery would make it [NULL, ∞). Only when the
+			// resolve proved both columns share a collation.
+			name:            "OpenIncludesCustomActiveCategory",
+			filter:          types.WorkFilter{Status: types.StatusOpen},
+			in:              ReadyWorkWhereInputs{ActiveCustomStatuses: []string{"review", "open", "", "triage", "review"}, StatusCollationMatches: true},
+			wantClause:      "WHERE status IN (?,?,?) AND",
+			rejectClauses:   []string{"custom_statuses", "status IN ('open', 'in_progress')"},
+			wantLeadingArgs: []any{"open", "review", "triage"},
+		},
+		{
+			// Different collations: the literal list would compare under
+			// issues.status's collation, the subquery under the name column's,
+			// so the subquery stays (review bd-s9czb).
+			name:            "OpenWithActiveCustomDifferentCollationKeepsSubquery",
+			filter:          types.WorkFilter{Status: types.StatusOpen},
+			in:              ReadyWorkWhereInputs{ActiveCustomStatuses: []string{"review"}, StatusCollationMatches: false},
+			wantClause:      "WHERE (status = ? OR status IN (SELECT name FROM custom_statuses WHERE category = 'active')) AND",
+			rejectClauses:   []string{"status IN (?"},
 			wantLeadingArgs: []any{"open"},
 		},
 		{
-			name:            "OpenIncludesCustomActiveCategory",
+			// Unknown collation is the zero value (the resolve could not
+			// tell, e.g. an empty table): the same safe subquery.
+			name:            "OpenWithActiveCustomUnknownCollationKeepsSubquery",
 			filter:          types.WorkFilter{Status: types.StatusOpen},
-			wantClause:      "status IN (SELECT name FROM custom_statuses WHERE category = 'active')",
-			rejectClause:    "status IN ('open', 'in_progress')",
+			in:              ReadyWorkWhereInputs{ActiveCustomStatuses: []string{"review"}},
+			wantClause:      "WHERE (status = ? OR status IN (SELECT name FROM custom_statuses WHERE category = 'active')) AND",
+			rejectClauses:   []string{"status IN (?"},
+			wantLeadingArgs: []any{"open"},
+		},
+		{
+			name:            "OpenWithoutActiveCustomIsExact",
+			filter:          types.WorkFilter{Status: types.StatusOpen},
+			wantClause:      "WHERE status = ? AND",
+			rejectClauses:   []string{"custom_statuses", "status IN ("},
 			wantLeadingArgs: []any{"open"},
 		},
 		{
 			name:            "NonOpenSingularStatusStaysExact",
 			filter:          types.WorkFilter{Status: types.StatusInProgress},
-			wantClause:      "status = ?",
-			rejectClause:    "custom_statuses",
+			in:              ReadyWorkWhereInputs{ActiveCustomStatuses: []string{"review"}},
+			wantClause:      "WHERE status = ? AND",
+			rejectClauses:   []string{"custom_statuses"},
 			wantLeadingArgs: []any{"in_progress"},
 		},
 		{
-			name:         "EmptyFilterLegacyDefault",
-			filter:       types.WorkFilter{},
-			wantClause:   "status IN ('open', 'in_progress')",
-			rejectClause: "status = ?",
+			name:          "EmptyFilterLegacyDefault",
+			filter:        types.WorkFilter{},
+			in:            ReadyWorkWhereInputs{ActiveCustomStatuses: []string{"review"}},
+			wantClause:    "status IN ('open', 'in_progress')",
+			rejectClauses: []string{"status = ?", "custom_statuses"},
 		},
 	}
 
@@ -451,15 +488,17 @@ func TestBuildReadyWorkWhereStatusFilter(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			where, args, err := BuildReadyWorkWhere(tt.filter, IssuesFilterTables, ReadyWorkWhereInputs{})
+			where, args, err := BuildReadyWorkWhere(tt.filter, IssuesFilterTables, tt.in)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if !strings.Contains(where, tt.wantClause) {
 				t.Errorf("status clause %q missing.\n where = %s", tt.wantClause, where)
 			}
-			if tt.rejectClause != "" && strings.Contains(where, tt.rejectClause) {
-				t.Errorf("unexpected status clause %q present.\n where = %s", tt.rejectClause, where)
+			for _, reject := range tt.rejectClauses {
+				if strings.Contains(where, reject) {
+					t.Errorf("unexpected status clause %q present.\n where = %s", reject, where)
+				}
 			}
 			if len(args) < len(tt.wantLeadingArgs) {
 				t.Fatalf("args = %v, want at least the %d leading status args %v", args, len(tt.wantLeadingArgs), tt.wantLeadingArgs)
@@ -470,6 +509,25 @@ func TestBuildReadyWorkWhereStatusFilter(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestNeedsActiveCustomStatuses(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		filter types.WorkFilter
+		want   bool
+	}{
+		{types.WorkFilter{Status: types.StatusOpen}, true},
+		{types.WorkFilter{Status: types.StatusOpen, Statuses: []types.Status{"blocked"}}, true},
+		{types.WorkFilter{Status: types.StatusInProgress}, false},
+		{types.WorkFilter{Statuses: []types.Status{"open"}}, false},
+		{types.WorkFilter{}, false},
+	} {
+		if got := NeedsActiveCustomStatuses(tc.filter); got != tc.want {
+			t.Errorf("NeedsActiveCustomStatuses(%+v) = %v, want %v", tc.filter, got, tc.want)
+		}
 	}
 }
 
@@ -488,6 +546,20 @@ func TestOptionalWispTable(t *testing.T) {
 	for _, name := range []string{"leases", "wisp_labels", "issues", "labels", "", "wisp"} {
 		if OptionalWispTable(name) {
 			t.Errorf("OptionalWispTable(%q) = true, want false", name)
+		}
+	}
+}
+
+// TestActiveCustomStatusesSQLReadsBothCollations pins the resolve statement:
+// one statement returning the active names, each with the name column's
+// collation and the status collation of the table the ready clause reads.
+func TestActiveCustomStatusesSQLReadsBothCollations(t *testing.T) {
+	t.Parallel()
+	for _, table := range []string{"issues", "wisps"} {
+		want := "SELECT name, COLLATION(name), (SELECT COLLATION(status) FROM " + table + " LIMIT 1)" +
+			" FROM custom_statuses WHERE category = 'active' ORDER BY name"
+		if got := ActiveCustomStatusesSQL(table); got != want {
+			t.Errorf("ActiveCustomStatusesSQL(%q) =\n%s\nwant\n%s", table, got, want)
 		}
 	}
 }

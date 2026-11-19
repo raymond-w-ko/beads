@@ -3,12 +3,16 @@ package issueops
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"reflect"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -244,29 +248,170 @@ func TestGetChildrenOfDeferredParentsInTx_IgnoresMissingWispDependenciesTable(t 
 	}
 }
 
+// recordingQueryMatcher matches like sqlmock's default regexp matcher and
+// records every statement it is shown, so a test can assert on the exact text
+// the code sent rather than only on a pattern it matched.
+type recordingQueryMatcher struct {
+	mu   sync.Mutex
+	sent []string
+}
+
+func (m *recordingQueryMatcher) Match(expectedSQL, actualSQL string) error {
+	m.mu.Lock()
+	m.sent = append(m.sent, actualSQL)
+	m.mu.Unlock()
+	return sqlmock.QueryMatcherRegexp.Match(expectedSQL, actualSQL)
+}
+
+func (m *recordingQueryMatcher) statementsContaining(substr string) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for _, q := range m.sent {
+		if strings.Contains(q, substr) {
+			out = append(out, q)
+		}
+	}
+	return out
+}
+
+// TestGetReadyWorkInTxOpenIncludesCustomActive captures the statement the
+// store's ready path sends for `bd ready` (Status open). The ready-eligible
+// set, built-in open plus the category-active custom statuses, arrives as
+// bound literals read in the same transaction when the resolve proves
+// custom_statuses.name and issues.status share a collation: an OR with a
+// custom_statuses subquery makes Dolt read the [is_blocked,status] index as
+// the open-ended range [NULL, ∞), every unblocked issue of every status
+// (bd-7c0u4 Q4). When the collations differ or are unknown, the literal list
+// would compare under the other column's collation, so the subquery clause
+// stays (review bd-s9czb). The resolve is one statement in every case.
 func TestGetReadyWorkInTxOpenIncludesCustomActive(t *testing.T) {
 	t.Parallel()
 
-	_, mock, tx := beginMockTx(t)
-	mock.ExpectQuery(deferredParentProbeRegex("issues")).WillReturnError(sql.ErrNoRows)
-	mock.ExpectQuery(deferredParentProbeRegex("wisps")).WillReturnError(sql.ErrNoRows)
-	mock.ExpectQuery(`SELECT id FROM issues\s+WHERE \(status = \? OR status IN \(SELECT name FROM custom_statuses WHERE category = 'active'\)\)`).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}))
-	mock.ExpectQuery(`SELECT 1 FROM wisps LIMIT 1`).WillReturnError(sql.ErrNoRows)
+	const legacyClause = "WHERE (status = ? OR status IN (SELECT name FROM custom_statuses WHERE category = 'active')) AND"
+	type resolveRow struct {
+		name            string
+		nameCollation   any
+		statusCollation any
+	}
+	for _, tc := range []struct {
+		name         string
+		rows         []resolveRow
+		wantClause   string
+		wantArgs     []string
+		wantSubquery bool
+	}{
+		{
+			name:       "ActiveCustomStatusSameCollation",
+			rows:       []resolveRow{{"review", "utf8mb4_0900_bin", "utf8mb4_0900_bin"}},
+			wantClause: "WHERE status IN (?,?) AND",
+			wantArgs:   []string{"open", "review"},
+		},
+		{
+			name:         "ActiveCustomStatusDifferentCollation",
+			rows:         []resolveRow{{"review", "utf8mb4_0900_ai_ci", "utf8mb4_0900_bin"}},
+			wantClause:   legacyClause,
+			wantArgs:     []string{"open"},
+			wantSubquery: true,
+		},
+		{
+			// An empty issues table reports no status collation.
+			name:         "ActiveCustomStatusUnknownCollation",
+			rows:         []resolveRow{{"review", "utf8mb4_0900_bin", nil}},
+			wantClause:   legacyClause,
+			wantArgs:     []string{"open"},
+			wantSubquery: true,
+		},
+		{
+			name: "OneOfSeveralDiffers",
+			rows: []resolveRow{
+				{"review", "utf8mb4_0900_bin", "utf8mb4_0900_bin"},
+				{"triage", "utf8mb4_0900_ai_ci", "utf8mb4_0900_bin"},
+			},
+			wantClause:   legacyClause,
+			wantArgs:     []string{"open"},
+			wantSubquery: true,
+		},
+		{name: "NoActiveCustomStatus", wantClause: "WHERE status = ? AND", wantArgs: []string{"open"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	got, err := GetReadyWorkInTx(
-		context.Background(),
-		tx,
-		types.WorkFilter{Status: types.StatusOpen},
-	)
-	if err != nil {
-		t.Fatalf("GetReadyWorkInTx: %v", err)
-	}
-	if len(got) != 0 {
-		t.Fatalf("expected no rows, got %d", len(got))
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet SQL expectations: %v", err)
+			matcher := &recordingQueryMatcher{}
+			db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(matcher))
+			if err != nil {
+				t.Fatalf("sqlmock.New: %v", err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			mock.ExpectBegin()
+			tx, err := db.BeginTx(context.Background(), nil)
+			if err != nil {
+				t.Fatalf("BeginTx: %v", err)
+			}
+			t.Cleanup(func() { _ = tx.Rollback() })
+
+			var active []string
+			for _, r := range tc.rows {
+				active = append(active, r.name)
+			}
+			filter := types.WorkFilter{Status: types.StatusOpen}
+			_, whereArgs, err := sqlbuild.BuildReadyWorkWhere(filter, IssuesFilterTables,
+				sqlbuild.ReadyWorkWhereInputs{ActiveCustomStatuses: active, StatusCollationMatches: !tc.wantSubquery})
+			if err != nil {
+				t.Fatalf("BuildReadyWorkWhere: %v", err)
+			}
+			for i, want := range tc.wantArgs {
+				if i >= len(whereArgs) || whereArgs[i] != want {
+					t.Fatalf("builder args = %v, want leading %v", whereArgs, tc.wantArgs)
+				}
+			}
+			// The hybrid ORDER BY binds two recency cutoffs after the WHERE args.
+			queryArgs := make([]driver.Value, 0, len(whereArgs)+2)
+			for _, a := range whereArgs {
+				queryArgs = append(queryArgs, a)
+			}
+			queryArgs = append(queryArgs, sqlmock.AnyArg(), sqlmock.AnyArg())
+
+			mock.ExpectQuery(deferredParentProbeRegex("issues")).WillReturnError(sql.ErrNoRows)
+			mock.ExpectQuery(deferredParentProbeRegex("wisps")).WillReturnError(sql.ErrNoRows)
+			activeRows := sqlmock.NewRows([]string{"name", "name_collation", "status_collation"})
+			for _, r := range tc.rows {
+				activeRows.AddRow(r.name, r.nameCollation, r.statusCollation)
+			}
+			mock.ExpectQuery("^" + regexp.QuoteMeta(sqlbuild.ActiveCustomStatusesSQL("issues")) + "$").
+				WillReturnRows(activeRows)
+			// Loose on purpose: the exact-text checks below name the clause.
+			mock.ExpectQuery(`SELECT id FROM issues\s+WHERE `).
+				WithArgs(queryArgs...).
+				WillReturnRows(sqlmock.NewRows([]string{"id"}))
+			mock.ExpectQuery(`SELECT 1 FROM wisps LIMIT 1`).WillReturnError(sql.ErrNoRows)
+
+			got, err := GetReadyWorkInTx(context.Background(), tx, filter)
+			if err != nil {
+				t.Fatalf("GetReadyWorkInTx: %v", err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("expected no rows, got %d", len(got))
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet SQL expectations: %v", err)
+			}
+
+			if resolves := matcher.statementsContaining("FROM custom_statuses WHERE category = 'active' ORDER BY name"); len(resolves) != 1 {
+				t.Fatalf("resolve statements sent = %d, want 1: %q", len(resolves), resolves)
+			}
+			reads := matcher.statementsContaining("SELECT id FROM issues")
+			if len(reads) == 0 {
+				t.Fatalf("no ready read sent; statements: %q", matcher.sent)
+			}
+			readyRead := reads[len(reads)-1]
+			if got := strings.Contains(readyRead, "custom_statuses"); got != tc.wantSubquery {
+				t.Fatalf("ready read has the custom_statuses subquery = %v, want %v:\n%s", got, tc.wantSubquery, readyRead)
+			}
+			if !strings.Contains(readyRead, tc.wantClause) {
+				t.Fatalf("ready read lacks status clause %q:\n%s", tc.wantClause, readyRead)
+			}
+		})
 	}
 }
 

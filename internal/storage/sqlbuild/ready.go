@@ -78,6 +78,67 @@ type ReadyWorkWhereInputs struct {
 	// ParentDescendantIDs are the transitive descendants of *filter.ParentID;
 	// consulted only when filter.ParentID != nil.
 	ParentDescendantIDs []string
+	// ActiveCustomStatuses are the names of the category-active custom
+	// statuses (the rows ActiveCustomStatusesSQL returns); consulted only when
+	// NeedsActiveCustomStatuses(filter). The caller resolves them in the
+	// transaction of the ready read, so the builder can bind the ready-eligible
+	// set as literals: Dolt plans a literal status IN list as a bounded range
+	// of the [is_blocked,status] index, but an OR with a custom_statuses
+	// subquery as the open-ended range [NULL, ∞), reading every unblocked issue
+	// of every status, closed included (bd-7c0u4, Q4).
+	ActiveCustomStatuses []string
+	// StatusCollationMatches reports that the resolve proved
+	// custom_statuses.name and the status column of the table the clause
+	// reads (FilterTables.Main) have the same collation. Only then does a
+	// literal IN list compare the way the subquery did: the subquery compared
+	// under the name column's collation, a literal list compares under the
+	// status column's, so with a binary status and a case-insensitive name an
+	// active "review" matches a stored "REVIEW" in one and not the other
+	// (review bd-s9czb). False, the zero value, also means "could not tell",
+	// and keeps the subquery clause.
+	StatusCollationMatches bool
+}
+
+// ActiveCustomStatusesSQL returns the statement that resolves the ready
+// clause's custom statuses for a read of table ("issues" or "wisps"): the
+// names of the category-active custom statuses, which `bd ready` treats as
+// ready-eligible next to built-in open, each with the name column's collation
+// and the collation of table's status column. COLLATION() of a column reports
+// the column's collation on Dolt and the embedded engine alike. The status
+// collation comes from a row of table, so it is NULL when table is empty,
+// which reads as "could not tell". One statement, the one the resolve already
+// sent: no round trip is added for the collation check.
+func ActiveCustomStatusesSQL(table string) string {
+	return "SELECT name, COLLATION(name), (SELECT COLLATION(status) FROM " + table + " LIMIT 1)" +
+		" FROM custom_statuses WHERE category = 'active' ORDER BY name"
+}
+
+// legacyReadyStatusClause is the ready-eligible status clause as a subquery.
+// It is correct under any collations but plans as an unbounded status range;
+// BuildReadyWorkWhere keeps it when the literal list could compare
+// differently (see ReadyWorkWhereInputs.StatusCollationMatches).
+const legacyReadyStatusClause = "(status = ? OR status IN (SELECT name FROM custom_statuses WHERE category = 'active'))"
+
+// NeedsActiveCustomStatuses reports whether BuildReadyWorkWhere consults
+// ReadyWorkWhereInputs.ActiveCustomStatuses for filter, so a caller runs
+// ActiveCustomStatusesSQL only when the clause needs it.
+func NeedsActiveCustomStatuses(filter types.WorkFilter) bool {
+	return filter.Status == types.StatusOpen
+}
+
+// readyEligibleStatuses is built-in open followed by the active custom
+// statuses, without empty names or repeats.
+func readyEligibleStatuses(active []string) []string {
+	out := []string{string(types.StatusOpen)}
+	seen := map[string]bool{string(types.StatusOpen): true}
+	for _, name := range active {
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out
 }
 
 // BuildReadyWorkWhere renders the full ready-work WHERE clause for one table
@@ -98,13 +159,30 @@ func BuildReadyWorkWhere(filter types.WorkFilter, tables FilterTables, in ReadyW
 		// Singular StatusOpen is the `bd ready` pin and means the ready-
 		// eligible set: built-in open plus category-active custom statuses,
 		// matching the ready_issues view since migration 0025 (GH#5831).
+		// The set is bound as literals from in.ActiveCustomStatuses, so the
+		// status range stays bounded (see ReadyWorkWhereInputs), when the
+		// resolve proved the name and status columns share a collation; the
+		// schema pins neither, so they do on every database it creates.
+		// Otherwise the subquery clause stays: it compares exactly as before.
 		// Any other singular status stays exact.
-		if filter.Status == types.StatusOpen {
-			statusClause = "(status = ? OR status IN (SELECT name FROM custom_statuses WHERE category = 'active'))"
+		if NeedsActiveCustomStatuses(filter) {
+			eligible := readyEligibleStatuses(in.ActiveCustomStatuses)
+			switch {
+			case len(eligible) == 1:
+				statusClause = "status = ?"
+				args = append(args, eligible[0])
+			case !in.StatusCollationMatches:
+				statusClause = legacyReadyStatusClause
+				args = append(args, string(types.StatusOpen))
+			default:
+				ph, statusArgs := InPlaceholders(eligible)
+				statusClause = fmt.Sprintf("status IN (%s)", ph)
+				args = append(args, statusArgs...)
+			}
 		} else {
 			statusClause = "status = ?"
+			args = append(args, string(filter.Status))
 		}
-		args = append(args, string(filter.Status))
 	case len(filter.Statuses) > 0:
 		ph, statusArgs := InPlaceholders(filter.Statuses)
 		statusClause = fmt.Sprintf("status IN (%s)", ph)

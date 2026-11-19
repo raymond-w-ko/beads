@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/steveyegge/beads/internal/storage/dberrors"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -42,6 +43,17 @@ func (r *issueSQLRepositoryImpl) buildReadyWorkPredicates(ctx context.Context, f
 			return nil, fmt.Errorf("get parent descendants: %w", descErr)
 		}
 		inputs.ParentDescendantIDs = descendantIDs
+	}
+
+	// The ready-eligible custom statuses are bound as literals (see
+	// sqlbuild.ReadyWorkWhereInputs), read on the runner of the ready read.
+	if sqlbuild.NeedsActiveCustomStatuses(filter) {
+		active, sameCollation, acErr := issueops.ActiveCustomStatusesInTx(ctx, r.runner, tables.Main)
+		if acErr != nil {
+			return nil, fmt.Errorf("get ready work: %w", acErr)
+		}
+		inputs.ActiveCustomStatuses = active
+		inputs.StatusCollationMatches = sameCollation
 	}
 
 	whereSQL, args, err := sqlbuild.BuildReadyWorkWhere(filter, tables, inputs)
