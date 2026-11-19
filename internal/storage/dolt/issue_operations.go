@@ -169,6 +169,7 @@ func nonCoordinationPatchSignals(patch issueops.IssuePatch) []bool {
 		len(patch.Metadata.Unset) != 0,
 		patch.Metadata.Replace.Set,
 		patch.Metadata.Merge.Set,
+		len(patch.Metadata.MergePatch) != 0,
 	}
 }
 

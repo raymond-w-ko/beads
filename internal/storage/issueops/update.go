@@ -573,6 +573,10 @@ const (
 	// OpUnsetMetadata removes metadata keys (bd update --unset-metadata).
 	// Value: []string.
 	OpUnsetMetadata = "_unset_metadata"
+	// OpMergePatchMetadata applies RFC 7396 JSON Merge Patches to the issue's
+	// metadata, in order (bd update --merge-metadata). Value: []json.RawMessage.
+	// It cannot be combined with the other metadata operations.
+	OpMergePatchMetadata = "_merge_patch_metadata"
 	// OpAppendNotes appends a line to the issue's notes
 	// (bd update --append-notes). Value: string.
 	OpAppendNotes = "append_notes"
@@ -614,7 +618,7 @@ func PopForceClosePolicy(updates map[string]interface{}) bool {
 // store's whole-attempt retry then re-runs that resolution against the winning
 // writer's committed row.
 func HasMergeOps(updates map[string]interface{}) bool {
-	for _, op := range []string{OpMergeMetadata, OpSetMetadata, OpUnsetMetadata, OpAppendNotes} {
+	for _, op := range []string{OpMergeMetadata, OpSetMetadata, OpUnsetMetadata, OpMergePatchMetadata, OpAppendNotes} {
 		if _, ok := updates[op]; ok {
 			return true
 		}
@@ -732,15 +736,19 @@ func issueFieldMatches(issue *types.Issue, key string, value interface{}) (bool,
 		waiters, ok := value.([]string)
 		return ok && slices.Equal(issue.Waiters, waiters), nil
 	case "metadata":
-		current, err := normalizedMetadata(issue.Metadata)
-		if err != nil {
-			return false, err
-		}
+		// The same answer ApplyMetadataPatch gives on the store routes, so a
+		// resolved metadata edit that only respells the stored document (1.0
+		// over 1, a reordered object) writes no row, version or event on the
+		// unit-of-work route either.
 		candidate, err := storage.NormalizeMetadataValue(value)
 		if err != nil {
 			return false, err
 		}
-		return current == candidate, nil
+		changed, err := metadataChanged(issue.Metadata, json.RawMessage(candidate))
+		if err != nil {
+			return false, err
+		}
+		return !changed, nil
 	default:
 		return false, nil
 	}
@@ -850,18 +858,11 @@ func matchesTimePointer(current *time.Time, candidate interface{}) bool {
 	}
 }
 
-func normalizedMetadata(value json.RawMessage) (string, error) {
-	if len(value) == 0 {
-		return "{}", nil
-	}
-	return storage.NormalizeMetadataValue(value)
-}
-
 // isMergeOpKey reports whether k is a read-merge-write operation key consumed by
 // ResolveMergeOps rather than a concrete column value to pass through unchanged.
 func isMergeOpKey(k string) bool {
 	switch k {
-	case OpMergeMetadata, OpSetMetadata, OpUnsetMetadata, OpAppendNotes:
+	case OpMergeMetadata, OpSetMetadata, OpUnsetMetadata, OpMergePatchMetadata, OpAppendNotes:
 		return true
 	default:
 		return false
@@ -876,7 +877,8 @@ func resolveMetadataMergeOps(oldIssue *types.Issue, updates, resolved map[string
 	_, hasMerge := updates[OpMergeMetadata]
 	_, hasSet := updates[OpSetMetadata]
 	_, hasUnset := updates[OpUnsetMetadata]
-	if !hasMerge && !hasSet && !hasUnset {
+	mergePatches, hasMergePatch := updates[OpMergePatchMetadata]
+	if !hasMerge && !hasSet && !hasUnset && !hasMergePatch {
 		return nil
 	}
 	if _, direct := resolved["metadata"]; direct {
@@ -884,6 +886,22 @@ func resolveMetadataMergeOps(oldIssue *types.Issue, updates, resolved map[string
 	}
 
 	current := oldIssue.Metadata
+	if hasMergePatch {
+		if hasMerge || hasSet || hasUnset {
+			return fmt.Errorf("cannot combine a metadata merge patch with other metadata edits")
+		}
+		patches, ok := mergePatches.([]json.RawMessage)
+		if !ok {
+			return fmt.Errorf("%s must be a list of JSON documents, got %T", OpMergePatchMetadata, mergePatches)
+		}
+		for _, patch := range patches {
+			merged, err := storage.MergePatchMetadataJSON(current, patch)
+			if err != nil {
+				return fmt.Errorf("metadata merge patch failed: %w", err)
+			}
+			current = merged
+		}
+	}
 	if hasMerge {
 		normalized, err := storage.NormalizeMetadataValue(updates[OpMergeMetadata])
 		if err != nil {

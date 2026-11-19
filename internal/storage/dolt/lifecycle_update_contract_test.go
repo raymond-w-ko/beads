@@ -57,6 +57,9 @@ func TestLifecycleUpdateContract(t *testing.T) {
 	t.Run("MetadataPatchOrdersMergeSetUnset", func(t *testing.T) {
 		conformance.RunLifecycleUpdateMetadataPatchOrdersMergeSetUnset(t, ctx, fixture)
 	})
+	t.Run("MetadataMergePatch", func(t *testing.T) {
+		conformance.RunLifecycleUpdateMetadataMergePatch(t, ctx, fixture)
+	})
 	t.Run("ClosePolicy", func(t *testing.T) {
 		conformance.RunLifecycleUpdateClosePolicy(t, ctx, fixture)
 	})

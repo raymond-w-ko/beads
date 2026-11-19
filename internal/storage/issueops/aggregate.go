@@ -1,11 +1,14 @@
 package issueops
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/steveyegge/beads/internal/storage"
@@ -103,6 +106,14 @@ func ValidateMetadataPatch(patch publicops.MetadataPatch) error {
 	if patch.Replace.Set && (patch.Merge.Set || len(patch.Set) > 0 || len(patch.Unset) > 0) {
 		return fmt.Errorf("%w: cannot combine metadata replacement with incremental metadata edits", storage.ErrValidation)
 	}
+	if len(patch.MergePatch) > 0 && (patch.Replace.Set || patch.Merge.Set || len(patch.Set) > 0 || len(patch.Unset) > 0) {
+		return fmt.Errorf("%w: cannot combine a metadata merge patch with other metadata edits", storage.ErrValidation)
+	}
+	for _, mergePatch := range patch.MergePatch {
+		if err := storage.ValidateMetadataMergePatch(mergePatch); err != nil {
+			return fmt.Errorf("%w: %w", storage.ErrValidation, err)
+		}
+	}
 	return nil
 }
 
@@ -187,8 +198,11 @@ func AuthorizeAssigneeTransfer(ctx context.Context, tx DBTX, before *types.Issue
 
 // ApplyMetadataPatch returns the canonical metadata value and whether it changes.
 func ApplyMetadataPatch(current json.RawMessage, patch publicops.MetadataPatch) (json.RawMessage, bool, error) {
-	if !patch.Replace.Set && !patch.Merge.Set && len(patch.Set) == 0 && len(patch.Unset) == 0 {
+	if !patch.Replace.Set && !patch.Merge.Set && len(patch.Set) == 0 && len(patch.Unset) == 0 && len(patch.MergePatch) == 0 {
 		return current, false, nil
+	}
+	if err := ValidateMetadataPatch(patch); err != nil {
+		return nil, false, err
 	}
 	setKeys := make([]string, 0, len(patch.Set))
 	for key := range patch.Set {
@@ -213,6 +227,15 @@ func ApplyMetadataPatch(current json.RawMessage, patch publicops.MetadataPatch) 
 		}
 		if !json.Valid(next) {
 			return nil, false, fmt.Errorf("%w: metadata replacement is not valid JSON", storage.ErrValidation)
+		}
+	} else if len(patch.MergePatch) > 0 {
+		next = append(json.RawMessage(nil), current...)
+		for _, mergePatch := range patch.MergePatch {
+			merged, err := storage.MergePatchMetadataJSON(next, mergePatch)
+			if err != nil {
+				return nil, false, fmt.Errorf("%w: metadata merge patch: %v", storage.ErrValidation, err)
+			}
+			next = merged
 		}
 	} else {
 		next = append(json.RawMessage(nil), current...)
@@ -262,27 +285,147 @@ func ApplyMetadataPatch(current json.RawMessage, patch publicops.MetadataPatch) 
 	return next, changed, nil
 }
 
+// metadataChanged reports whether next differs from current as a JSON value,
+// with numbers compared as the server keeps them (review bd-ldmiy finding 3):
+//
+//   - two integer literals (an optional '-' and digits, no fraction or
+//     exponent; -0 aside) inside the signed or unsigned 64-bit range are equal
+//     only when the integers are: Dolt 2.6 keeps such an integer's digits, so
+//     9007199254740993 over a stored 9007199254740992 is a change;
+//   - an integer literal in that range against any other spelling is equal only
+//     when the other's float64 is integral and the literal is either exactly
+//     that integer or that float64's shortest decimal spelling, which is how
+//     the server prints a stored float64 (2^63 as 9223372036854776000): 1 and
+//     1.0, 1000 and 1e3 are equal, 9007199254740993 and 9007199254740993.0
+//     (stored as ...992) are not;
+//   - any other pair is equal when the two float64 values are, as the float64
+//     round trip of the old form decided: 0.1 and 0.10000000000000001 are one
+//     number, -0 and 0 are two. A number a float64 cannot hold (1e400) anywhere
+//     in either document is an error, as it was.
+//
+// Each number costs time and memory linear in its text; no exponent is
+// expanded into digits.
 func metadataChanged(current, next json.RawMessage) (bool, error) {
-	canonical := func(raw json.RawMessage) (string, error) {
+	decode := func(raw json.RawMessage) (any, error) {
 		if len(raw) == 0 || string(raw) == "null" {
-			return "{}", nil
+			return map[string]any{}, nil
 		}
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
 		var value any
-		if err := json.Unmarshal(raw, &value); err != nil {
-			return "", err
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
 		}
-		encoded, err := json.Marshal(value)
-		return string(encoded), err
+		if err := checkJSONNumbers(value); err != nil {
+			return nil, err
+		}
+		return value, nil
 	}
-	left, err := canonical(current)
+	left, err := decode(current)
 	if err != nil {
 		return false, err
 	}
-	right, err := canonical(next)
+	right, err := decode(next)
 	if err != nil {
 		return false, err
 	}
-	return left != right, nil
+	return !jsonValuesEqual(left, right), nil
+}
+
+// checkJSONNumbers fails on a number a float64 cannot hold, where the old
+// float64 decode failed.
+func checkJSONNumbers(value any) error {
+	switch typed := value.(type) {
+	case json.Number:
+		if _, err := strconv.ParseFloat(typed.String(), 64); err != nil {
+			return fmt.Errorf("metadata number %.40s: %w", typed.String(), err)
+		}
+	case map[string]any:
+		for _, member := range typed {
+			if err := checkJSONNumbers(member); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, member := range typed {
+			if err := checkJSONNumbers(member); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// jsonValuesEqual compares two documents decoded with UseNumber: objects by
+// their member sets, arrays in order, numbers by jsonNumbersEqual, every other
+// value as itself. A number never equals a string of the same digits.
+func jsonValuesEqual(left, right any) bool {
+	switch l := left.(type) {
+	case map[string]any:
+		r, ok := right.(map[string]any)
+		if !ok || len(l) != len(r) {
+			return false
+		}
+		for key, member := range l {
+			other, present := r[key]
+			if !present || !jsonValuesEqual(member, other) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		r, ok := right.([]any)
+		if !ok || len(l) != len(r) {
+			return false
+		}
+		for i := range l {
+			if !jsonValuesEqual(l[i], r[i]) {
+				return false
+			}
+		}
+		return true
+	case json.Number:
+		r, ok := right.(json.Number)
+		return ok && jsonNumbersEqual(l.String(), r.String())
+	default:
+		return left == right
+	}
+}
+
+// jsonNumbersEqual is metadataChanged's number rule for two valid JSON
+// numbers a float64 can hold (checkJSONNumbers ran first).
+func jsonNumbersEqual(a, b string) bool {
+	aInt, bInt := isJSON64BitIntegerLiteral(a), isJSON64BitIntegerLiteral(b)
+	if aInt && bInt {
+		return a == b
+	}
+	fa, _ := strconv.ParseFloat(a, 64)
+	fb, _ := strconv.ParseFloat(b, 64)
+	if aInt || bInt {
+		literal, other := a, fb
+		if bInt {
+			literal, other = b, fa
+		}
+		if other != math.Trunc(other) || (other == 0 && math.Signbit(other)) {
+			return false
+		}
+		return literal == strconv.FormatFloat(other, 'f', 0, 64) ||
+			literal == strconv.FormatFloat(other, 'f', -1, 64)
+	}
+	return math.Float64bits(fa) == math.Float64bits(fb)
+}
+
+// isJSON64BitIntegerLiteral reports whether number, a valid JSON number, has
+// no fraction and no exponent, is not -0, and fits an int64 or a uint64.
+func isJSON64BitIntegerLiteral(number string) bool {
+	if strings.ContainsAny(number, ".eE") || number == "-0" {
+		return false
+	}
+	if _, err := strconv.ParseInt(number, 10, 64); err == nil {
+		return true
+	}
+	_, err := strconv.ParseUint(number, 10, 64)
+	return err == nil
 }
 
 // ApplyLabelPatch applies ordered label edits and reports whether rows changed.

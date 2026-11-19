@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -1061,6 +1062,169 @@ func RunLifecycleUpdateMetadataPatchOrdersMergeSetUnset(t *testing.T, ctx contex
 		})
 	}
 	events.assert(t, "refused replace-plus-incremental patches", 0)
+}
+
+// RunLifecycleUpdateMetadataMergePatch pins MetadataPatch.MergePatch: RFC 7396
+// patches applied in order to the document read inside the mutation, a null
+// member removing a key at any depth, members the patches do not name kept, a
+// name given twice in one object taking its last value, and the combinations
+// and patches the field refuses writing nothing: the row (its updated_at and
+// row version included) and the issue's events stay as they were.
+func RunLifecycleUpdateMetadataMergePatch(t *testing.T, ctx context.Context, fixture LifecycleUpdateFixture) {
+	t.Helper()
+
+	id := fixture.IssuePrefix + "-lup-metamergepatch"
+	seeded := lifecycleUpdateIssue(id)
+	seeded.Metadata = json.RawMessage(`{"top":"seeded","jira.sprint":"s1","everturn":{"landing":{"old":1},"worktree":"wt/a","keep":{"n":7}}}`)
+	seedLifecycleUpdateIssue(t, ctx, fixture, seeded)
+
+	patched, err := fixture.Lifecycle.Update(ctx, publicops.UpdateRequest{Actor: "writer", IssueID: id, Patch: publicops.IssuePatch{
+		Metadata: publicops.MetadataPatch{MergePatch: []json.RawMessage{
+			json.RawMessage(`{"everturn":{"landing":null}}`),
+			json.RawMessage(`{"everturn":{"landing":{"new":2},"worktree":"wt/b"},"top":null,"added":[1,null]}`),
+		}},
+	}})
+	if err != nil {
+		t.Fatalf("metadata merge patch on %s: %v", id, err)
+	}
+	if !patched.Changed {
+		t.Errorf("metadata merge patch on %s reported Changed = false, want a committed edit", id)
+	}
+	const merged = `{"added":[1,null],"everturn":{"keep":{"n":7},"landing":{"new":2},"worktree":"wt/b"},"jira.sprint":"s1"}`
+	assertLifecycleUpdateMetadata(t, "merge patch result", patched.Issue, merged)
+	assertLifecycleUpdateMetadata(t, "stored row after the merge patch", lifecycleUpdateRow(t, ctx, fixture, id), merged)
+
+	// A name twice in one object: the last member wins, the earlier one is
+	// ignored rather than merged, at the top level and below.
+	if _, err := fixture.Lifecycle.Update(ctx, publicops.UpdateRequest{Actor: "writer", IssueID: id, Patch: publicops.IssuePatch{
+		Metadata: publicops.MetadataPatch{MergePatch: []json.RawMessage{
+			json.RawMessage(`{"everturn":{"keep":{"n":8},"keep":{"m":9}},"dup":1,"dup":null,"twice":null,"twice":"last"}`),
+		}},
+	}}); err != nil {
+		t.Fatalf("duplicate-name merge patch on %s: %v", id, err)
+	}
+	const deduped = `{"added":[1,null],"everturn":{"keep":{"m":9,"n":7},"landing":{"new":2},"worktree":"wt/b"},"jira.sprint":"s1","twice":"last"}`
+	assertLifecycleUpdateMetadata(t, "stored row after the duplicate-name merge patch", lifecycleUpdateRow(t, ctx, fixture, id), deduped)
+
+	// Numbers, a literal U+FFFD name and an escaped surrogate pair are
+	// accepted; the respellings below are then no change on every route
+	// (review bd-ldmiy finding 2): Changed is false and nothing is written, no
+	// row version, no updated_at, no event. That is the answer the store
+	// routes gave, and the unit-of-work route now gives it too.
+	if _, err := fixture.Lifecycle.Update(ctx, publicops.UpdateRequest{Actor: "writer", IssueID: id, Patch: publicops.IssuePatch{
+		Metadata: publicops.MetadataPatch{MergePatch: []json.RawMessage{
+			json.RawMessage(`{"n":1,"k":1000,"f":0.1,"everturn":{"` + "\uFFFD" + `":"keep"},"emoji":"\ud83d\ude00"}`),
+		}},
+	}}); err != nil {
+		t.Fatalf("numbers merge patch on %s: %v", id, err)
+	}
+	const want = `{"added":[1,null],"emoji":"` + "\U0001F600" + `","everturn":{"keep":{"m":9,"n":7},"landing":{"new":2},"worktree":"wt/b","` + "\uFFFD" + `":"keep"},"f":0.1,"jira.sprint":"s1","k":1000,"n":1,"twice":"last"}`
+	assertLifecycleUpdateMetadata(t, "stored row after the numbers merge patch", lifecycleUpdateRow(t, ctx, fixture, id), want)
+	unchanged := lifecycleUpdateRow(t, ctx, fixture, id)
+	noopEvents := newLifecycleUpdateEventCounter(t, ctx, fixture, id)
+	for _, noop := range []struct {
+		name  string
+		patch publicops.MetadataPatch
+	}{
+		{"1.0 over 1", publicops.MetadataPatch{MergePatch: []json.RawMessage{json.RawMessage(`{"n":1.0}`)}}},
+		{"1e3 over 1000", publicops.MetadataPatch{MergePatch: []json.RawMessage{json.RawMessage(`{"k":1e3}`)}}},
+		{"0.10000000000000001 over 0.1", publicops.MetadataPatch{MergePatch: []json.RawMessage{json.RawMessage(`{"f":0.10000000000000001}`)}}},
+		{"a nested value it holds", publicops.MetadataPatch{MergePatch: []json.RawMessage{json.RawMessage(`{"everturn":{"keep":{"m":9},"worktree":"wt/b"}}`)}}},
+		{"removing an absent key", publicops.MetadataPatch{MergePatch: []json.RawMessage{json.RawMessage(`{"absent":null,"everturn":{"absent":null}}`)}}},
+		{"an empty patch", publicops.MetadataPatch{MergePatch: []json.RawMessage{json.RawMessage(`{}`)}}},
+		{"set then reset in one call", publicops.MetadataPatch{MergePatch: []json.RawMessage{json.RawMessage(`{"n":2}`), json.RawMessage(`{"n":1e0}`)}}},
+		{"legacy set 0.10000000000000001 over 0.1", publicops.MetadataPatch{Set: map[string]json.RawMessage{"f": storage.MetadataEditValue("0.10000000000000001")}}},
+		{"legacy set 1E3 over 1000", publicops.MetadataPatch{Set: map[string]json.RawMessage{"k": storage.MetadataEditValue("1E3")}}},
+	} {
+		t.Run("no change: "+noop.name, func(t *testing.T) {
+			result, err := fixture.Lifecycle.Update(ctx, publicops.UpdateRequest{
+				Actor: "writer", IssueID: id, Patch: publicops.IssuePatch{Metadata: noop.patch},
+			})
+			if err != nil {
+				t.Fatalf("%s: %v", noop.name, err)
+			}
+			if result.Changed {
+				t.Errorf("%s: Changed = true, want false for a patch that leaves the document as stored", noop.name)
+			}
+			after := lifecycleUpdateRow(t, ctx, fixture, id)
+			assertLifecycleUpdateMetadata(t, "stored row after "+noop.name, after, want)
+			assertLifecycleUpdateRowUnchanged(t, ctx, fixture, id, "after "+noop.name, unchanged)
+			if !after.UpdatedAt.Equal(unchanged.UpdatedAt) {
+				t.Errorf("%s after %s: updated_at = %v, want it unchanged at %v", id, noop.name, after.UpdatedAt, unchanged.UpdatedAt)
+			}
+		})
+	}
+	noopEvents.assert(t, "merge patches that change nothing", 0)
+
+	before := lifecycleUpdateRow(t, ctx, fixture, id)
+	tooDeep := `{"deep":` + strings.Repeat(`{"a":`, storage.MaxMetadataMergePatchDepth) + `1` + strings.Repeat(`}`, storage.MaxMetadataMergePatchDepth) + `}`
+	events := newLifecycleUpdateEventCounter(t, ctx, fixture, id)
+	for _, refusal := range []struct {
+		name  string
+		patch publicops.MetadataPatch
+	}{
+		{"merge patch with merge", publicops.MetadataPatch{
+			MergePatch: []json.RawMessage{json.RawMessage(`{"must_not_persist":true}`)},
+			Merge:      publicops.Field[json.RawMessage]{Set: true, Value: json.RawMessage(`{"must_not_persist":true}`)},
+		}},
+		{"merge patch with set", publicops.MetadataPatch{
+			MergePatch: []json.RawMessage{json.RawMessage(`{"must_not_persist":true}`)},
+			Set:        map[string]json.RawMessage{"must_not_persist": json.RawMessage(`true`)},
+		}},
+		{"merge patch with unset", publicops.MetadataPatch{
+			MergePatch: []json.RawMessage{json.RawMessage(`{"must_not_persist":true}`)},
+			Unset:      []string{"added"},
+		}},
+		{"merge patch with replace", publicops.MetadataPatch{
+			MergePatch: []json.RawMessage{json.RawMessage(`{"must_not_persist":true}`)},
+			Replace:    publicops.Field[json.RawMessage]{Set: true, Value: json.RawMessage(`{"replacement":true}`)},
+		}},
+		{"array merge patch", publicops.MetadataPatch{MergePatch: []json.RawMessage{json.RawMessage(`[1]`)}}},
+		{"null merge patch", publicops.MetadataPatch{MergePatch: []json.RawMessage{json.RawMessage(`null`)}}},
+		{"invalid merge patch", publicops.MetadataPatch{MergePatch: []json.RawMessage{json.RawMessage(`{`)}}},
+		{"second patch invalid", publicops.MetadataPatch{MergePatch: []json.RawMessage{
+			json.RawMessage(`{"must_not_persist":true}`), json.RawMessage(`"x"`),
+		}}},
+		{"top-level name outside the key grammar", publicops.MetadataPatch{MergePatch: []json.RawMessage{json.RawMessage(`{"bad key":true}`)}}},
+		{"patch nested past the depth bound", publicops.MetadataPatch{MergePatch: []json.RawMessage{
+			json.RawMessage(`{"must_not_persist":true}`), json.RawMessage(tooDeep),
+		}}},
+		// Review bd-ldmiy finding 1: text the store would keep as U+FFFD.
+		// The raw byte e9 as a name would remove the U+FFFD member above.
+		{"raw byte e9 as a name", publicops.MetadataPatch{MergePatch: []json.RawMessage{
+			json.RawMessage(`{"everturn":{"` + string([]byte{0xe9}) + `":null}}`),
+		}}},
+		{"raw byte e9 in a value", publicops.MetadataPatch{MergePatch: []json.RawMessage{
+			json.RawMessage(`{"must_not_persist":"` + string([]byte{0xe9}) + `"}`),
+		}}},
+		{"lone high surrogate escape as a name", publicops.MetadataPatch{MergePatch: []json.RawMessage{
+			json.RawMessage(`{"everturn":{"\ud800":null}}`),
+		}}},
+		{"lone low surrogate escape in a value", publicops.MetadataPatch{MergePatch: []json.RawMessage{
+			json.RawMessage(`{"must_not_persist":true}`), json.RawMessage(`{"must_not_persist":"\udc00"}`),
+		}}},
+	} {
+		t.Run(refusal.name, func(t *testing.T) {
+			_, err := fixture.Lifecycle.Update(ctx, publicops.UpdateRequest{
+				Actor: "writer", IssueID: id, Patch: publicops.IssuePatch{Metadata: refusal.patch},
+			})
+			if !errors.Is(err, storage.ErrValidation) {
+				t.Fatalf("%s: err = %v, want ErrValidation", refusal.name, err)
+			}
+			if strings.Contains(refusal.name, "surrogate") || strings.Contains(refusal.name, "e9") {
+				if !strings.Contains(err.Error(), storage.ErrMetadataMergePatchText.Error()) {
+					t.Errorf("%s: err = %v, want it to say %q", refusal.name, err, storage.ErrMetadataMergePatchText)
+				}
+			}
+			after := lifecycleUpdateRow(t, ctx, fixture, id)
+			assertLifecycleUpdateMetadata(t, "stored row after "+refusal.name, after, want)
+			assertLifecycleUpdateRowUnchanged(t, ctx, fixture, id, "after "+refusal.name, before)
+			if !after.UpdatedAt.Equal(before.UpdatedAt) {
+				t.Errorf("%s after %s: updated_at = %v, want it unchanged at %v", id, refusal.name, after.UpdatedAt, before.UpdatedAt)
+			}
+		})
+	}
+	events.assert(t, "refused merge patches", 0)
 }
 
 // RunLifecycleUpdateClosePolicy pins what a generic status update does when it

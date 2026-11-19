@@ -52,6 +52,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal from a managed (local sidecar) backend keep the full transient
   retry.
 
+## [1.3.5-dev.3] - 2026-11-19
+
+Fork pre-release above [1.3.5-dev.2], stamped so a caller can tell by
+`bd version` a build that has `bd update --merge-metadata`: everturn's bridge
+writes nested metadata keys with the flag once its pin reaches this version.
+It also marks the ready, show, error-classification and init schema check
+changes landed since 1.3.5-dev.2.
+
+### Added
+
+- **`bd update --merge-metadata '<json>'` applies an RFC 7396 JSON Merge Patch
+  to an issue's metadata**, so a caller can set or remove one nested key and keep
+  its siblings: an object member recurses, a `null` member removes the key, any
+  other value replaces it. The flag repeats, and its patches apply in order in
+  the update's one transaction against the row read there (`{"a":{"b":null}}`
+  then `{"a":{"b":{...}}}` replaces a nested object whole). It takes `@file.json`
+  as `--metadata` does, and refuses, before any write, a patch that is not a JSON
+  object, one nested more than 100 deep, a top-level name outside the metadata
+  key grammar, and use beside `--metadata`, `--set-metadata` or
+  `--unset-metadata`. It also refuses text the store would not keep as typed,
+  a byte that is not UTF-8 or a `\u` escape of a lone surrogate, in a name or a
+  string value, with `metadata merge patch is not valid UTF-8 text: it holds an
+  invalid byte or an unpaired \u surrogate escape`. Names are literal at every
+  depth, a name given twice in one object takes its last value, and members a
+  patch does not name keep their stored text. A patch that leaves the document
+  as stored (`{"n":1.0}` over `{"n":1}`) writes nothing on every route. Public
+  `issueops.MetadataPatch` gains `MergePatch`.
+
+### Changed
+
+- **An idle `bd ready` no longer waits for the journal writer lock** (fork
+  19b5b975a): the ready reads (`bd ready`, `--json` and the ready count) probe
+  for due defers on one connection first and run the defer-wake sweep, which
+  takes the lock behind every bead writer on the database, only when one is
+  due. A claim keeps the sweep. The config read of `bd list` and `bd ready` is
+  one `SELECT`, not three statements in a transaction: 7 statements and a lock
+  wait less per idle `bd ready`.
+- **`--label-pattern` sends a bare `LIKE` for a glob with no escapes** (fork
+  cbcb704ca): a glob holding no `%`, `_`, `\` or `|`, such as `class:*`, seeks
+  `idx_labels_label` instead of filtering every label row with
+  `LIKE ? ESCAPE '|'`, 122 ms -> 42 ms at 20k issues and 33k labels on Dolt
+  2.6.2. Every other glob keeps the `ESCAPE` form.
+- **`bd show <id>` reads the issue once** when the id is exact (fork
+  6ad20a350), not an id search and then the issue again: `bd show --json` 40
+  -> 34 statements per process on Dolt 2.6.2. Every other command resolves ids
+  as before.
+- **The schema check of `bd init` on an existing database and of `bd doctor`
+  no longer counts every issue** (fork 3d4f1e754), 0.45 s on the fleet's store
+  at each `bd init`: it sends a one-row read of the columns and comparisons the
+  statistics query uses and an `EXPLAIN` of the blocked count's filter, which
+  reads no row, with the old check's answers.
+
+### Fixed
+
+- **A guarded metadata edit that changes only an integer's digits past 2^53 is
+  written again**, not dropped as a no-op. The update's change check read both
+  documents through a float64, so `{"id":9007199254740993}` over a stored
+  `9007199254740992` exited 0 and wrote nothing on a Dolt that keeps the digits
+  (2.6.x; 2.2 rounds them in the column). Two integer literals inside the 64-bit
+  range now compare as integers. An integer literal equals another spelling
+  only when that spelling's float64 is integral and the literal is exactly it
+  or is its shortest digits, as the server prints a stored float64
+  (`9223372036854776000` for 2^63). Every other pair compares as
+  before, through a float64: `1.0` over a stored `1`, `1e3` over `1000` and
+  `0.10000000000000001` over `0.1` are still no-ops. The unit-of-work
+  (proxied-server) route now gives the same answer for every metadata edit, so
+  a respelled document no longer advances the row version or `updated_at` or
+  writes an event there.
+
+- **A typed server error no longer opens the circuit breaker** (fork
+  900e40be0). The connection and retry checks matched words such as "gone
+  away" anywhere in an error's text, a MySQL packet quoting user input
+  included: `bd config set types.custom 'gone away,gone away'` got 1062
+  duplicate primary key, replayed the write five times and opened the breaker
+  every bd process of that server and database shares. A typed packet is now a
+  server response; only the outage packets (1053, and 2003 from the db proxy)
+  count as a lost connection, and a real connection loss joined to a typed
+  packet still does.
+
 ## [1.3.5-dev.2] - 2026-11-19
 
 Fork pre-release above [1.3.5-dev.1], stamped so a caller can tell by

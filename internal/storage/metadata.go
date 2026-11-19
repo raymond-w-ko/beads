@@ -2,10 +2,14 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // NormalizeMetadataValue converts metadata values to a validated JSON string.
@@ -271,6 +275,271 @@ func MergeMetadataJSON(existing, incoming json.RawMessage) (json.RawMessage, err
 		return nil, fmt.Errorf("failed to marshal merged metadata: %w", err)
 	}
 	return json.RawMessage(result), nil
+}
+
+// MaxMetadataMergePatchDepth is the deepest nesting of objects and arrays a
+// metadata merge patch may have; the patch itself is depth 1. A deeper patch is
+// refused before any write. The merge recurses once per object level of the
+// patch and re-reads the member text at each, so an unbounded depth would cost
+// time quadratic in the patch's length. 100 is MySQL's limit on the depth of a
+// JSON document.
+const MaxMetadataMergePatchDepth = 100
+
+// ValidateMetadataMergePatch checks that patch can be applied as a metadata
+// merge patch: a JSON object, nested at most MaxMetadataMergePatchDepth deep,
+// whose top-level member names pass ValidateMetadataKey. Member names below
+// the top level are literal and are not checked, and member values are not
+// inspected. It is what every caller runs before a write, so a refused patch
+// writes nothing.
+func ValidateMetadataMergePatch(patch json.RawMessage) error {
+	_, err := metadataMergePatchMembers(patch)
+	return err
+}
+
+// ErrMetadataMergePatchText refuses a merge patch holding text the store would
+// not keep as typed: a byte sequence that is not UTF-8, or a \u escape of a
+// lone UTF-16 surrogate (a high half not followed by a low half, or a low half
+// alone). Both decode to U+FFFD, so such a patch would name, set or remove a
+// U+FFFD member it never spelled.
+var ErrMetadataMergePatchText = errors.New("metadata merge patch is not valid UTF-8 text: it holds an invalid byte or an unpaired \\u surrogate escape")
+
+func metadataMergePatchMembers(patch json.RawMessage) (map[string]json.RawMessage, error) {
+	if !json.Valid(patch) {
+		return nil, fmt.Errorf("metadata merge patch is not valid JSON")
+	}
+	if !jsonTextKeepsItsCharacters(patch) {
+		return nil, ErrMetadataMergePatchText
+	}
+	if depth := jsonNestingDepth(patch); depth > MaxMetadataMergePatchDepth {
+		return nil, fmt.Errorf("metadata merge patch is nested %d deep, more than the limit of %d", depth, MaxMetadataMergePatchDepth)
+	}
+	members, isObject := jsonObjectMembers(patch)
+	if !isObject {
+		return nil, fmt.Errorf("metadata merge patch must be a JSON object, got %s", jsonKindOf(patch))
+	}
+	keys := make([]string, 0, len(members))
+	for key := range members {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if err := ValidateMetadataKey(key); err != nil {
+			return nil, err
+		}
+	}
+	return members, nil
+}
+
+// MergePatchMetadataJSON applies patch to existing as an RFC 7396 JSON Merge
+// Patch and returns the merged document. An object member of the patch
+// recurses into the same-named member of the document, a null member removes
+// it, and any other member replaces it; a document member that is absent or is
+// not an object counts as {} before an object member is merged into it.
+//
+// Member names are literal at every depth: there is no path grammar, so a
+// dotted or slashed name is one member. Values the patch does not name keep
+// their text, since the recursion decodes only into map[string]json.RawMessage
+// and only along the patch's own paths; a number is never read through a
+// float64. The encoding is MergeMetadataJSON's: members sorted by name, each
+// object compacted, and <, >, & and U+2028/U+2029 escaped inside strings.
+//
+// A name that appears twice in one object of the patch takes its last value,
+// as encoding/json decodes it (and as Dolt stores such a document): the
+// earlier member is ignored, not merged with the later one.
+//
+// Existing metadata that is not an object (empty, null, or any other value)
+// counts as {}, the RFC's rule for the target, where MergeMetadataJSON would
+// refuse it. Only the patch is checked: ValidateMetadataMergePatch.
+func MergePatchMetadataJSON(existing, patch json.RawMessage) (json.RawMessage, error) {
+	members, err := metadataMergePatchMembers(patch)
+	if err != nil {
+		return nil, err
+	}
+	base, isObject := jsonObjectMembers(existing)
+	if !isObject {
+		base = make(map[string]json.RawMessage)
+	}
+	merged, err := applyMergePatchMembers(base, members)
+	if err != nil {
+		return nil, err
+	}
+	result, err := json.Marshal(merged)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal merged metadata: %w", err)
+	}
+	return json.RawMessage(result), nil
+}
+
+// applyMergePatchMembers is RFC 7396's MergePatch for an object patch, with
+// target already resolved to an object (possibly empty). It mutates target.
+func applyMergePatchMembers(target, patch map[string]json.RawMessage) (map[string]json.RawMessage, error) {
+	for name, value := range patch {
+		if isJSONNull(value) {
+			delete(target, name)
+			continue
+		}
+		members, isObject := jsonObjectMembers(value)
+		if !isObject {
+			target[name] = value
+			continue
+		}
+		child, childIsObject := jsonObjectMembers(target[name])
+		if !childIsObject {
+			child = make(map[string]json.RawMessage)
+		}
+		merged, err := applyMergePatchMembers(child, members)
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := json.Marshal(merged)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal merged metadata member %q: %w", name, err)
+		}
+		target[name] = encoded
+	}
+	return target, nil
+}
+
+// jsonObjectMembers decodes raw as an object's members. It reports false for
+// anything that is not a JSON object, including null and invalid JSON.
+func jsonObjectMembers(raw json.RawMessage) (map[string]json.RawMessage, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, false
+	}
+	members := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(trimmed, &members); err != nil {
+		return nil, false
+	}
+	return members, true
+}
+
+// jsonNestingDepth is the deepest nesting of objects and arrays in raw, a
+// valid JSON document, in one pass over its bytes: a scalar is depth 0, {} or
+// [] depth 1.
+func jsonNestingDepth(raw json.RawMessage) int {
+	depth, deepest := 0, 0
+	inString, escaped := false, false
+	for _, c := range raw {
+		switch {
+		case inString:
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+		case c == '"':
+			inString = true
+		case c == '{' || c == '[':
+			depth++
+			if depth > deepest {
+				deepest = depth
+			}
+		case c == '}' || c == ']':
+			depth--
+		}
+	}
+	return deepest
+}
+
+// jsonTextKeepsItsCharacters reports whether raw, a valid JSON document, is
+// UTF-8 and every \u escape in its strings stands for a character: a high
+// surrogate escape is followed at once by a low one, and no low surrogate
+// escape stands alone. A literal U+FFFD and an escaped surrogate pair pass. It
+// is one pass over the bytes.
+func jsonTextKeepsItsCharacters(raw json.RawMessage) bool {
+	if !utf8.Valid(raw) {
+		return false
+	}
+	inString := false
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if !inString {
+			if c == '"' {
+				inString = true
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = false
+		case '\\':
+			i++
+			if i >= len(raw) || raw[i] != 'u' {
+				continue
+			}
+			unit, ok := jsonEscapeUnit(raw, i+1)
+			if !ok {
+				return false
+			}
+			i += 4
+			switch {
+			case unit >= 0xD800 && unit <= 0xDBFF:
+				if i+2 >= len(raw) || raw[i+1] != '\\' || raw[i+2] != 'u' {
+					return false
+				}
+				low, ok := jsonEscapeUnit(raw, i+3)
+				if !ok || low < 0xDC00 || low > 0xDFFF {
+					return false
+				}
+				i += 6
+			case unit >= 0xDC00 && unit <= 0xDFFF:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// jsonEscapeUnit reads the four hex digits of a \u escape starting at raw[at].
+func jsonEscapeUnit(raw json.RawMessage, at int) (rune, bool) {
+	if at+4 > len(raw) {
+		return 0, false
+	}
+	var unit rune
+	for _, c := range raw[at : at+4] {
+		unit <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			unit |= rune(c - '0')
+		case c >= 'a' && c <= 'f':
+			unit |= rune(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			unit |= rune(c-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return unit, true
+}
+
+func isJSONNull(raw json.RawMessage) bool {
+	return string(bytes.TrimSpace(raw)) == "null"
+}
+
+// jsonKindOf names the top-level kind of a valid JSON document for error text.
+func jsonKindOf(raw json.RawMessage) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return "empty input"
+	}
+	switch trimmed[0] {
+	case '{':
+		return "an object"
+	case '[':
+		return "an array"
+	case '"':
+		return "a string"
+	case 't', 'f':
+		return "a boolean"
+	case 'n':
+		return "null"
+	default:
+		return "a number"
+	}
 }
 
 // ApplyMetadataEdits applies incremental set (key=value) and unset (key) edits

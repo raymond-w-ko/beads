@@ -30,6 +30,7 @@ func CloneUpdateRequest(request publicops.UpdateRequest) publicops.UpdateRequest
 	clone.Patch.Metadata.Merge.Value = cloneRawMessage(request.Patch.Metadata.Merge.Value)
 	clone.Patch.Metadata.Set = cloneRawMessageMap(request.Patch.Metadata.Set)
 	clone.Patch.Metadata.Unset = append([]string(nil), request.Patch.Metadata.Unset...)
+	clone.Patch.Metadata.MergePatch = cloneRawMessages(request.Patch.Metadata.MergePatch)
 	clone.Patch.EstimatedMinutes.Value = cloneInt(request.Patch.EstimatedMinutes.Value)
 	clone.Patch.ExternalRef.Value = cloneString(request.Patch.ExternalRef.Value)
 	clone.Patch.DueAt.Value = cloneTime(request.Patch.DueAt.Value)
@@ -108,6 +109,17 @@ func cloneComments(comments []*types.Comment) []*types.Comment {
 
 func cloneRawMessage(value json.RawMessage) json.RawMessage {
 	return append(json.RawMessage(nil), value...)
+}
+
+func cloneRawMessages(values []json.RawMessage) []json.RawMessage {
+	if values == nil {
+		return nil
+	}
+	clone := make([]json.RawMessage, len(values))
+	for index, value := range values {
+		clone[index] = cloneRawMessage(value)
+	}
+	return clone
 }
 
 func cloneRawMessageMap(values map[string]json.RawMessage) map[string]json.RawMessage {

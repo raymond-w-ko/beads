@@ -278,6 +278,15 @@ func TestBuildUpdatePatchMapsSupportedFields(t *testing.T) {
 			want:    issueops.IssuePatch{Metadata: issueops.MetadataPatch{Unset: []string{"one", "two"}}},
 		},
 		{
+			name: "metadata merge patches keep their order",
+			updates: map[string]any{storageissueops.OpMergePatchMetadata: []json.RawMessage{
+				json.RawMessage(`{"everturn":{"landing":null}}`), json.RawMessage(`{"everturn":{"landing":{}}}`),
+			}},
+			want: issueops.IssuePatch{Metadata: issueops.MetadataPatch{MergePatch: []json.RawMessage{
+				json.RawMessage(`{"everturn":{"landing":null}}`), json.RawMessage(`{"everturn":{"landing":{}}}`),
+			}}},
+		},
+		{
 			name:    "wisp enabled",
 			updates: map[string]any{"wisp": true},
 			want:    issueops.IssuePatch{Persistence: setField(issueops.PersistenceModeEphemeral)},

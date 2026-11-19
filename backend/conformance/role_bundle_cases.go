@@ -442,6 +442,7 @@ var roleContractCases = []roleContract{
 		RunLifecycleUpdateConditionalGuardsGateOrdinaryEdits,
 		RunLifecycleUpdateConditionalGuardAcceptsRespelledAssignee,
 		RunLifecycleUpdateMetadataPatchOrdersMergeSetUnset,
+		RunLifecycleUpdateMetadataMergePatch,
 		RunLifecycleUpdateClosePolicy,
 		RunLifecycleUpdateAssigneeTransferFence,
 		RunLifecycleUpdateClaimIsAMutationWhenThePatchRestoresTheRow,

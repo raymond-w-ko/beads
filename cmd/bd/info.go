@@ -221,6 +221,20 @@ type VersionChange struct {
 // versionChanges contains agent-actionable changes for recent versions
 var versionChanges = []VersionChange{
 	{
+		Version: "1.3.5-dev.3",
+		Date:    "2026-11-19",
+		Changes: []string{
+			"DEV: fork pre-release above 1.3.5-dev.2, stamped so a caller can tell by 'bd version' a build that has 'bd update --merge-metadata'. It also marks the ready, show, error-classification and init schema check changes landed since 1.3.5-dev.2.",
+			"NEW: 'bd update <id> --merge-metadata <json>' applies an RFC 7396 JSON Merge Patch to an issue's metadata, so a caller can set or remove one nested key and keep its siblings: an object member recurses, a null member removes the key, any other value replaces it. The flag repeats; its patches apply in the order given, in the update's one transaction, against the row read there ('{\"a\":{\"b\":null}}' then '{\"a\":{\"b\":{...}}}' replaces a nested object whole). It takes @file.json as --metadata does. Names are literal at every depth, a name given twice in one object takes its last value, and members no patch names keep their stored text, an integer past 2^53 included. Refused before any write, exit non-zero: a patch that is not a JSON object, one nested more than 100 deep, a top-level name outside the metadata key grammar, and the flag beside --metadata, --set-metadata or --unset-metadata. Public issueops.MetadataPatch gains MergePatch.",
+			"FIX: a guarded metadata edit that changes only an integer's digits past 2^53 is written again, not dropped as a no-op. The update's change check read both documents through a float64, so '{\"id\":9007199254740993}' over a stored 9007199254740992 exited 0 and wrote nothing on a Dolt that keeps the digits (2.6.x; 2.2 rounds them in the column). Numbers now compare by exact value, so 1.0 over a stored 1 is still a no-op.",
+			"CHANGE: 'bd ready', 'bd ready --json' and the ready count probe for due defers on one connection first and run the defer-wake sweep, which takes the journal writer lock, only when one is due; an idle 'bd ready' no longer waits behind every bead writer. A claim keeps the sweep. The config read of 'bd list' and 'bd ready' is one SELECT, not three statements in a transaction (19b5b975a).",
+			"CHANGE: '--label-pattern' with a glob holding no %, _, \\ or | (such as 'class:*') sends a bare LIKE that seeks idx_labels_label instead of 'LIKE ? ESCAPE' over every label row: 122 ms -> 42 ms at 20k issues and 33k labels on Dolt 2.6.2. Every other glob keeps the ESCAPE form (cbcb704ca).",
+			"CHANGE: 'bd show <id>' reads the issue once when the id is exact, not an id search and then the issue again: show --json 40 -> 34 statements per process on Dolt 2.6.2. Other commands resolve ids as before (6ad20a350).",
+			"CHANGE: a typed MySQL error packet (such as 1062 duplicate key on 'bd config set types.custom' with a repeated name that quotes 'gone away') is a server response, never a lost connection: it no longer replays the write five times and opens the shared circuit breaker. The outage packets (1053, and 2003 from the db proxy) still count (900e40be0).",
+			"CHANGE: the schema check of 'bd init' on an existing database and of 'bd doctor' no longer counts every issue (0.45 s on the fleet's store at each bd init): it sends a one-row read of the columns and comparisons the statistics query uses and an EXPLAIN of the blocked count's filter, which reads no row, with the old check's answers (3d4f1e754).",
+		},
+	},
+	{
 		Version: "1.3.5-dev.2",
 		Date:    "2026-11-19",
 		Changes: []string{

@@ -338,6 +338,9 @@ func updateSpec(request publicops.UpdateRequest) (domain.UpdateSpec, error) {
 		if len(patch.Metadata.Unset) > 0 {
 			fields[storageissueops.OpUnsetMetadata] = patch.Metadata.Unset
 		}
+		if len(patch.Metadata.MergePatch) > 0 {
+			fields[storageissueops.OpMergePatchMetadata] = patch.Metadata.MergePatch
+		}
 	}
 	// Spelled only alongside a status change, matching the embedded backend:
 	// without one the funnel has no crossing to judge.
@@ -549,6 +552,14 @@ func validateMetadataPatch(metadata publicops.MetadataPatch) error {
 	}
 	if metadata.Replace.Set && len(metadata.Replace.Value) > 0 && !json.Valid(metadata.Replace.Value) {
 		return fmt.Errorf("metadata replacement is not valid JSON")
+	}
+	if len(metadata.MergePatch) > 0 && (metadata.Replace.Set || metadata.Merge.Set || len(metadata.Set) > 0 || len(metadata.Unset) > 0) {
+		return fmt.Errorf("metadata merge patch cannot combine with other metadata edits")
+	}
+	for _, mergePatch := range metadata.MergePatch {
+		if err := storage.ValidateMetadataMergePatch(mergePatch); err != nil {
+			return err
+		}
 	}
 	if metadata.Merge.Set {
 		var object map[string]json.RawMessage

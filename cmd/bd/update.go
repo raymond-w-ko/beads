@@ -386,6 +386,13 @@ pointless).`,
 		if len(unsetMetadataFlags) > 0 {
 			updates[storageissueops.OpUnsetMetadata] = unsetMetadataFlags
 		}
+		mergePatches, err := readMergeMetadataFlags(cmd)
+		if err != nil {
+			return HandleErrorRespectJSON("%v", err)
+		}
+		if len(mergePatches) > 0 {
+			updates[storageissueops.OpMergePatchMetadata] = mergePatches
+		}
 
 		// Get claim flag
 		claimFlag, _ := cmd.Flags().GetBool("claim")
@@ -737,6 +744,8 @@ func buildUpdatePatch(updates map[string]interface{}) (issueops.IssuePatch, erro
 			}
 		case storageissueops.OpUnsetMetadata:
 			patch.Metadata.Unset, ok = value.([]string)
+		case storageissueops.OpMergePatchMetadata:
+			patch.Metadata.MergePatch, ok = value.([]json.RawMessage)
 		case "wisp":
 			var flag bool
 			if flag, ok = value.(bool); ok {
@@ -802,6 +811,41 @@ func parseSetMetadataFlags(flags []string) (map[string]json.RawMessage, error) {
 		set[key] = storage.MetadataEditValue(value)
 	}
 	return set, nil
+}
+
+// readMergeMetadataFlags reads the repeatable --merge-metadata flag: each value
+// is inline JSON or @file.json, and each must be a JSON object whose top-level
+// names are valid metadata keys. It refuses the flag beside the other metadata
+// flags, so every refusal lands before any issue is written.
+func readMergeMetadataFlags(cmd *cobra.Command) ([]json.RawMessage, error) {
+	values, _ := cmd.Flags().GetStringArray("merge-metadata")
+	if len(values) == 0 {
+		return nil, nil
+	}
+	for _, other := range []string{"metadata", "set-metadata", "unset-metadata"} {
+		if cmd.Flags().Changed(other) {
+			return nil, fmt.Errorf("cannot combine --merge-metadata with --%s", other)
+		}
+	}
+	patches := make([]json.RawMessage, 0, len(values))
+	for _, value := range values {
+		text := value
+		if strings.HasPrefix(value, "@") {
+			filePath := value[1:]
+			// #nosec G304 -- user explicitly provides file path via @file.json syntax
+			data, err := os.ReadFile(filePath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read metadata file %s: %v", filePath, err)
+			}
+			text = string(data)
+		}
+		patch := json.RawMessage(text)
+		if err := storage.ValidateMetadataMergePatch(patch); err != nil {
+			return nil, fmt.Errorf("invalid --merge-metadata: %v", err)
+		}
+		patches = append(patches, patch)
+	}
+	return patches, nil
 }
 
 func replacesExistingNotes(existing string, fields map[string]any) bool {
@@ -1026,6 +1070,7 @@ func init() {
 	// Incremental metadata edits (GH#1406)
 	updateCmd.Flags().StringArray("set-metadata", nil, "Set metadata key=value (repeatable, e.g., --set-metadata team=platform)")
 	updateCmd.Flags().StringArray("unset-metadata", nil, "Remove metadata key (repeatable, e.g., --unset-metadata team)")
+	updateCmd.Flags().StringArray("merge-metadata", nil, "Apply an RFC 7396 JSON merge patch to metadata (JSON object or @file.json; repeatable, applied in order; a null member removes a key)")
 	updateCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(updateCmd)
 }

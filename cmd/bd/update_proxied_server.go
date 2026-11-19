@@ -310,6 +310,9 @@ func proxiedUpdatePatch(in *updateInput, before *types.Issue) (issueops.IssuePat
 	if len(in.unsetMetadata) > 0 {
 		patch.Metadata.Unset = in.unsetMetadata
 	}
+	if len(in.mergePatches) > 0 {
+		patch.Metadata.MergePatch = in.mergePatches
+	}
 	// GH#3233: --defer="" restores ready visibility only if the issue was
 	// actually deferred, exactly as the direct route decides it.
 	if in.clearDeferStatus && before.Status == types.StatusDeferred {

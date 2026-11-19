@@ -29,6 +29,7 @@ type updateInput struct {
 	setMetadata      []string
 	unsetMetadata    []string
 	mergeMetadataIn  json.RawMessage
+	mergePatches     []json.RawMessage
 	clearDeferStatus bool
 	// bd-wsqvw conditional-update guards; non-nil only when the flag was
 	// explicitly passed (a pointer to "" is the real "expected unassigned"
@@ -256,6 +257,11 @@ func gatherUpdateInput(ctx context.Context, cmd *cobra.Command) (*updateInput, e
 	}
 	in.setMetadata = setMetadataFlags
 	in.unsetMetadata = unsetMetadataFlags
+	mergePatches, err := readMergeMetadataFlags(cmd)
+	if err != nil {
+		return nil, HandleErrorRespectJSON("%v", err)
+	}
+	in.mergePatches = mergePatches
 
 	in.claim, _ = cmd.Flags().GetBool("claim")
 
@@ -279,7 +285,7 @@ func gatherUpdateInput(ctx context.Context, cmd *cobra.Command) (*updateInput, e
 		if in.claim {
 			return nil, HandleErrorRespectJSON("cannot combine --if-assignee/--if-status with --claim (--claim is already an atomic compare-and-set)")
 		}
-		if len(in.fields) == 0 && !in.hasAppendNotes && len(in.mergeMetadataIn) == 0 && len(in.setMetadata) == 0 && len(in.unsetMetadata) == 0 {
+		if len(in.fields) == 0 && !in.hasAppendNotes && len(in.mergeMetadataIn) == 0 && len(in.setMetadata) == 0 && len(in.unsetMetadata) == 0 && len(in.mergePatches) == 0 {
 			return nil, HandleErrorRespectJSON("--if-assignee/--if-status require at least one field update (e.g. -a, -s); label and parent edits are not covered by the guard")
 		}
 	}
@@ -317,7 +323,7 @@ func isUpdateInputNoop(in *updateInput) bool {
 	if len(in.addLabels) > 0 || len(in.removeLabels) > 0 {
 		return false
 	}
-	if len(in.mergeMetadataIn) > 0 || len(in.setMetadata) > 0 || len(in.unsetMetadata) > 0 {
+	if len(in.mergeMetadataIn) > 0 || len(in.setMetadata) > 0 || len(in.unsetMetadata) > 0 || len(in.mergePatches) > 0 {
 		return false
 	}
 	return true

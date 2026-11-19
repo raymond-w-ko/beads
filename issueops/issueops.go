@@ -88,7 +88,8 @@ type LabelPatch struct {
 // MetadataPatch describes metadata replacement or ordered incremental edits.
 // Replace is mutually exclusive with Merge, Set, and Unset. Without Replace,
 // operations apply Merge, then Set keys in deterministic order, then Unset, so
-// unsetting a key wins over setting or merging that key.
+// unsetting a key wins over setting or merging that key. MergePatch is
+// mutually exclusive with all four.
 type MetadataPatch struct {
 	// Replace replaces the complete metadata document when Set is true. A nil or
 	// empty Value clears metadata; a nonempty Value must be valid JSON.
@@ -112,6 +113,13 @@ type MetadataPatch struct {
 	Set map[string]json.RawMessage
 	// Unset removes individual metadata keys after all other edits.
 	Unset []string
+	// MergePatch applies RFC 7396 JSON Merge Patches to the current value, in
+	// order, inside the mutation: an object member recurses, a null member
+	// removes the key, any other member replaces it. Member names are literal
+	// at every depth. Each patch must be a JSON object whose top-level names
+	// are valid metadata keys. It cannot be combined with Replace, Merge, Set
+	// or Unset.
+	MergePatch []json.RawMessage
 }
 
 // IssuePatch describes fields that can change on an issue.
