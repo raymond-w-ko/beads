@@ -76,13 +76,23 @@ func deferWakeSweepEligible(readOnly, classifiedRead bool) bool {
 	return !readOnly || classifiedRead
 }
 
-// wakeExpiredDefers runs the lazy defer-wake sweep (issueops.WakeExpiredDefersInTx)
-// in its own write transaction before a ready-work read. Advisory by contract:
-// a ready listing must never fail because the sweep could not run, so every
-// error is swallowed here — silently for the expected shapes (read-only store,
-// open write circuit, closed store), with a stderr warning otherwise. It runs
-// OUTSIDE the read tx below because withReadTx unconditionally rolls back (and
-// may retry its body on the read-only justification).
+// The lazy defer-wake sweep (issueops.WakeExpiredDefersInTx) runs in its own
+// write transaction before a ready-work read or a claim, through one of two
+// entry points:
+//
+//   - wakeExpiredDefersForRead (GetReadyWork, GetReadyWorkWithCounts,
+//     CountReadyWork) probes first and sweeps only when the probe says due.
+//   - wakeExpiredDefersForClaim (readyClaimer.ClaimNext, and the decorators'
+//     WakeExpiredDefersAdvisory, whose one caller is the externaldeps ready
+//     claimer) sweeps as before the probe: the journal writer lock, the
+//     transaction, the recheck.
+//
+// Advisory by contract: a ready listing or a claim must never fail because
+// the sweep could not run, so every error is swallowed here — silently for
+// the expected shapes (read-only store, open write circuit, closed store),
+// with a stderr warning otherwise. It runs OUTSIDE the read tx because
+// withReadTx unconditionally rolls back (and may retry its body on the
+// read-only justification).
 //
 // A classified-read open (GH#804: bd ready/bd list are read-only for the
 // CURRENT project) still runs the sweep — the store is genuinely writable
@@ -90,10 +100,48 @@ func deferWakeSweepEligible(readOnly, classifiedRead bool) bool {
 // A strict --readonly, preview, or foreign-project open must never sweep,
 // which is why deferWakeSweepEligible checks classifiedRead rather than the
 // guard dropping the readOnly check entirely (be-vbhpf).
-func (s *DoltStore) wakeExpiredDefers(ctx context.Context) {
+func (s *DoltStore) wakeExpiredDefersForRead(ctx context.Context) {
 	if !deferWakeSweepEligible(s.readOnly, s.classifiedRead) {
 		return
 	}
+	// Probe first: when nothing is due the sweep would take the journal
+	// writer lock (and queue behind every bead writer on the database) and
+	// a write transaction only to find no rows (bd-ypak8, bd-aw3l8).
+	//
+	// Contract (review bd-w6ppm, finding 1): a ready read answers for the
+	// instant its probe reads, and never waits for the journal writer lock
+	// to learn that nothing is due. A defer whose date passes after that
+	// instant is woken by the next ready read, not this one, even when a
+	// writer holds the lock past the date: the sweep used to wait for the
+	// lock, so its answer was for the instant the lock came free. With the
+	// lock free the two answers are the same, since the sweep then ran at
+	// once and found nothing either. A due row, a probe error and a session
+	// with autocommit off all report due, and the sweep (lock, transaction,
+	// recheck) decides as before (TestWakeDefersProbeAnswersForItsInstant).
+	//
+	// The early answer is for reads only (review bd-ee2ci, finding 1). A
+	// claim selects and writes after the sweep under the same journal writer
+	// lock, so it waits for that lock whatever the probe says: an answer
+	// from before the wait would miss an issue the lock holder's commit made
+	// due, and the claim would pass over it (claimed nothing, the issue left
+	// deferred) where HEAD woke and claimed it. The probe saves a claim no
+	// wait, so a claim takes wakeExpiredDefersForClaim.
+	if !s.expiredDefersDue(ctx) {
+		return
+	}
+	s.sweepExpiredDefers(ctx)
+}
+
+// wakeExpiredDefersForClaim is the sweep without the probe, for a caller that
+// selects and writes in one operation (see wakeExpiredDefersForRead).
+func (s *DoltStore) wakeExpiredDefersForClaim(ctx context.Context) {
+	if !deferWakeSweepEligible(s.readOnly, s.classifiedRead) {
+		return
+	}
+	s.sweepExpiredDefers(ctx)
+}
+
+func (s *DoltStore) sweepExpiredDefers(ctx context.Context) {
 	err := s.withCircuitWrite(ctx, func(ctx context.Context) error {
 		return s.runIssueOperationTxWithMessage(ctx, func(tx *sql.Tx) (issueops.ChangedTables, string, error) {
 			woke, err := issueops.WakeExpiredDefersInTx(ctx, tx)
@@ -115,6 +163,32 @@ func (s *DoltStore) wakeExpiredDefers(ctx context.Context) {
 	}
 }
 
+// expiredDefersDue is issueops.ExpiredDefersDue on one connection pinned from
+// the store's pool, under the read lock every other read takes (Close swaps
+// s.db for nil under the write lock). Pinned, so that on a session with
+// autocommit off the probe ends the implicit transaction its SELECT opened
+// on the same session before the connection goes back to the pool (review
+// bd-ee2ci, finding 2); with autocommit on the pin sends nothing. A pool
+// that cannot give a connection reports due, so the sweep decides. A closed
+// store reports false: the sweep would end at ErrStoreClosed, which
+// sweepExpiredDefers drops silently anyway.
+func (s *DoltStore) expiredDefersDue(ctx context.Context) bool {
+	if s.closed.Load() {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.db == nil {
+		return false
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return true
+	}
+	defer func() { _ = conn.Close() }()
+	return issueops.ExpiredDefersDue(ctx, conn)
+}
+
 // deferWakeAccessDeniedOnce rate-limits the access-denied advisory to one
 // warning per process: a read-only-privileged SQL user hits it on every
 // ready-front read, and repeating a configuration fact on each `bd ready`
@@ -132,7 +206,7 @@ func warnDeferWakeSweepSkipped(err error) {
 }
 
 func (s *DoltStore) GetReadyWork(ctx context.Context, filter types.WorkFilter) ([]*types.Issue, error) {
-	s.wakeExpiredDefers(ctx)
+	s.wakeExpiredDefersForRead(ctx)
 	var result []*types.Issue
 	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
 		var err error
@@ -143,7 +217,7 @@ func (s *DoltStore) GetReadyWork(ctx context.Context, filter types.WorkFilter) (
 }
 
 func (s *DoltStore) GetReadyWorkWithCounts(ctx context.Context, filter types.WorkFilter) ([]*types.IssueWithCounts, error) {
-	s.wakeExpiredDefers(ctx)
+	s.wakeExpiredDefersForRead(ctx)
 	var result []*types.IssueWithCounts
 	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
 		var err error
@@ -158,7 +232,7 @@ func (s *DoltStore) GetReadyWorkWithCounts(ctx context.Context, filter types.Wor
 // cheap indexed COUNT(*)s instead of re-running the counts mega-query. Backs the
 // storage.ReadyWorkCounter capability.
 func (s *DoltStore) CountReadyWork(ctx context.Context, filter types.WorkFilter) (int, error) {
-	s.wakeExpiredDefers(ctx)
+	s.wakeExpiredDefersForRead(ctx)
 	var n int
 	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
 		var err error

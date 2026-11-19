@@ -1,6 +1,7 @@
 package uow
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"sync"
@@ -33,6 +34,32 @@ import (
 // the closure's error and retries against a fresh unit of work, exactly like
 // a commit issued by RunTxResult itself.
 func WakeExpiredDefers(ctx context.Context, p UnitOfWorkProvider) (int, error) {
+	// Probe first, outside any unit of work, where the provider can run a
+	// bare read: when nothing is due the sweep's lock and write transaction
+	// would find no rows (see storageissueops.ExpiredDefersDue). The probe
+	// answers for the instant it reads, without waiting for the journal
+	// writer lock, and reports due on a session with autocommit off; the
+	// contract is the store's, at its call site in
+	// dolt.wakeExpiredDefersForRead. RunNonTx's connection is pinned, so on
+	// a session with autocommit off the probe ends the implicit transaction
+	// it opened there before the connection goes back (review bd-ee2ci,
+	// finding 2). For reads only: a claim takes sweepExpiredDefers.
+	if mp, ok := p.(MaintenanceProvider); ok {
+		due := true
+		err := mp.RunNonTx(ctx, func(ctx context.Context, conn *sql.Conn) error {
+			due = storageissueops.ExpiredDefersDue(ctx, conn)
+			return nil
+		})
+		if err == nil && !due {
+			return 0, nil
+		}
+	}
+	return sweepExpiredDefers(ctx, p)
+}
+
+// sweepExpiredDefers is the sweep without the probe: the unit of work
+// WakeExpiredDefers runs when the probe says due, and all a claim runs.
+func sweepExpiredDefers(ctx context.Context, p UnitOfWorkProvider) (int, error) {
 	return RunTxResult(ctx, p, func(ctx context.Context, uw UnitOfWork) (int, string, error) {
 		issues, wisps, err := uw.IssueUseCase().WakeExpiredDefers(ctx)
 		if err != nil {
@@ -56,11 +83,29 @@ func WakeExpiredDefers(ctx context.Context, p UnitOfWorkProvider) (int, error) {
 // is noise, not signal.
 var advisoryAccessDeniedOnce sync.Once
 
-// WakeExpiredDefersAdvisory is WakeExpiredDefers under the read paths'
-// contract: a ready listing must never fail because the sweep could not run,
-// so errors are reduced to a stderr warning (warn-once for access-denied).
+// WakeExpiredDefersAdvisory is WakeExpiredDefers, the probing entry point,
+// under the read paths' contract: a ready listing must never fail because
+// the sweep could not run, so errors are reduced to a stderr warning
+// (warn-once for access-denied). For ready READS only (the issue reader's
+// Ready and --ready List, and bd ready on the proxied route); a claim calls
+// WakeExpiredDefersForClaimAdvisory.
 func WakeExpiredDefersAdvisory(ctx context.Context, p UnitOfWorkProvider) {
 	_, err := WakeExpiredDefers(ctx, p)
+	warnWakeExpiredDefers(err)
+}
+
+// WakeExpiredDefersForClaimAdvisory is the claim's sweep, under the same
+// advisory contract: no probe, the journal writer lock, the transaction and
+// the recheck, as before the probe. A claim selects and writes after it and
+// waits for that lock anyway, so an early "nothing due" would save it no wait
+// and would miss an issue the lock holder's commit made due while it waited
+// (review bd-ee2ci, finding 1).
+func WakeExpiredDefersForClaimAdvisory(ctx context.Context, p UnitOfWorkProvider) {
+	_, err := sweepExpiredDefers(ctx, p)
+	warnWakeExpiredDefers(err)
+}
+
+func warnWakeExpiredDefers(err error) {
 	if err == nil {
 		return
 	}
