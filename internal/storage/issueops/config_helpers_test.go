@@ -388,3 +388,30 @@ func TestCustomTypesYAMLFallback(t *testing.T) {
 type errSentinel string
 
 func (e errSentinel) Error() string { return string(e) }
+
+// TestSyncCustomTypesTableStoresARepeatedNameOnce (bd-w2ji5): a name given
+// twice in types.custom, in the comma form or the JSON array form, is one
+// row: the sync sends one DELETE and one INSERT per distinct name, in the
+// order of first occurrence. A second INSERT of the same name failed the
+// command with 1062 on the table's primary key.
+func TestSyncCustomTypesTableStoresARepeatedNameOnce(t *testing.T) {
+	for _, value := range []string{"a,b,a", `["a","b","a"]`} {
+		t.Run(value, func(t *testing.T) {
+			db, mock, tx := beginMockTx(t)
+			defer db.Close()
+			mock.ExpectExec(regexp.QuoteMeta("DELETE FROM custom_types")).
+				WillReturnResult(sqlmock.NewResult(0, 0))
+			for _, name := range []string{"a", "b"} {
+				mock.ExpectExec(regexp.QuoteMeta("INSERT INTO custom_types (name) VALUES (?)")).
+					WithArgs(name).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			}
+			if err := syncCustomTypesTable(context.Background(), tx, value); err != nil {
+				t.Fatalf("syncCustomTypesTable(%q): %v", value, err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet SQL expectations: %v", err)
+			}
+		})
+	}
+}

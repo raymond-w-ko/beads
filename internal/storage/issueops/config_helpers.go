@@ -420,7 +420,12 @@ func syncCustomTypesTable(ctx context.Context, tx DBTX, value string) error {
 	if value == "" {
 		return nil
 	}
-	names := ParseTypesConfigValue(value)
+	// A name given twice ("a,a", ["a","a"]) is one row, the first occurrence
+	// kept: inserting it again failed the command with 1062 on the table's
+	// primary key (bd-w2ji5). The comparison is byte-wise, as the key is, so
+	// names that differ only in case stay two rows. The config value itself
+	// is stored as typed.
+	names := dedupePreservingOrder(ParseTypesConfigValue(value))
 	for _, name := range names {
 		if _, err := tx.ExecContext(ctx, "INSERT INTO custom_types (name) VALUES (?)", name); err != nil {
 			return err
