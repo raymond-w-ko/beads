@@ -2527,9 +2527,11 @@ func (s *DoltStore) readStartupMetadata(ctx context.Context, key string) (string
 // found them equal. cmd/bd's write-command identity check makes that same
 // comparison, so when this returns true it skips its own database read
 // (bd-7c0u4 rank 4). False whenever the open made no comparison (no local
-// metadata or project id, an empty database project id, gateway, the global
-// database, a database the open created) or verified a different beads
-// directory, so the caller checks as before.
+// metadata or project id, an empty database project id, a gateway open with
+// CreateIfMissing set, the global database, a database the open created) or
+// verified a different beads directory, so the caller checks as before. A
+// gateway open with CreateIfMissing unset does compare, like any other open
+// of an existing database.
 func (s *DoltStore) IdentityVerifiedAtOpen(beadsDir string) bool {
 	return s.identityVerifiedBeadsDir != "" && beadsDir != "" &&
 		filepath.Clean(beadsDir) == s.identityVerifiedBeadsDir
@@ -3260,6 +3262,30 @@ func sharedServerDatabase(cfg *Config) bool {
 }
 
 func (s *DoltStore) initSchema(ctx context.Context, bootstrapHeal *schema.FreshBootstrapHealCapability) (int, error) {
+	// Steady state: the database is already at this binary's schema, so the
+	// migration pool below would be opened only for the gate to read "nothing
+	// pending" and MigrateUpWithLock's own convergence fast path to return
+	// (0, nil). Ask that same question first, on the main pool, and skip the
+	// pool and the gate (bd-7c0u4 rank 2: one connection and five statements
+	// per write).
+	//
+	// Skipping the gate here acts on nothing it would have acted on. Converged
+	// means the main cursor is at or past this binary's latest migration, so
+	// both gates (CheckRemoteMigrateGateForRemoteWithRemoteCheckAndAdopt and
+	// CheckSharedStoreMigrateGate) find no pending version and return nil
+	// before the remote probe, the smart router, the fast-forward adopt and
+	// the #6575 data-behind stop, all of which run only with a migration
+	// pending. The proxied provider already orders it this way: its gate runs
+	// after its convergence fast path (schema.WithMigrationGate).
+	//
+	// Fresh-bootstrap heal authority means this open just created the
+	// database, so there is nothing converged to find. Any other "no" (not
+	// converged, an error, the main pool's 10 s read timeout) takes the path
+	// below unchanged.
+	if bootstrapHeal == nil && s.writeOpenConverged(ctx) {
+		return 0, nil
+	}
+
 	// Schema migrations can run arbitrarily long (e.g. full-table recomputes
 	// such as the is_blocked backfill in migration 0047). The main connection
 	// pool sets a 10s ReadTimeout (see buildServerDSN); a slow migration over
@@ -3328,6 +3354,46 @@ func (s *DoltStore) initSchema(ctx context.Context, bootstrapHeal *schema.FreshB
 	}
 	applied, err := initSchemaOnDBWithRetryAndGateBootstrapHeal(ctx, migDB, gate, bootstrapHeal, s.serverEndpoint)
 	return applied, err
+}
+
+// writeOpenConverged runs schema.AlreadyConverged on one pinned connection of
+// the main pool. It is advisory and fails closed: a pool, probe or timeout
+// error is logged for BD_DEBUG and reads as "not converged", so initSchema
+// takes its locked path as it did before the check.
+//
+// The session goes back to the pool only on a clean true answer: converged,
+// and no statement failed (AlreadyConverged reports one it would otherwise
+// swallow). On every other answer it is discarded. A Dolt session that sent a
+// failing statement stays pinned to its pre-statement catalog (be-bv7x), and
+// the fallback's migration pool cannot repair it: when the schema is healthy
+// again by then, the open succeeds with nothing applied,
+// rebuildPoolAfterMigration keeps the pool, and the first read on that session
+// fails with "table not found" (review bd-zxrmq). The discard costs nothing on
+// the converged path; a fallback already opens a connection of its own.
+func (s *DoltStore) writeOpenConverged(ctx context.Context) bool {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		debug.Logf("dolt: write-open convergence check unavailable for %q, taking the migration path: %v\n", s.database, err)
+		return false
+	}
+	converged, err := schema.AlreadyConverged(ctx, conn, s.database)
+	if err == nil && converged {
+		_ = conn.Close()
+		return true
+	}
+	if err != nil {
+		debug.Logf("dolt: write-open convergence check failed for %q, taking the migration path: %v\n", s.database, err)
+	}
+	discardConn(conn)
+	return false
+}
+
+// discardConn closes a pinned connection's session instead of returning it to
+// the pool: database/sql drops a connection whose Raw callback reports
+// driver.ErrBadConn.
+func discardConn(conn *sql.Conn) {
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	_ = conn.Close() // already released by Raw; returns sql.ErrConnDone
 }
 
 // ApplySchemaMigrations runs idempotent schema migrations under the

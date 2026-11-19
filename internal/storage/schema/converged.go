@@ -8,6 +8,69 @@ import (
 	"github.com/steveyegge/beads/internal/storage/dberrors"
 )
 
+// AlreadyConverged is alreadyConverged for a caller whose session is already
+// on databaseName: internal/storage/dolt's writable open, which asks it on its
+// main pool (whose DSN names the database) before it opens the migration pool
+// and runs the migrate gate (bd-7c0u4 rank 2). It passes no selector, so a
+// session on any other database, or on none, declines.
+//
+// It is advisory exactly as alreadyConverged is: false, or an error, means
+// "take the locked path", never "refuse the open".
+//
+// A true answer also promises that no statement it sent failed. The caller
+// returns the session to its pool on a true answer, and a Dolt session that
+// sent a failing statement stays pinned to its pre-statement catalog (be-bv7x),
+// so a later read on it can miss a table the server has (review bd-zxrmq).
+// Most failures already surface as an error or a false answer, but helpers
+// read some as answers: forkTableColumnNames takes "table not found" from
+// SHOW COLUMNS as "table absent, column does not count", which can let a table
+// dropped after its sentinel probe through to a true answer. So every
+// statement's error is recorded here, and any failure turns the answer into
+// an error.
+func AlreadyConverged(ctx context.Context, db DBConn, databaseName string) (bool, error) {
+	rec := &failureRecordingConn{DBConn: db}
+	converged, err := alreadyConverged(ctx, rec, databaseName, nil)
+	if err != nil {
+		return false, err
+	}
+	if rec.failed != nil {
+		return false, fmt.Errorf("convergence probe: a statement failed and was read as an answer: %w", rec.failed)
+	}
+	return converged, nil
+}
+
+// failureRecordingConn passes every statement through to DBConn and keeps the
+// first statement error, including one a caller swallows. A QueryRowContext
+// error is read with Row.Err, which leaves the row for the caller's Scan.
+type failureRecordingConn struct {
+	DBConn
+	failed error
+}
+
+func (c *failureRecordingConn) note(err error) {
+	if err != nil && c.failed == nil {
+		c.failed = err
+	}
+}
+
+func (c *failureRecordingConn) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	res, err := c.DBConn.ExecContext(ctx, query, args...)
+	c.note(err)
+	return res, err
+}
+
+func (c *failureRecordingConn) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	rows, err := c.DBConn.QueryContext(ctx, query, args...)
+	c.note(err)
+	return rows, err
+}
+
+func (c *failureRecordingConn) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	row := c.DBConn.QueryRowContext(ctx, query, args...)
+	c.note(row.Err())
+	return row
+}
+
 // alreadyConverged reports whether databaseName is already at this binary's
 // target schema in every respect MigrateUp checks before its no-work
 // short-circuit: no migration work is pending, the canonical dolt_ignore

@@ -26,12 +26,18 @@ import (
 // Current budget (bd-rlkn9 cut the per-connection SELECT @@max_allowed_packet
 // probe by pinning MaxAllowedPacket in the DSN, and the second PING in
 // newServerMode; bd-kgx8s read the identity check's _project_id without
-// START TRANSACTION / ROLLBACK):
+// START TRANSACTION / ROLLBACK; bd-lbrt4 asks the convergence question on the
+// main pool before the migration pool and the gate):
 //   - read-only: 2 connections (the fail-fast preflight dial, which never
 //     authenticates, and the pooled session), 4 commands.
-//   - writable: 3 connections (plus the one-off migration pool), whose
-//     commands are the read-only four plus the schema gate and convergence
-//     pass on the migration pool.
+//   - writable: 2 connections, the same two, whose commands are the read-only
+//     four plus the convergence pass on the pooled session. A converged open
+//     no longer opens the one-off migration pool (3 connections, 34 commands
+//     before bd-lbrt4), so five commands went with it: the migrate gate's
+//     four (SHOW TABLES LIKE 'schema_migrations' and
+//     SELECT COALESCE(MAX(version), 0) FROM schema_migrations, once for
+//     CurrentVersion and once for PendingVersions) and initSchemaOnDB's
+//     SELECT DATABASE(). The convergence pass's own SELECT DATABASE() stays.
 func TestServerOpenStatementBudget(t *testing.T) {
 	skipIfNoDolt(t)
 	acquireTestSlot()
@@ -66,7 +72,7 @@ func TestServerOpenStatementBudget(t *testing.T) {
 		wantCmds  int
 	}{
 		{name: "read-only", readOnly: true, wantConns: 2, wantCmds: 4},
-		{name: "writable", readOnly: false, wantConns: 3, wantCmds: 34},
+		{name: "writable", readOnly: false, wantConns: 2, wantCmds: 29},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			cfg := f.config()

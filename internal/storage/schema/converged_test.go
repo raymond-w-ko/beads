@@ -382,6 +382,86 @@ func TestAlreadyConvergedWithoutASelectorNeverSelects(t *testing.T) {
 	}
 }
 
+// TestExportedAlreadyConvergedNeverSelects pins the exported wrapper
+// internal/storage/dolt's writable open calls (bd-lbrt4): it carries no
+// selector, so a session off the target database declines after the one
+// DATABASE() read, with no existence probe and no USE.
+func TestExportedAlreadyConvergedNeverSelects(t *testing.T) {
+	for _, current := range []any{nil, "otherdb"} {
+		db, mock := newMockDB(t)
+		expectCurrentDatabase(mock, current)
+
+		converged, err := AlreadyConverged(context.Background(), db, "testdb")
+		if err != nil {
+			t.Fatalf("AlreadyConverged() on %v: error = %v", current, err)
+		}
+		if converged {
+			t.Fatalf("AlreadyConverged() on %v = true off the target database, want false", current)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet SQL expectations on %v: %v", current, err)
+		}
+	}
+}
+
+// expectConvergedProbeWithWispsGone mocks a converged probe in which wisps is
+// dropped after its sentinel probe: SHOW COLUMNS FROM `wisps` fails with
+// "table not found", which forkTableColumnNames reads as "table absent", and
+// every other statement answers converged.
+func expectConvergedProbeWithWispsGone(mock sqlmock.Sqlmock, database string) {
+	expectCurrentDatabase(mock, database)
+	expectCursorProbe(mock, "schema_migrations", true)
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion())
+	expectCursorProbe(mock, "ignored_schema_migrations", true)
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", LatestIgnoredVersion())
+	expectIgnoredSentinelProbes(mock, true)
+	expectContentHashColumnExists(mock)
+	expectContentHashColumnExists(mock)
+	expectScalar(mock, "SELECT COUNT(*) FROM custom_types", "count", 1)
+	expectScalar(mock, "SELECT COUNT(*) FROM custom_statuses", "count", 1)
+	mock.ExpectQuery(regexp.QuoteMeta("SHOW COLUMNS FROM `issues`")).WillReturnRows(
+		sqlmock.NewRows([]string{"Field", "Type", "Null", "Key", "Default", "Extra"}).
+			AddRow("id", "varchar(255)", "NO", "PRI", nil, "").
+			AddRow("everturn_action", "varchar(255)", "YES", "", nil, ""))
+	mock.ExpectQuery(regexp.QuoteMeta("SHOW COLUMNS FROM `wisps`")).
+		WillReturnError(errors.New("Error 1146 (HY000): table not found: wisps"))
+	indexRows := sqlmock.NewRows([]string{"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name"}).
+		AddRow("issues", 0, "PRIMARY", 1, "id")
+	for _, idx := range forkIndexes {
+		indexRows.AddRow("issues", 1, idx.Name, 1, "")
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("SHOW INDEX FROM `issues`")).WillReturnRows(indexRows)
+	expectDoltIgnoreRead(mock, unqualifiedDoltIgnore, seededIgnorePatterns(LatestVersion()))
+	expectIgnoredCursorGate(mock, "", false, nil, false)
+	expectMigrationLockProbe(mock, database, 1)
+}
+
+// TestExportedAlreadyConvergedReportsASwallowedFailure: a probe statement that
+// fails but is read as an answer still lets alreadyConverged say true, and the
+// exported wrapper turns that into an error, so internal/storage/dolt discards
+// the session the failure pinned (be-bv7x, review bd-zxrmq).
+func TestExportedAlreadyConvergedReportsASwallowedFailure(t *testing.T) {
+	db, mock := newMockDB(t)
+	expectConvergedProbeWithWispsGone(mock, "testdb")
+	converged, err := alreadyConverged(context.Background(), db, "testdb", nil)
+	if err != nil || !converged {
+		t.Fatalf("alreadyConverged() with the wisps read swallowed = %v, %v; want true, nil (the case the wrapper guards)", converged, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+
+	db, mock = newMockDB(t)
+	expectConvergedProbeWithWispsGone(mock, "testdb")
+	converged, err = AlreadyConverged(context.Background(), db, "testdb")
+	if converged || err == nil || !strings.Contains(err.Error(), "table not found: wisps") {
+		t.Fatalf("AlreadyConverged() with the wisps read swallowed = %v, %v; want false and the swallowed error", converged, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet SQL expectations: %v", err)
+	}
+}
+
 // TestAlreadyConvergedFailsClosedOnDatabaseSelection covers the ways putting
 // the session on the target database can go wrong. All must surface as "not
 // converged" so MigrateUpWithLock takes the lock.
