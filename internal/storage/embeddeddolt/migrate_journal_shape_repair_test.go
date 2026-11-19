@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -156,6 +157,12 @@ VALUES (?, ?, ?, 'bd-t9ovd', ?, ?, ?)`, s.seq, s.ts, s.op, s.issueJSON, s.depJSO
 // first run must change nothing. SHOW CREATE TABLE before and after is the
 // whole assertion — it carries the column types, the index set, and their
 // order, so any DDL that fired would show up in it.
+//
+// The measured MigrateUp also runs the fork's column step after the ignored
+// series (schema.ensureForkIndexes), which adds the everturn key columns and
+// their indexes to wisps. That is not 0023's work, so both pictures leave the
+// fork step's columns and indexes out (withoutForkSchema); every other column
+// or index change still fails the test.
 func TestEmbeddedIgnoredMigration0023NoopsOnHealthyWorkspace(t *testing.T) {
 	requireEmbedded(t)
 	ctx := t.Context()
@@ -165,7 +172,7 @@ func TestEmbeddedIgnoredMigration0023NoopsOnHealthyWorkspace(t *testing.T) {
 	tables := []string{"bd_events_journal", "bd_events_seq", "wisps"}
 	before := make(map[string]string, len(tables))
 	for _, table := range tables {
-		before[table] = showCreateTable(t, ctx, conn, table)
+		before[table] = withoutForkSchema(showCreateTable(t, ctx, conn, table))
 	}
 
 	if _, err := schema.MigrateUp(ctx, conn); err != nil {
@@ -174,7 +181,7 @@ func TestEmbeddedIgnoredMigration0023NoopsOnHealthyWorkspace(t *testing.T) {
 	requireIgnoredCursorAtLatest(t, ctx, conn)
 
 	for _, table := range tables {
-		if after := showCreateTable(t, ctx, conn, table); after != before[table] {
+		if after := withoutForkSchema(showCreateTable(t, ctx, conn, table)); after != before[table] {
 			t.Errorf("0023 changed %s on a healthy workspace:\nbefore:\n%s\nafter:\n%s", table, before[table], after)
 		}
 	}
@@ -322,6 +329,40 @@ func showCreateTable(t *testing.T, ctx context.Context, conn *sql.Conn, table st
 		t.Fatalf("SHOW CREATE TABLE %s: %v", table, err)
 	}
 	return ddl
+}
+
+// forkColumnLine matches a SHOW CREATE TABLE line of a fork column step
+// column (schema's forkColumns): a STORED generated column over a
+// $.everturn path of metadata. It goes by definition, not by name alone, so a
+// column 0023 (or anything else) might add stays in the picture.
+var forkColumnLine = regexp.MustCompile("^\\s*`([^`]+)` varchar\\(255\\) GENERATED ALWAYS AS \\(LEFT\\(json_unquote\\(json_extract\\(`metadata`, '\\$\\.everturn\\.[^']+'\\)\\), 255\\)\\) STORED,?$")
+
+// forkIndexLine matches a KEY line and captures its first column.
+var forkIndexLine = regexp.MustCompile("^\\s*KEY `[^`]+` \\(`([^`]+)`")
+
+// withoutForkSchema drops the fork step's columns (forkColumnLine) and every
+// index led by one of them (schema's forkIndexes: (column, created_at)) from
+// a SHOW CREATE TABLE text. It also drops each line's trailing comma, since a
+// removed last column or index moves the comma of the line before it.
+func withoutForkSchema(ddl string) string {
+	lines := strings.Split(ddl, "\n")
+	forkCols := make(map[string]bool)
+	for _, line := range lines {
+		if m := forkColumnLine.FindStringSubmatch(line); m != nil {
+			forkCols[m[1]] = true
+		}
+	}
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if forkColumnLine.MatchString(line) {
+			continue
+		}
+		if m := forkIndexLine.FindStringSubmatch(line); m != nil && forkCols[m[1]] {
+			continue
+		}
+		kept = append(kept, strings.TrimSuffix(line, ","))
+	}
+	return strings.Join(kept, "\n")
 }
 
 type journalRow struct {
