@@ -419,18 +419,10 @@ func expectConvergedProbeWithWispsGone(mock sqlmock.Sqlmock, database string) {
 	expectContentHashColumnExists(mock)
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_types", "count", 1)
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_statuses", "count", 1)
-	mock.ExpectQuery(regexp.QuoteMeta("SHOW COLUMNS FROM `issues`")).WillReturnRows(
-		sqlmock.NewRows([]string{"Field", "Type", "Null", "Key", "Default", "Extra"}).
-			AddRow("id", "varchar(255)", "NO", "PRI", nil, "").
-			AddRow("everturn_action", "varchar(255)", "YES", "", nil, ""))
+	expectForkCreateTable(mock, "issues", "", nil)
+	expectForkCreateTable(mock, "issues", " AS OF 'HEAD'", nil)
 	mock.ExpectQuery(regexp.QuoteMeta("SHOW COLUMNS FROM `wisps`")).
 		WillReturnError(errors.New("Error 1146 (HY000): table not found: wisps"))
-	indexRows := sqlmock.NewRows([]string{"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name"}).
-		AddRow("issues", 0, "PRIMARY", 1, "id")
-	for _, idx := range forkIndexes {
-		indexRows.AddRow("issues", 1, idx.Name, 1, "")
-	}
-	mock.ExpectQuery(regexp.QuoteMeta("SHOW INDEX FROM `issues`")).WillReturnRows(indexRows)
 	expectDoltIgnoreRead(mock, unqualifiedDoltIgnore, seededIgnorePatterns(LatestVersion()))
 	expectIgnoredCursorGate(mock, "", false, nil, false)
 	expectMigrationLockProbe(mock, database, 1)

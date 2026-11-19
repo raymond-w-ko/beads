@@ -5,12 +5,17 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage/issueops"
+	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -20,16 +25,38 @@ var forkIndexNames = []string{
 	"idx_issues_closed_at",
 	"idx_issues_status_closed_at",
 	"idx_issues_everturn_action",
+	"idx_issues_everturn_key",
+	"idx_issues_everturn_relay_source",
+	"idx_issues_everturn_bead",
+	"idx_issues_everturn_corrects",
 }
 
+// everturnMailKeyColumns are the four generated columns everturn's mail reads
+// filter on, each on issues and on wisps and indexed on both as
+// (column, created_at), with the metadata path each holds. The names and paths
+// are everturn's reader contract (bd-iqmdg).
+var everturnMailKeyColumns = []struct{ name, path string }{
+	{name: "everturn_key", path: "$.everturn.key"},
+	{name: "everturn_relay_source", path: "$.everturn.relay.source"},
+	{name: "everturn_bead", path: "$.everturn.bead"},
+	{name: "everturn_corrects", path: "$.everturn.corrects"},
+}
+
+var forkTables = []string{"issues", "wisps"}
+
 func issuesIndexExists(t *testing.T, ctx context.Context, db *sql.DB, name string) bool {
+	t.Helper()
+	return tableIndexExists(t, ctx, db, "issues", name)
+}
+
+func tableIndexExists(t *testing.T, ctx context.Context, db *sql.DB, table, name string) bool {
 	t.Helper()
 	var count int
 	if err := db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS
-		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'issues' AND INDEX_NAME = ?
-	`, name).Scan(&count); err != nil {
-		t.Fatalf("probe index %s: %v", name, err)
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?
+	`, table, name).Scan(&count); err != nil {
+		t.Fatalf("probe index %s on %s: %v", name, table, err)
 	}
 	return count > 0
 }
@@ -205,11 +232,16 @@ func tableColumnExists(t *testing.T, ctx context.Context, db *sql.DB, table, col
 
 func issuesIndexColumns(t *testing.T, ctx context.Context, db *sql.DB, name string) []string {
 	t.Helper()
+	return tableIndexColumns(t, ctx, db, "issues", name)
+}
+
+func tableIndexColumns(t *testing.T, ctx context.Context, db *sql.DB, table, name string) []string {
+	t.Helper()
 	rows, err := db.QueryContext(ctx, `
 		SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS
-		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'issues' AND INDEX_NAME = ?
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?
 		ORDER BY SEQ_IN_INDEX
-	`, name)
+	`, table, name)
 	if err != nil {
 		t.Fatalf("index columns %s: %v", name, err)
 	}
@@ -337,11 +369,11 @@ func TestForkIndexesEverturnActionColumn(t *testing.T) {
 }
 
 // TestForkIndexesEverturnActionUpsert is review bd-gv9ou's P1 case: with the
-// generated column present, the issue upsert (issueops.InsertIssueIntoTable,
-// INSERT ... ON DUPLICATE KEY UPDATE col = VALUES(col)) of an existing row
-// succeeds on issues and on wisps, and the stored everturn_action follows the
-// new metadata. A VIRTUAL column failed here on Dolt 2.2.0, VALUES() shifted
-// by one column.
+// generated columns present (everturn_action and the four mail key columns),
+// the issue upsert (issueops.InsertIssueIntoTable, INSERT ... ON DUPLICATE KEY
+// UPDATE col = VALUES(col)) of an existing row succeeds on issues and on
+// wisps, and every stored column follows the new metadata. A VIRTUAL column
+// failed here on Dolt 2.2.0, VALUES() shifted by one column.
 func TestForkIndexesEverturnActionUpsert(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
@@ -352,24 +384,24 @@ func TestForkIndexesEverturnActionUpsert(t *testing.T) {
 		t.Run(table, func(t *testing.T) {
 			now := time.Now().UTC().Truncate(time.Second)
 			issue := &types.Issue{ID: "fx-upsert-" + table, Title: "before upsert", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask,
-				CreatedAt: now, UpdatedAt: now, Ephemeral: table == "wisps", Metadata: json.RawMessage(`{"everturn":{"action":"wake"}}`)}
+				CreatedAt: now, UpdatedAt: now, Ephemeral: table == "wisps", Metadata: allEverturnKeysMetadata("wake", "1")}
 			if err := issueops.InsertIssueIntoTable(ctx, store.db, table, issue); err != nil {
 				t.Fatalf("first upsert into %s: %v", table, err)
 			}
 			issue.Title = "after upsert"
 			issue.UpdatedAt = now.Add(time.Second)
-			issue.Metadata = json.RawMessage(`{"everturn":{"action":"claim"}}`)
+			issue.Metadata = allEverturnKeysMetadata("claim", "2")
 			if err := issueops.InsertIssueIntoTable(ctx, store.db, table, issue); err != nil {
 				t.Fatalf("second upsert into %s of an existing row: %v", table, err)
 			}
 			var title string
-			var action sql.NullString
-			if err := store.db.QueryRowContext(ctx, "SELECT title, everturn_action FROM "+table+" WHERE id = ?", issue.ID).Scan(&title, &action); err != nil {
+			if err := store.db.QueryRowContext(ctx, "SELECT title FROM "+table+" WHERE id = ?", issue.ID).Scan(&title); err != nil {
 				t.Fatalf("read %s.%s after upsert: %v", table, issue.ID, err)
 			}
-			if title != "after upsert" || !action.Valid || action.String != "claim" {
-				t.Errorf("%s.%s after upsert = (%q, everturn_action=%v), want (\"after upsert\", claim)", table, issue.ID, title, action)
+			if title != "after upsert" {
+				t.Errorf("%s.%s title after upsert = %q, want \"after upsert\"", table, issue.ID, title)
 			}
+			assertEverturnKeys(t, ctx, store.db, table, issue.ID, wantAllEverturnKeys("claim", "2"))
 		})
 	}
 }
@@ -540,5 +572,1174 @@ func TestForkIndexesDirtyWispsStillHealed(t *testing.T) {
 	}
 	if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n != 0 {
 		t.Errorf("issues has %d dolt_status rows after healing wisps, want 0", n)
+	}
+}
+
+// allEverturnKeysMetadata is metadata carrying everturn.action and every mail
+// key, the mail keys ending in suffix.
+func allEverturnKeysMetadata(action, suffix string) json.RawMessage {
+	return json.RawMessage(fmt.Sprintf(`{"everturn":{"action":%q,"key":"k-%s","relay":{"source":"src-%s"},"bead":"bd-%s","corrects":"mail-%s"}}`,
+		action, suffix, suffix, suffix, suffix))
+}
+
+// wantAllEverturnKeys is what the generated columns of a row written with
+// allEverturnKeysMetadata(action, suffix) hold.
+func wantAllEverturnKeys(action, suffix string) map[string]sql.NullString {
+	v := func(s string) sql.NullString { return sql.NullString{String: s, Valid: true} }
+	return map[string]sql.NullString{
+		"everturn_action":       v(action),
+		"everturn_key":          v("k-" + suffix),
+		"everturn_relay_source": v("src-" + suffix),
+		"everturn_bead":         v("bd-" + suffix),
+		"everturn_corrects":     v("mail-" + suffix),
+	}
+}
+
+// everturnKeysOf reads every everturn generated column of table.id.
+func everturnKeysOf(t *testing.T, ctx context.Context, db *sql.DB, table, id string) map[string]sql.NullString {
+	t.Helper()
+	names := []string{"everturn_action"}
+	for _, c := range everturnMailKeyColumns {
+		names = append(names, c.name)
+	}
+	vals := make([]sql.NullString, len(names))
+	dest := make([]any, len(names))
+	for i := range vals {
+		dest[i] = &vals[i]
+	}
+	//nolint:gosec // test-only identifiers
+	if err := db.QueryRowContext(ctx, "SELECT "+strings.Join(names, ", ")+" FROM "+table+" WHERE id = ?", id).Scan(dest...); err != nil {
+		t.Fatalf("read everturn columns of %s.%s: %v", table, id, err)
+	}
+	got := make(map[string]sql.NullString, len(names))
+	for i, name := range names {
+		got[name] = vals[i]
+	}
+	return got
+}
+
+func assertEverturnKeys(t *testing.T, ctx context.Context, db *sql.DB, table, id string, want map[string]sql.NullString) {
+	t.Helper()
+	got := everturnKeysOf(t, ctx, db, table, id)
+	for name, w := range want {
+		if g := got[name]; g != w {
+			t.Errorf("%s.%s %s = %v, want %v", table, id, name, g, w)
+		}
+	}
+}
+
+// metadataAt is metadata holding the JSON text value at path ($.a.b.c).
+func metadataAt(path, value string) string {
+	parts := strings.Split(strings.TrimPrefix(path, "$."), ".")
+	out := value
+	for i := len(parts) - 1; i >= 0; i-- {
+		out = fmt.Sprintf(`{%q:%s}`, parts[i], out)
+	}
+	return out
+}
+
+// seedEverturnMailKeyRows inserts n rows into table whose metadata carries
+// every mail key (values cycling over three), created one minute apart, so
+// the EXPLAIN cases plan against a populated table. Every fourth row has no
+// keys, and every fifth an array key.
+func seedEverturnMailKeyRows(t *testing.T, ctx context.Context, db *sql.DB, table string, n int) {
+	t.Helper()
+	const batch = 100
+	base := time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC)
+	for start := 0; start < n; start += batch {
+		var values []string
+		for i := start; i < n && i < start+batch; i++ {
+			metadata := "{}"
+			switch {
+			case i%4 == 3:
+			case i%5 == 4:
+				metadata = fmt.Sprintf(`{"everturn":{"key":["k%d","k%d"]}}`, i%3, i%3+1)
+			default:
+				metadata = string(allEverturnKeysMetadata("wake", fmt.Sprint(i%3)))
+			}
+			createdAt := base.Add(-time.Duration(i) * time.Minute).Format("2006-01-02 15:04:05")
+			values = append(values, fmt.Sprintf("('fx-mail-%s-%d', 'mail fixture', '', '', '', '', 'open', 2, 'task', '%s', '%s')", table, i, metadata, createdAt))
+		}
+		//nolint:gosec // test-only identifiers
+		if _, err := db.ExecContext(ctx, "INSERT INTO "+table+" (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, metadata, created_at) VALUES "+strings.Join(values, ", ")); err != nil {
+			t.Fatalf("seed mail key rows into %s: %v", table, err)
+		}
+	}
+}
+
+// assertEverturnForkSchema checks that every everturn generated column is on
+// issues and wisps and every fork index on its table, (column, created_at)
+// for the everturn ones.
+func assertEverturnForkSchema(t *testing.T, ctx context.Context, db *sql.DB, when string) {
+	t.Helper()
+	for _, table := range forkTables {
+		if !tableColumnExists(t, ctx, db, table, "everturn_action") {
+			t.Errorf("%s: %s lacks everturn_action", when, table)
+		}
+		for _, c := range everturnMailKeyColumns {
+			if !tableColumnExists(t, ctx, db, table, c.name) {
+				t.Errorf("%s: %s lacks %s", when, table, c.name)
+			}
+			index := "idx_" + table + "_" + c.name
+			if got, want := tableIndexColumns(t, ctx, db, table, index), []string{c.name, "created_at"}; !slices.Equal(got, want) {
+				t.Errorf("%s: %s columns on %s = %v, want %v", when, index, table, got, want)
+			}
+		}
+	}
+	for _, name := range forkIndexNames {
+		if !issuesIndexExists(t, ctx, db, name) {
+			t.Errorf("%s: issues lacks %s", when, name)
+		}
+	}
+}
+
+// TestForkIndexesEverturnMailKeysPresentAndUsed checks the four mail key
+// columns: on issues and wisps after an open, each indexed on both as
+// (column, created_at), and read through that index by et's ids-first reader
+// shape and by everturn_key's array-prefix LIKE.
+func TestForkIndexesEverturnMailKeysPresentAndUsed(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	assertEverturnForkSchema(t, ctx, store.db, "after schema init")
+	for _, table := range forkTables {
+		seedEverturnMailKeyRows(t, ctx, store.db, table, 300)
+	}
+
+	for _, table := range forkTables {
+		for _, c := range everturnMailKeyColumns {
+			index := "[" + table + "." + c.name + "," + table + ".created_at]"
+			value := map[string]string{
+				"everturn_key": "k-1", "everturn_relay_source": "src-1", "everturn_bead": "bd-1", "everturn_corrects": "mail-1",
+			}[c.name]
+			queries := []string{
+				fmt.Sprintf("SELECT m.id FROM (SELECT id FROM %s WHERE %s = '%s') k JOIN %s m ON m.id = k.id", table, c.name, value, table),
+			}
+			if c.name == "everturn_key" {
+				queries = append(queries, fmt.Sprintf("SELECT id FROM %s WHERE everturn_key LIKE '[%%'", table))
+			}
+			for _, query := range queries {
+				plan := explainPlan(t, ctx, store.db, query)
+				t.Logf("EXPLAIN FORMAT=TREE %s\n%s", query, plan)
+				if !strings.Contains(plan, "IndexedTableAccess") || !strings.Contains(plan, index) {
+					t.Errorf("%s: want IndexedTableAccess on %s, plan:\n%s", query, index, plan)
+				}
+			}
+		}
+	}
+	// The array-prefix LIKE finds exactly the array keys.
+	for _, table := range forkTables {
+		var n int
+		//nolint:gosec // test-only identifiers
+		if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table+" WHERE everturn_key LIKE '[%'").Scan(&n); err != nil {
+			t.Fatalf("count array keys on %s: %v", table, err)
+		}
+		if want := 45; n != want { // i%5 == 4 and i%4 != 3, i < 300
+			t.Errorf("%s rows with an array everturn_key = %d, want %d", table, n, want)
+		}
+	}
+}
+
+// TestForkIndexesEverturnMailKeyValues checks what each mail key column stores,
+// on issues and on wisps, through the store: a string key, a missing key
+// (NULL), an array key (its JSON text), a 300-character value (its first 255),
+// relay.source read from the nested path, and a metadata update recomputing it.
+func TestForkIndexesEverturnMailKeyValues(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	long := strings.Repeat("x", 300)
+	for _, table := range forkTables {
+		for _, c := range everturnMailKeyColumns {
+			for _, tc := range []struct {
+				name, metadata string
+				want           sql.NullString
+			}{
+				{name: "string", metadata: metadataAt(c.path, `"v1"`), want: sql.NullString{String: "v1", Valid: true}},
+				{name: "missing", metadata: `{"everturn":{"action":"wake"}}`},
+				{name: "array", metadata: metadataAt(c.path, `["k1","k2"]`), want: sql.NullString{String: `["k1", "k2"]`, Valid: true}},
+				{name: "long", metadata: metadataAt(c.path, `"`+long+`"`), want: sql.NullString{String: long[:255], Valid: true}},
+			} {
+				id := fmt.Sprintf("fx-mk-%s-%s-%s", table, strings.TrimPrefix(c.name, "everturn_"), tc.name)
+				iss := &types.Issue{ID: id, Title: "mail key value", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask,
+					Ephemeral: table == "wisps", Metadata: json.RawMessage(tc.metadata)}
+				if err := store.CreateIssue(ctx, iss, "tester"); err != nil {
+					t.Errorf("create %s.%s: %v", table, id, err)
+					continue
+				}
+				assertEverturnKeys(t, ctx, store.db, table, id, map[string]sql.NullString{c.name: tc.want})
+			}
+
+			id := fmt.Sprintf("fx-mk-%s-%s-string", table, strings.TrimPrefix(c.name, "everturn_"))
+			if err := store.UpdateIssue(ctx, id, map[string]interface{}{"metadata": metadataAt(c.path, `"v2"`)}, "tester"); err != nil {
+				t.Fatalf("update metadata of %s.%s: %v", table, id, err)
+			}
+			assertEverturnKeys(t, ctx, store.db, table, id, map[string]sql.NullString{c.name: {String: "v2", Valid: true}})
+		}
+	}
+}
+
+// TestForkIndexesEverturnMailKeysPromotion checks the wisp promotion to issues
+// with every everturn column present on both tables: the promoted row's
+// columns hold the wisp's keys.
+func TestForkIndexesEverturnMailKeysPromotion(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	wisp := &types.Issue{ID: "fx-mk-promote", Title: "promoted mail", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask,
+		Ephemeral: true, Metadata: allEverturnKeysMetadata("wake", "p")}
+	if err := store.CreateIssue(ctx, wisp, "tester"); err != nil {
+		t.Fatalf("create wisp: %v", err)
+	}
+	assertEverturnKeys(t, ctx, store.db, "wisps", wisp.ID, wantAllEverturnKeys("wake", "p"))
+	if err := store.PromoteFromEphemeral(ctx, wisp.ID, "tester"); err != nil {
+		t.Fatalf("PromoteFromEphemeral: %v", err)
+	}
+	assertEverturnKeys(t, ctx, store.db, "issues", wisp.ID, wantAllEverturnKeys("wake", "p"))
+	var left int
+	if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM wisps WHERE id = ?", wisp.ID).Scan(&left); err != nil {
+		t.Fatalf("count wisp after promote: %v", err)
+	}
+	if left != 0 {
+		t.Errorf("wisp %s still in wisps after promotion", wisp.ID)
+	}
+}
+
+func doltHead(t *testing.T, ctx context.Context, db *sql.DB) string {
+	t.Helper()
+	var head string
+	if err := db.QueryRowContext(ctx, "SELECT DOLT_HASHOF('HEAD')").Scan(&head); err != nil {
+		t.Fatalf("read HEAD: %v", err)
+	}
+	return head
+}
+
+func showCreateTable(t *testing.T, ctx context.Context, db *sql.DB, table string) string {
+	t.Helper()
+	var name, ddl string
+	//nolint:gosec // test-only identifiers
+	if err := db.QueryRowContext(ctx, "SHOW CREATE TABLE `"+table+"`").Scan(&name, &ddl); err != nil {
+		t.Fatalf("SHOW CREATE TABLE %s: %v", table, err)
+	}
+	return ddl
+}
+
+func execAll(t *testing.T, ctx context.Context, db *sql.DB, queries ...string) {
+	t.Helper()
+	for _, q := range queries {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+}
+
+// TestForkIndexesEverturnMailKeysRepaired checks that a dropped mail key column
+// (its index goes with it) and a dropped mail key index come back at the next
+// writable open, on issues and on wisps, and that an open of a database that
+// has them all runs no ALTER: no commit, nothing dirty, wisps unchanged.
+func TestForkIndexesEverturnMailKeysRepaired(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	execAll(t, ctx, store.db,
+		"ALTER TABLE issues DROP COLUMN everturn_key",
+		"ALTER TABLE issues DROP INDEX idx_issues_everturn_bead",
+		"CALL DOLT_ADD('issues')",
+		"CALL DOLT_COMMIT('-m', 'test: drop a mail key column and index on issues')",
+		"ALTER TABLE wisps DROP COLUMN everturn_corrects",
+		"ALTER TABLE wisps DROP INDEX idx_wisps_everturn_relay_source",
+	)
+	if tableColumnExists(t, ctx, store.db, "issues", "everturn_key") || tableIndexExists(t, ctx, store.db, "issues", "idx_issues_everturn_key") ||
+		tableColumnExists(t, ctx, store.db, "wisps", "everturn_corrects") || tableIndexExists(t, ctx, store.db, "wisps", "idx_wisps_everturn_corrects") {
+		t.Fatalf("a dropped column or its index survived; the case under test did not arise")
+	}
+	if _, err := initSchemaOnDB(ctx, store.db); err != nil {
+		t.Fatalf("initSchemaOnDB after drops: %v", err)
+	}
+	assertEverturnForkSchema(t, ctx, store.db, "after the repairing open")
+	// wisps is clone-local and stays dirty; issues is committed by the pass.
+	if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n != 0 {
+		t.Errorf("issues has %d dolt_status rows after the repairing open, want 0 (committed by the pass)", n)
+	}
+
+	head, wisps := doltHead(t, ctx, store.db), showCreateTable(t, ctx, store.db, "wisps")
+	applied, err := initSchemaOnDB(ctx, store.db)
+	if err != nil {
+		t.Fatalf("initSchemaOnDB on a repaired database: %v", err)
+	}
+	if applied != 0 {
+		t.Errorf("initSchemaOnDB on a repaired database applied = %d, want 0", applied)
+	}
+	if got := doltHead(t, ctx, store.db); got != head {
+		t.Errorf("an open with nothing to do committed: HEAD %s -> %s", head, got)
+	}
+	if got := showCreateTable(t, ctx, store.db, "wisps"); got != wisps {
+		t.Errorf("an open with nothing to do changed wisps:\nbefore %s\nafter %s", wisps, got)
+	}
+	if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n != 0 {
+		t.Errorf("issues has %d dolt_status rows after a no-op open, want 0", n)
+	}
+}
+
+// TestForkIndexesEverturnMailKeysBackfilled is a database written by the build
+// before the mail key columns (columns absent on issues and wisps), then
+// opened by this one: the open adds the columns and the rows written before
+// get their values.
+func TestForkIndexesEverturnMailKeysBackfilled(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	for _, table := range forkTables {
+		for _, c := range everturnMailKeyColumns {
+			execAll(t, ctx, store.db, "ALTER TABLE "+table+" DROP COLUMN "+c.name)
+		}
+	}
+	execAll(t, ctx, store.db, "CALL DOLT_ADD('issues')", "CALL DOLT_COMMIT('-m', 'test: the schema before the mail key columns')")
+	for _, table := range forkTables {
+		if tableColumnExists(t, ctx, store.db, table, "everturn_key") {
+			t.Fatalf("%s.everturn_key survived its drop; the case under test did not arise", table)
+		}
+		//nolint:gosec // test-only identifiers
+		execAll(t, ctx, store.db, "INSERT INTO "+table+" (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, metadata) VALUES "+
+			"('fx-mk-old-"+table+"', 'written before', '', '', '', '', 'open', 2, 'task', '"+string(allEverturnKeysMetadata("wake", "old"))+"'), "+
+			"('fx-mk-old-none-"+table+"', 'written before, no keys', '', '', '', '', 'open', 2, 'task', '{}')")
+	}
+	execAll(t, ctx, store.db, "CALL DOLT_ADD('issues')", "CALL DOLT_COMMIT('-m', 'test: rows written before the mail key columns')")
+
+	if _, err := initSchemaOnDB(ctx, store.db); err != nil {
+		t.Fatalf("initSchemaOnDB on the older database: %v", err)
+	}
+	assertEverturnForkSchema(t, ctx, store.db, "after the upgrading open")
+	for _, table := range forkTables {
+		assertEverturnKeys(t, ctx, store.db, table, "fx-mk-old-"+table, wantAllEverturnKeys("wake", "old"))
+		assertEverturnKeys(t, ctx, store.db, table, "fx-mk-old-none-"+table, map[string]sql.NullString{
+			"everturn_key": {}, "everturn_relay_source": {}, "everturn_bead": {}, "everturn_corrects": {},
+		})
+	}
+	if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n != 0 {
+		t.Errorf("issues has %d dolt_status rows after the upgrading open, want 0 (committed by the pass)", n)
+	}
+}
+
+// TestForkIndexesWispsMadeAgain: wisps made again from its definition without
+// the fork columns (as its numbered migrations define it) gets every fork
+// column and index back at the next open. The open of a database with no
+// wisps table at all is TestForkIndexesSkipAbsentWisps (schema package): a
+// dropped wisps cannot reach the fork step live, the ignored series' dirty
+// guard refuses the pass first.
+func TestForkIndexesWispsMadeAgain(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	execAll(t, ctx, store.db, "ALTER TABLE wisps DROP COLUMN everturn_action")
+	for _, c := range everturnMailKeyColumns {
+		execAll(t, ctx, store.db, "ALTER TABLE wisps DROP COLUMN "+c.name)
+	}
+	definition := showCreateTable(t, ctx, store.db, "wisps")
+	if strings.Contains(definition, "everturn_") {
+		t.Fatalf("wisps definition still has a fork column:\n%s", definition)
+	}
+	// The aux wisp tables reference wisps, so drop and make it with the
+	// checks off (the store's pool is one session).
+	execAll(t, ctx, store.db, "SET FOREIGN_KEY_CHECKS = 0", "DROP TABLE wisps", definition, "SET FOREIGN_KEY_CHECKS = 1")
+	if tableColumnExists(t, ctx, store.db, "wisps", "everturn_key") {
+		t.Fatalf("the remade wisps has everturn_key; the case under test did not arise")
+	}
+	if _, err := initSchemaOnDB(ctx, store.db); err != nil {
+		t.Fatalf("initSchemaOnDB after wisps is made again: %v", err)
+	}
+	assertEverturnForkSchema(t, ctx, store.db, "after wisps is made again")
+}
+
+// forkMailKeyStatements are the fork step's statements for issues on a
+// database of the previous build (1.3.5-dev.1: everturn_action and its index
+// present, the four mail key columns absent), in the step's order: the four
+// columns, then their four indexes.
+func forkMailKeyStatements() []string {
+	var out []string
+	for _, c := range everturnMailKeyColumns {
+		out = append(out, "ALTER TABLE issues ADD COLUMN "+c.name+" VARCHAR(255) GENERATED ALWAYS AS (LEFT(JSON_UNQUOTE(JSON_EXTRACT(metadata, '"+c.path+"')), 255)) STORED")
+	}
+	for _, c := range everturnMailKeyColumns {
+		out = append(out, "ALTER TABLE issues ADD INDEX idx_issues_"+c.name+" ("+c.name+", created_at)")
+	}
+	return out
+}
+
+const (
+	forkSeedKeys = "fx-int-keys" // committed before the upgrade, every key set
+	forkSeedNone = "fx-int-none" // committed before the upgrade, no key
+)
+
+// toForkBuildSchema makes the store's schema that of an older build, drops
+// every column in drop on issues and on wisps (an index goes with its
+// column), and commits issues with two seed rows, so issues is clean.
+func toForkBuildSchema(t *testing.T, ctx context.Context, db *sql.DB, drop []string) {
+	t.Helper()
+	for _, table := range forkTables {
+		for _, c := range drop {
+			//nolint:gosec // test-only identifiers
+			execAll(t, ctx, db, "ALTER TABLE "+table+" DROP COLUMN "+c)
+		}
+	}
+	execAll(t, ctx, db,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, metadata) VALUES "+
+			"('"+forkSeedKeys+"', 'before the upgrade', '', '', '', '', 'open', 2, 'task', '"+string(allEverturnKeysMetadata("wake", "seed"))+"'), "+
+			"('"+forkSeedNone+"', 'before the upgrade, no keys', '', '', '', '', 'open', 2, 'task', '{}')",
+		"CALL DOLT_ADD('issues')",
+		"CALL DOLT_COMMIT('-m', 'test: the schema of an older build')",
+	)
+	if n := doltStatusRowsFor(t, ctx, db, "issues"); n != 0 {
+		t.Fatalf("issues has %d dolt_status rows on the older build's schema, want 0", n)
+	}
+}
+
+// toPreviousBuildSchema is the schema of 1.3.5-dev.1: no mail key columns.
+func toPreviousBuildSchema(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+	var drop []string
+	for _, c := range everturnMailKeyColumns {
+		drop = append(drop, c.name)
+	}
+	toForkBuildSchema(t, ctx, db, drop)
+}
+
+func doltLogCount(t *testing.T, ctx context.Context, db *sql.DB) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM dolt_log").Scan(&n); err != nil {
+		t.Fatalf("count dolt_log: %v", err)
+	}
+	return n
+}
+
+// forkInterruptedCases are the states an open killed inside the fork step can
+// leave on a clean issues: the first k of this build's statements applied and
+// uncommitted, for every k but the last, and the state 1.3.5-dev.1 can leave
+// (everturn_action added, its index not yet).
+func forkInterruptedCases() []struct {
+	name    string
+	prepare func(t *testing.T, ctx context.Context, db *sql.DB)
+} {
+	stmts := forkMailKeyStatements()
+	var cases []struct {
+		name    string
+		prepare func(t *testing.T, ctx context.Context, db *sql.DB)
+	}
+	for k := 1; k < len(stmts); k++ {
+		applied := stmts[:k]
+		cases = append(cases, struct {
+			name    string
+			prepare func(t *testing.T, ctx context.Context, db *sql.DB)
+		}{fmt.Sprintf("k=%d", k), func(t *testing.T, ctx context.Context, db *sql.DB) {
+			toPreviousBuildSchema(t, ctx, db)
+			execAll(t, ctx, db, applied...)
+		}})
+	}
+	cases = append(cases, struct {
+		name    string
+		prepare func(t *testing.T, ctx context.Context, db *sql.DB)
+	}{"dev.1 everturn_action without its index", func(t *testing.T, ctx context.Context, db *sql.DB) {
+		drop := []string{"everturn_action"}
+		for _, c := range everturnMailKeyColumns {
+			drop = append(drop, c.name)
+		}
+		toForkBuildSchema(t, ctx, db, drop)
+		execAll(t, ctx, db, "ALTER TABLE issues ADD COLUMN everturn_action VARCHAR(255) GENERATED ALWAYS AS (LEFT(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.everturn.action')), 255)) STORED")
+	}})
+	return cases
+}
+
+// TestForkIndexesInterruptedUpgradeFinished (bd-gcmmv, review bd-suuqd): an
+// open killed between two of the fork step's statements leaves issues dirty
+// with only the step's own DDL. The next writable open must take that for
+// its own work, not a user's: it adds what is missing, stages and commits
+// issues as an uninterrupted pass does (HEAD moves once, issues clean), and
+// the open after that runs no DDL and finds every column and index present.
+func TestForkIndexesInterruptedUpgradeFinished(t *testing.T) {
+	for _, c := range forkInterruptedCases() {
+		t.Run(c.name, func(t *testing.T) {
+			store, cleanup := setupTestStore(t)
+			defer cleanup()
+			ctx, cancel := testContext(t)
+			defer cancel()
+
+			c.prepare(t, ctx, store.db)
+			if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n == 0 {
+				t.Fatalf("issues is clean after the interrupted statements; the case under test did not arise")
+			}
+			commits := doltLogCount(t, ctx, store.db)
+			if _, err := rerunSchemaInitOnTestStore(ctx, store); err != nil {
+				t.Fatalf("open after the interrupted step: %v", err)
+			}
+			assertEverturnForkSchema(t, ctx, store.db, c.name+": after the resuming open")
+			if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n != 0 {
+				t.Errorf("%s: issues has %d dolt_status rows after the resuming open, want 0 (committed by the pass)", c.name, n)
+			}
+			if got := doltLogCount(t, ctx, store.db); got != commits+1 {
+				t.Errorf("%s: the resuming open made %d commits, want 1", c.name, got-commits)
+			}
+			assertEverturnKeys(t, ctx, store.db, "issues", forkSeedKeys, wantAllEverturnKeys("wake", "seed"))
+			assertEverturnKeys(t, ctx, store.db, "issues", forkSeedNone, map[string]sql.NullString{
+				"everturn_action": {}, "everturn_key": {}, "everturn_relay_source": {}, "everturn_bead": {}, "everturn_corrects": {},
+			})
+
+			head, issues, wisps := doltHead(t, ctx, store.db), showCreateTable(t, ctx, store.db, "issues"), showCreateTable(t, ctx, store.db, "wisps")
+			applied, err := rerunSchemaInitOnTestStore(ctx, store)
+			if err != nil {
+				t.Fatalf("%s: open after the resuming open: %v", c.name, err)
+			}
+			if applied != 0 {
+				t.Errorf("%s: open after the resuming open applied = %d, want 0", c.name, applied)
+			}
+			if got := doltHead(t, ctx, store.db); got != head {
+				t.Errorf("%s: the open after the resuming open committed: HEAD %s -> %s", c.name, head, got)
+			}
+			if got := showCreateTable(t, ctx, store.db, "issues"); got != issues {
+				t.Errorf("%s: the open after the resuming open changed issues:\nbefore %s\nafter %s", c.name, issues, got)
+			}
+			if got := showCreateTable(t, ctx, store.db, "wisps"); got != wisps {
+				t.Errorf("%s: the open after the resuming open changed wisps:\nbefore %s\nafter %s", c.name, wisps, got)
+			}
+			if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n != 0 {
+				t.Errorf("%s: issues has %d dolt_status rows after a no-op open, want 0", c.name, n)
+			}
+		})
+	}
+}
+
+// forkUserRowChange is a user's uncommitted row change on issues: one seed
+// row retitled and one row added.
+const forkUserRowID = "fx-int-user"
+
+func forkUserRowChange(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+	execAll(t, ctx, db,
+		"UPDATE issues SET title = 'retitled by the user' WHERE id = '"+forkSeedNone+"'",
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, metadata) VALUES "+
+			"('"+forkUserRowID+"', 'added by the user', '', '', '', '', 'open', 2, 'task', '"+string(allEverturnKeysMetadata("wake", "user"))+"')",
+	)
+}
+
+// assertForkUserRowsUncommitted checks the user's change of forkUserRowChange
+// is in the working set, unchanged, and not at HEAD.
+func assertForkUserRowsUncommitted(t *testing.T, ctx context.Context, db *sql.DB, when string) {
+	t.Helper()
+	var title string
+	if err := db.QueryRowContext(ctx, "SELECT title FROM issues WHERE id = ?", forkSeedNone).Scan(&title); err != nil {
+		t.Fatalf("%s: read %s: %v", when, forkSeedNone, err)
+	}
+	if title != "retitled by the user" {
+		t.Errorf("%s: %s title = %q, want the user's %q", when, forkSeedNone, title, "retitled by the user")
+	}
+	var userTitle string
+	if err := db.QueryRowContext(ctx, "SELECT title FROM issues WHERE id = ?", forkUserRowID).Scan(&userTitle); err != nil {
+		t.Errorf("%s: the user's row %s: %v", when, forkUserRowID, err)
+	} else if userTitle != "added by the user" {
+		t.Errorf("%s: %s title = %q, want %q", when, forkUserRowID, userTitle, "added by the user")
+	}
+	var headTitle string
+	if err := db.QueryRowContext(ctx, "SELECT title FROM issues AS OF 'HEAD' WHERE id = ?", forkSeedNone).Scan(&headTitle); err != nil {
+		t.Fatalf("%s: read %s at HEAD: %v", when, forkSeedNone, err)
+	}
+	if headTitle != "before the upgrade, no keys" {
+		t.Errorf("%s: %s title at HEAD = %q: the user's change was committed", when, forkSeedNone, headTitle)
+	}
+	var atHead int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues AS OF 'HEAD' WHERE id = ?", forkUserRowID).Scan(&atHead); err != nil {
+		t.Fatalf("%s: count %s at HEAD: %v", when, forkUserRowID, err)
+	}
+	if atHead != 0 {
+		t.Errorf("%s: the user's row %s is at HEAD: it was committed", when, forkUserRowID)
+	}
+}
+
+// TestForkIndexesUserRowsStillSkipped: a user's uncommitted rows alone on
+// issues, no fork statement applied, still make the step skip issues and
+// leave it untouched (the next open after the user's commit adds the columns).
+func TestForkIndexesUserRowsStillSkipped(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	toPreviousBuildSchema(t, ctx, store.db)
+	forkUserRowChange(t, ctx, store.db)
+	issues := showCreateTable(t, ctx, store.db, "issues")
+	if _, err := rerunSchemaInitOnTestStore(ctx, store); err != nil {
+		t.Fatalf("open with a user's uncommitted rows: %v", err)
+	}
+	if got := showCreateTable(t, ctx, store.db, "issues"); got != issues {
+		t.Errorf("the step changed issues under a user's uncommitted rows:\nbefore %s\nafter %s", issues, got)
+	}
+	for _, c := range everturnMailKeyColumns {
+		if tableColumnExists(t, ctx, store.db, "issues", c.name) {
+			t.Errorf("issues.%s added under a user's uncommitted rows", c.name)
+		}
+	}
+	assertForkUserRowsUncommitted(t, ctx, store.db, "after the skipping open")
+
+	execAll(t, ctx, store.db, "CALL DOLT_ADD('issues')", "CALL DOLT_COMMIT('-m', 'test: the user commits')")
+	if _, err := rerunSchemaInitOnTestStore(ctx, store); err != nil {
+		t.Fatalf("open after the user's commit: %v", err)
+	}
+	assertEverturnForkSchema(t, ctx, store.db, "after the user's commit")
+	if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n != 0 {
+		t.Errorf("issues has %d dolt_status rows after the open that follows the user's commit, want 0", n)
+	}
+}
+
+// TestForkIndexesInterruptedUpgradeUnderUserRows is an interrupted step with
+// a user's uncommitted row change on top. Chosen behaviour (bd-gcmmv item 3):
+// the open adds the missing columns and indexes so reads work, neither stages
+// nor commits issues (HEAD does not move), and leaves the user's rows
+// uncommitted and unchanged; the open after the user's commit has nothing to
+// do.
+func TestForkIndexesInterruptedUpgradeUnderUserRows(t *testing.T) {
+	for _, c := range forkInterruptedCases() {
+		t.Run(c.name, func(t *testing.T) {
+			store, cleanup := setupTestStore(t)
+			defer cleanup()
+			ctx, cancel := testContext(t)
+			defer cancel()
+
+			c.prepare(t, ctx, store.db)
+			forkUserRowChange(t, ctx, store.db)
+			head := doltHead(t, ctx, store.db)
+			if _, err := rerunSchemaInitOnTestStore(ctx, store); err != nil {
+				t.Fatalf("%s: open over the interrupted step and a user's rows: %v", c.name, err)
+			}
+			assertEverturnForkSchema(t, ctx, store.db, c.name+": after the open over a user's rows")
+			var source sql.NullString
+			if err := store.db.QueryRowContext(ctx, "SELECT everturn_relay_source FROM issues WHERE id = ?", forkUserRowID).Scan(&source); err != nil {
+				t.Errorf("%s: read by everturn_relay_source after the open: %v", c.name, err)
+			}
+			assertEverturnKeys(t, ctx, store.db, "issues", forkUserRowID, wantAllEverturnKeys("wake", "user"))
+			assertEverturnKeys(t, ctx, store.db, "issues", forkSeedKeys, wantAllEverturnKeys("wake", "seed"))
+			if got := doltHead(t, ctx, store.db); got != head {
+				t.Errorf("%s: the open committed over a user's uncommitted rows: HEAD %s -> %s", c.name, head, got)
+			}
+			if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n == 0 {
+				t.Errorf("%s: issues is clean after the open: the user's rows were committed", c.name)
+			}
+			assertForkUserRowsUncommitted(t, ctx, store.db, c.name+": after the open")
+
+			execAll(t, ctx, store.db, "CALL DOLT_ADD('issues')", "CALL DOLT_COMMIT('-m', 'test: the user commits')")
+			head, issues := doltHead(t, ctx, store.db), showCreateTable(t, ctx, store.db, "issues")
+			applied, err := rerunSchemaInitOnTestStore(ctx, store)
+			if err != nil {
+				t.Fatalf("%s: open after the user's commit: %v", c.name, err)
+			}
+			if applied != 0 {
+				t.Errorf("%s: open after the user's commit applied = %d, want 0", c.name, applied)
+			}
+			if got := doltHead(t, ctx, store.db); got != head {
+				t.Errorf("%s: the open after the user's commit committed: HEAD %s -> %s", c.name, head, got)
+			}
+			if got := showCreateTable(t, ctx, store.db, "issues"); got != issues {
+				t.Errorf("%s: the open after the user's commit changed issues:\nbefore %s\nafter %s", c.name, issues, got)
+			}
+			if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n != 0 {
+				t.Errorf("%s: issues has %d dolt_status rows after the open that follows the user's commit, want 0", c.name, n)
+			}
+		})
+	}
+}
+
+// startForkGateProxy forwards each connection to upstream and calls gate with
+// the text of each client command (as startBudgetProxy describes it) before
+// forwarding it; a false answer drops the connection there, unforwarded.
+func startForkGateProxy(t *testing.T, upstream string, gate func(desc string) bool) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("gate proxy listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			client, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(client net.Conn) {
+				defer func() { _ = client.Close() }()
+				server, err := net.Dial("tcp", upstream)
+				if err != nil {
+					return
+				}
+				defer func() { _ = server.Close() }()
+				go func() {
+					_, _ = io.Copy(client, server)
+					_ = client.Close()
+				}()
+				for {
+					seq, payload, raw, err := readBudgetPacket(client)
+					if err != nil {
+						return
+					}
+					if seq == 0 && len(payload) > 0 && (payload[0] == 0x03 || payload[0] == 0x16) {
+						if !gate(strings.Join(strings.Fields(string(payload[1:])), " ")) {
+							return
+						}
+					}
+					if _, err := server.Write(raw); err != nil {
+						return
+					}
+				}
+			}(client)
+		}
+	}()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// TestForkIndexesCancelledUpgradeFinishedByWaiter is the reviewer's sequence
+// (bd-suuqd): the first writable open of a 1.3.5-dev.1 database adds
+// issues.everturn_key and is cancelled before its next ALTER, while it holds
+// the migration lock and a second writable open waits for it. The waiter
+// takes the lock when the first open's session goes, finds the step's own
+// uncommitted DDL, and returns the complete schema, committed; a read of
+// issues by everturn_relay_source succeeds.
+func TestForkIndexesCancelledUpgradeFinishedByWaiter(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	toPreviousBuildSchema(t, ctx, store.db)
+	upstream := net.JoinHostPort("127.0.0.1", strconv.Itoa(testServerPort))
+	openConfig := func(port int) *Config {
+		return &Config{Path: t.TempDir(), Database: store.database, ServerHost: "127.0.0.1", ServerPort: port,
+			ServerUser: "root", CommitterName: "test", CommitterEmail: "test@example.com"}
+	}
+	open := func(ctx context.Context, cfg *Config) <-chan error {
+		done := make(chan error, 1)
+		go func() {
+			s, err := New(ctx, cfg)
+			if err == nil {
+				err = s.Close()
+			}
+			done <- err
+		}()
+		return done
+	}
+
+	firstCtx, cancelFirst := context.WithCancel(ctx)
+	defer cancelFirst()
+	atSecondALTER := make(chan struct{})
+	var atSecondOnce sync.Once
+	firstPort := startForkGateProxy(t, upstream, func(desc string) bool {
+		if !strings.HasPrefix(desc, "ALTER TABLE issues ADD COLUMN everturn_relay_source ") {
+			return true
+		}
+		atSecondOnce.Do(func() { close(atSecondALTER) })
+		<-firstCtx.Done()
+		return false
+	})
+	first := open(firstCtx, openConfig(firstPort))
+	select {
+	case <-atSecondALTER:
+	case err := <-first:
+		t.Fatalf("the first open returned before its second ALTER: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if !tableColumnExists(t, ctx, store.db, "issues", "everturn_key") || tableColumnExists(t, ctx, store.db, "issues", "everturn_relay_source") {
+		t.Fatalf("the first open did not stop after exactly its first ALTER")
+	}
+	var free int
+	if err := store.db.QueryRowContext(ctx, "SELECT IS_FREE_LOCK(?)", schema.MigrationLockName(store.database)).Scan(&free); err != nil || free != 0 {
+		t.Fatalf("the first open does not hold the migration lock: IS_FREE_LOCK = %d, %v", free, err)
+	}
+
+	waiting := make(chan struct{})
+	var waitingOnce sync.Once
+	secondPort := startForkGateProxy(t, upstream, func(desc string) bool {
+		if strings.Contains(desc, "GET_LOCK(") {
+			waitingOnce.Do(func() { close(waiting) })
+		}
+		return true
+	})
+	second := open(ctx, openConfig(secondPort))
+	select {
+	case <-waiting:
+	case err := <-second:
+		t.Fatalf("the second open returned before it asked for the migration lock: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+
+	cancelFirst()
+	if err := <-first; err == nil {
+		t.Errorf("the cancelled first open returned no error")
+	} else {
+		t.Logf("cancelled first open: %v", err)
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("the waiting open: %v", err)
+	}
+	assertEverturnForkSchema(t, ctx, store.db, "after the waiting open")
+	if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n != 0 {
+		t.Errorf("issues has %d dolt_status rows after the waiting open, want 0 (committed by its pass)", n)
+	}
+	var source sql.NullString
+	if err := store.db.QueryRowContext(ctx, "SELECT everturn_relay_source FROM issues WHERE id = ?", forkSeedKeys).Scan(&source); err != nil {
+		t.Fatalf("read issues by everturn_relay_source: %v", err)
+	}
+	if !source.Valid || source.String != "src-seed" {
+		t.Errorf("everturn_relay_source of %s = %v, want src-seed", forkSeedKeys, source)
+	}
+}
+
+// assertForkCommittedOnce checks the state a pass that commits the fork step
+// leaves: every column and index present, issues out of dolt_status, HEAD
+// moved from head by exactly one commit, and a read by everturn_relay_source.
+func assertForkCommittedOnce(t *testing.T, ctx context.Context, db *sql.DB, when, head string, commits int) {
+	t.Helper()
+	assertEverturnForkSchema(t, ctx, db, when)
+	if got := doltHead(t, ctx, db); got == head {
+		t.Errorf("%s: HEAD did not move: the step's DDL was not committed", when)
+	}
+	if got := doltLogCount(t, ctx, db); got != commits+1 {
+		t.Errorf("%s: %d new commits, want 1", when, got-commits)
+	}
+	if n := doltStatusRowsFor(t, ctx, db, "issues"); n != 0 {
+		t.Errorf("%s: issues has %d dolt_status rows, want 0", when, n)
+	}
+	for _, c := range everturnMailKeyColumns {
+		var n int
+		//nolint:gosec // test-only identifiers
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues AS OF 'HEAD' WHERE "+c.name+" IS NOT NULL").Scan(&n); err != nil {
+			t.Errorf("%s: HEAD lacks issues.%s: %v", when, c.name, err)
+		}
+	}
+	var source sql.NullString
+	if err := db.QueryRowContext(ctx, "SELECT everturn_relay_source FROM issues WHERE id = ?", forkSeedKeys).Scan(&source); err != nil || source.String != "src-seed" {
+		t.Errorf("%s: everturn_relay_source of %s = %v, %v; want src-seed", when, forkSeedKeys, source, err)
+	}
+}
+
+// TestForkIndexesCommitBoundaryFinished (bd-7bqv6, review bd-313ml finding
+// 1): an upgrade cancelled after every statement of the step, before
+// CALL DOLT_COMMIT('-m', 'schema: apply migrations'), leaves a complete
+// working schema and HEAD without it, issues dirty. The working table looks
+// converged, so the gate (needsForkIndexes) reads HEAD as well: the next
+// writable open commits issues once, and the open after it does nothing.
+// Two shapes: the real cancel at the commit (issues staged, through a proxy
+// that holds the commit), and every statement applied by hand, unstaged.
+//
+// It is also the test that turns red when a Dolt version prints a fork column
+// or index line in a form normalizeDefinition does not know: the classifier
+// then reads the step's own line as a foreign definition, skips issues, and
+// HEAD does not move.
+func TestForkIndexesCommitBoundaryFinished(t *testing.T) {
+	reopenTwice := func(t *testing.T, ctx context.Context, store *DoltStore, head string, commits int) {
+		t.Helper()
+		cfg := &Config{Path: t.TempDir(), Database: store.database, ServerHost: "127.0.0.1", ServerPort: testServerPort,
+			ServerUser: "root", CommitterName: "test", CommitterEmail: "test@example.com"}
+		for attempt := 1; attempt <= 2; attempt++ {
+			s, err := New(ctx, cfg)
+			if err != nil {
+				t.Fatalf("writable open %d after the lost commit: %v", attempt, err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatalf("close open %d: %v", attempt, err)
+			}
+			assertForkCommittedOnce(t, ctx, store.db, fmt.Sprintf("after writable open %d", attempt), head, commits)
+		}
+	}
+
+	t.Run("cancelled at the commit, staged", func(t *testing.T) {
+		store, cleanup := setupConcurrentTestStore(t)
+		defer cleanup()
+		ctx, cancel := testContext(t)
+		defer cancel()
+
+		toPreviousBuildSchema(t, ctx, store.db)
+		head, commits := doltHead(t, ctx, store.db), doltLogCount(t, ctx, store.db)
+		firstCtx, cancelFirst := context.WithCancel(ctx)
+		defer cancelFirst()
+		atCommit := make(chan struct{})
+		var once sync.Once
+		port := startForkGateProxy(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(testServerPort)), func(desc string) bool {
+			if !strings.Contains(desc, "'schema: apply migrations'") {
+				return true
+			}
+			once.Do(func() { close(atCommit) })
+			<-firstCtx.Done()
+			return false
+		})
+		done := make(chan error, 1)
+		go func() {
+			s, err := New(firstCtx, &Config{Path: t.TempDir(), Database: store.database, ServerHost: "127.0.0.1", ServerPort: port,
+				ServerUser: "root", CommitterName: "test", CommitterEmail: "test@example.com"})
+			if err == nil {
+				err = s.Close()
+			}
+			done <- err
+		}()
+		select {
+		case <-atCommit:
+		case err := <-done:
+			t.Fatalf("the first open returned before its commit: %v", err)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		assertEverturnForkSchema(t, ctx, store.db, "at the held commit")
+		var staged int
+		if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM dolt_status WHERE table_name = 'issues' AND staged").Scan(&staged); err != nil || staged != 1 {
+			t.Fatalf("issues is not staged at the held commit: %d, %v", staged, err)
+		}
+		cancelFirst()
+		if err := <-done; err == nil {
+			t.Fatal("the first open succeeded though cancelled at its commit")
+		}
+		if got := doltHead(t, ctx, store.db); got != head {
+			t.Fatalf("the cancelled commit landed: HEAD %s -> %s", head, got)
+		}
+		reopenTwice(t, ctx, store, head, commits)
+	})
+
+	t.Run("every statement applied, unstaged", func(t *testing.T) {
+		store, cleanup := setupConcurrentTestStore(t)
+		defer cleanup()
+		ctx, cancel := testContext(t)
+		defer cancel()
+
+		toPreviousBuildSchema(t, ctx, store.db)
+		head, commits := doltHead(t, ctx, store.db), doltLogCount(t, ctx, store.db)
+		// The wisps statements too (wisps is dolt_ignored, so they leave
+		// nothing in dolt_status): with any of them missing, wisps alone would
+		// send the open down the pass and hide what the gate reads of issues.
+		stmts := forkMailKeyStatements()
+		for _, s := range forkMailKeyStatements() {
+			stmts = append(stmts, strings.ReplaceAll(s, "issues", "wisps"))
+		}
+		execAll(t, ctx, store.db, stmts...)
+		assertEverturnForkSchema(t, ctx, store.db, "with every statement applied")
+		if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n == 0 {
+			t.Fatal("issues is clean with every statement applied; the case under test did not arise")
+		}
+		reopenTwice(t, ctx, store, head, commits)
+	})
+}
+
+// TestForkIndexesUserOwnedDefinitionsSkipped (bd-7bqv6, review bd-313ml
+// finding 2): a fork-named column or index a user added, uncommitted, with
+// another definition than the step's is a user's change: the open leaves
+// issues untouched and uncommitted. The controls, an unrelated user column
+// and index, are skipped the same way.
+func TestForkIndexesUserOwnedDefinitionsSkipped(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		ddl           string
+		ownFirstAlter bool
+	}{
+		{name: "fork-named column", ddl: "ALTER TABLE issues ADD COLUMN everturn_key VARCHAR(255) DEFAULT 'user-owned'"},
+		{name: "fork-named index", ddl: "ALTER TABLE issues ADD INDEX idx_issues_everturn_key (title)", ownFirstAlter: true},
+		{name: "control: unrelated column", ddl: "ALTER TABLE issues ADD COLUMN user_column VARCHAR(255)"},
+		{name: "control: unrelated index", ddl: "ALTER TABLE issues ADD INDEX user_title_index (title)", ownFirstAlter: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, cleanup := setupTestStore(t)
+			defer cleanup()
+			ctx, cancel := testContext(t)
+			defer cancel()
+
+			toPreviousBuildSchema(t, ctx, store.db)
+			if tc.ownFirstAlter {
+				execAll(t, ctx, store.db, forkMailKeyStatements()[0])
+			}
+			execAll(t, ctx, store.db, tc.ddl)
+			head, issues := doltHead(t, ctx, store.db), showCreateTable(t, ctx, store.db, "issues")
+			if _, err := rerunSchemaInitOnTestStore(ctx, store); err != nil {
+				t.Fatalf("open over the user's DDL: %v", err)
+			}
+			if got := doltHead(t, ctx, store.db); got != head {
+				t.Errorf("the open committed the user's DDL: HEAD %s -> %s", head, got)
+			}
+			if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n == 0 {
+				t.Errorf("issues is clean after the open: the user's DDL was committed")
+			}
+			if got := showCreateTable(t, ctx, store.db, "issues"); got != issues {
+				t.Errorf("the open changed issues over the user's DDL:\nbefore %s\nafter %s", issues, got)
+			}
+		})
+	}
+}
+
+// TestForkIndexesCaseOnlyRowEdit (bd-7bqv6, review bd-313ml finding 3): with
+// a case-insensitive issues.title, a case-only edit of a row is a user's row
+// change. At classification (over the step's interrupted first ALTER) it
+// makes issues "own DDL and a user's rows": the columns are finished, nothing
+// is staged or committed, and the user's value stays in the working set only.
+// The control is the reviewer's case-only edit inside metadata. During the
+// pass (another session's edit after the guard's first read) it trips the
+// changed-signature guard; the control is a substantive edit.
+func TestForkIndexesCaseOnlyRowEdit(t *testing.T) {
+	const ciTitle = "ALTER TABLE issues MODIFY title VARCHAR(500) COLLATE utf8mb4_0900_ai_ci NOT NULL"
+	for _, tc := range []struct {
+		name, change, probe, original, changed string
+	}{
+		{name: "at classification: case-only title", change: "UPDATE issues SET title = 'Before the upgrade', updated_at = updated_at WHERE id = '" + forkSeedKeys + "'",
+			probe: "title", original: "before the upgrade", changed: "Before the upgrade"},
+		{name: "at classification: control, case-only metadata", change: "UPDATE issues SET metadata = JSON_SET(metadata, '$.everturn.relay.source', 'Src-Seed'), updated_at = updated_at WHERE id = '" + forkSeedKeys + "'",
+			probe: "JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.everturn.relay.source'))", original: "src-seed", changed: "Src-Seed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, cleanup := setupTestStore(t)
+			defer cleanup()
+			ctx, cancel := testContext(t)
+			defer cancel()
+
+			execAll(t, ctx, store.db, ciTitle)
+			toPreviousBuildSchema(t, ctx, store.db)
+			execAll(t, ctx, store.db, forkMailKeyStatements()[0], tc.change)
+			head := doltHead(t, ctx, store.db)
+			if _, err := rerunSchemaInitOnTestStore(ctx, store); err != nil {
+				t.Fatalf("open over the user's edit: %v", err)
+			}
+			assertEverturnForkSchema(t, ctx, store.db, "after the open over the user's edit")
+			var atHead, working string
+			//nolint:gosec // test-only expressions
+			if err := store.db.QueryRowContext(ctx, "SELECT "+tc.probe+" FROM issues AS OF 'HEAD' WHERE id = ?", forkSeedKeys).Scan(&atHead); err != nil {
+				t.Fatalf("read at HEAD: %v", err)
+			}
+			//nolint:gosec // test-only expressions
+			if err := store.db.QueryRowContext(ctx, "SELECT "+tc.probe+" FROM issues WHERE id = ?", forkSeedKeys).Scan(&working); err != nil {
+				t.Fatalf("read the working value: %v", err)
+			}
+			if got := doltHead(t, ctx, store.db); got != head {
+				t.Errorf("the open committed over the user's edit: HEAD %s -> %s", head, got)
+			}
+			if working != tc.changed || atHead != tc.original {
+				t.Errorf("the user's edit: working %q (want %q), HEAD %q (want %q)", working, tc.changed, atHead, tc.original)
+			}
+			if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n == 0 {
+				t.Errorf("issues is clean after the open: the user's edit was committed")
+			}
+		})
+	}
+
+	for _, tc := range []struct{ name, title string }{
+		{name: "during the pass: case-only title", title: "Before the upgrade, no keys"},
+		{name: "during the pass: control, substantive title", title: "substantively different"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, cleanup := setupConcurrentTestStore(t)
+			defer cleanup()
+			ctx, cancel := testContext(t)
+			defer cancel()
+
+			execAll(t, ctx, store.db, ciTitle)
+			toPreviousBuildSchema(t, ctx, store.db)
+			// Own DDL and a user's rows: the guard reads forkRowsSignature.
+			execAll(t, ctx, store.db, forkMailKeyStatements()[0],
+				"UPDATE issues SET metadata = JSON_SET(metadata, '$.everturn.relay.source', 'different-source') WHERE id = '"+forkSeedKeys+"'")
+			head := doltHead(t, ctx, store.db)
+			atAlter, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			port := startForkGateProxy(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(testServerPort)), func(desc string) bool {
+				if !strings.HasPrefix(desc, "ALTER TABLE issues ADD COLUMN everturn_relay_source ") {
+					return true
+				}
+				once.Do(func() { close(atAlter) })
+				select {
+				case <-release:
+					return true
+				case <-ctx.Done():
+					return false
+				}
+			})
+			done := make(chan error, 1)
+			go func() {
+				s, err := New(ctx, &Config{Path: t.TempDir(), Database: store.database, ServerHost: "127.0.0.1", ServerPort: port,
+					ServerUser: "root", CommitterName: "test", CommitterEmail: "test@example.com"})
+				if err == nil {
+					err = s.Close()
+				}
+				done <- err
+			}()
+			select {
+			case <-atAlter:
+			case err := <-done:
+				t.Fatalf("the open returned before its next ALTER: %v", err)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			execAll(t, ctx, store.db, "UPDATE issues SET title = '"+tc.title+"', updated_at = updated_at WHERE id = '"+forkSeedNone+"'")
+			close(release)
+			err := <-done
+			if err == nil || !strings.Contains(err.Error(), "pre-existing dirty tables changed during schema migration: issues") {
+				t.Errorf("an edit of title %q during the pass: open = %v, want the changed-signature refusal", tc.title, err)
+			}
+			if got := doltHead(t, ctx, store.db); got != head {
+				t.Errorf("the refused open committed: HEAD %s -> %s", head, got)
+			}
+		})
+	}
+}
+
+// TestForkIndexesStandingUserRowsLeftAlone (bd-7bqv6): a finished step under a
+// user's uncommitted rows leaves HEAD without the fork columns until the
+// user's commit, so each writable open in between takes the locked pass. That
+// open changes nothing (issues definition, rows, HEAD), and the open after the
+// user's commit has nothing to do.
+func TestForkIndexesStandingUserRowsLeftAlone(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	toPreviousBuildSchema(t, ctx, store.db)
+	execAll(t, ctx, store.db, forkMailKeyStatements()[0])
+	forkUserRowChange(t, ctx, store.db)
+	if _, err := rerunSchemaInitOnTestStore(ctx, store); err != nil {
+		t.Fatalf("open finishing the step under the user's rows: %v", err)
+	}
+	assertEverturnForkSchema(t, ctx, store.db, "after the finishing open")
+	head, issues := doltHead(t, ctx, store.db), showCreateTable(t, ctx, store.db, "issues")
+	for attempt := 1; attempt <= 2; attempt++ {
+		start := time.Now()
+		applied, err := rerunSchemaInitOnTestStore(ctx, store)
+		if err != nil {
+			t.Fatalf("standing open %d: %v", attempt, err)
+		}
+		t.Logf("standing open %d: %v (applied %d)", attempt, time.Since(start), applied)
+		if got := doltHead(t, ctx, store.db); got != head {
+			t.Errorf("standing open %d committed: HEAD %s -> %s", attempt, head, got)
+		}
+		if got := showCreateTable(t, ctx, store.db, "issues"); got != issues {
+			t.Errorf("standing open %d changed issues:\nbefore %s\nafter %s", attempt, issues, got)
+		}
+		assertForkUserRowsUncommitted(t, ctx, store.db, fmt.Sprintf("after standing open %d", attempt))
+	}
+
+	execAll(t, ctx, store.db, "CALL DOLT_ADD('issues')", "CALL DOLT_COMMIT('-m', 'test: the user commits')")
+	head = doltHead(t, ctx, store.db)
+	applied, err := rerunSchemaInitOnTestStore(ctx, store)
+	if err != nil {
+		t.Fatalf("open after the user's commit: %v", err)
+	}
+	if applied != 0 {
+		t.Errorf("open after the user's commit applied = %d, want 0", applied)
+	}
+	if got := doltHead(t, ctx, store.db); got != head {
+		t.Errorf("open after the user's commit committed: HEAD %s -> %s", head, got)
+	}
+	if n := doltStatusRowsFor(t, ctx, store.db, "issues"); n != 0 {
+		t.Errorf("issues has %d dolt_status rows after the user's commit and an open, want 0", n)
 	}
 }

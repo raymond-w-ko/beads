@@ -38,6 +38,13 @@ import (
 //     SELECT COALESCE(MAX(version), 0) FROM schema_migrations, once for
 //     CurrentVersion and once for PendingVersions) and initSchemaOnDB's
 //     SELECT DATABASE(). The convergence pass's own SELECT DATABASE() stays.
+//     bd-iqmdg's mail key indexes on wisps added one probe to it, 29 to 30:
+//     SHOW INDEX FROM `wisps` (the fork step's columns on wisps were already
+//     read by its SHOW COLUMNS FROM `wisps`). bd-7bqv6 (review bd-313ml
+//     finding 1) replaced SHOW COLUMNS FROM `issues` and SHOW INDEX FROM
+//     `issues` with SHOW CREATE TABLE `issues` and SHOW CREATE TABLE `issues`
+//     AS OF 'HEAD' (the gate reads HEAD too, so a lost schema commit is
+//     seen), so the count stays 30.
 func TestServerOpenStatementBudget(t *testing.T) {
 	skipIfNoDolt(t)
 	acquireTestSlot()
@@ -72,7 +79,7 @@ func TestServerOpenStatementBudget(t *testing.T) {
 		wantCmds  int
 	}{
 		{name: "read-only", readOnly: true, wantConns: 2, wantCmds: 4},
-		{name: "writable", readOnly: false, wantConns: 2, wantCmds: 29},
+		{name: "writable", readOnly: false, wantConns: 2, wantCmds: 30},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			cfg := f.config()

@@ -471,7 +471,7 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	expectIgnoredSentinelProbes(mock, true)
 	expectDoltStatusRows(mock)
 	// The fork step runs after the ignored series and its unstage read above.
-	expectForkIndexesPresent(mock)
+	expectForkStepPresent(mock)
 	expectDoltStatusRows(mock)
 	mock.ExpectQuery("(?s)SELECT t\\.TABLE_NAME\\s+FROM INFORMATION_SCHEMA\\.TABLES t").
 		WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("schema_migrations"))

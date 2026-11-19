@@ -785,6 +785,49 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, seedChanged bool) (
 	for name := range auxRekeyExempt {
 		delete(dirtyBefore, name)
 	}
+	// bd-gcmmv: a fork table left dirty by the fork step's own interrupted DDL
+	// (an open killed between two of its ALTERs) is this pass's own state,
+	// like the aux re-key's tables above: drop it from dirtyBefore so the step
+	// finishes it and the pass stages and commits it. When a user's
+	// uncommitted rows sit on top of that DDL, the table stays in dirtyBefore
+	// (never staged or committed by the pass), but the fork step may still
+	// finish its columns and indexes there (forkResume), and the
+	// changed-signature guard reads it over the columns outside the fork
+	// columns (forkRowsSignature), which the step's DDL does not change.
+	forkDirty, err := classifyForkDirtyTables(ctx, db, dirtyBefore)
+	if err != nil {
+		return 0, err
+	}
+	// The gate sends a pass here also when only the commit was lost (bd-7bqv6,
+	// review bd-313ml finding 1: HEAD lacks fork objects the working table
+	// holds), so forkDirtyOwn with nothing left to add is committed the same
+	// way. forkDirtyOwnAndRows with nothing left to add is the standing state
+	// of a finished step under a user's rows: every writable open lands here
+	// until the user's commit takes both. The step adds nothing to that table
+	// and the pass neither stages nor commits it, so it is kept out of the
+	// changed-signature guard's reads (forkLeave), which would walk its whole
+	// dolt_diff twice on each such open.
+	forkResumed := false
+	forkResume := make(map[string]bool)
+	forkLeave := make(map[string]bool)
+	var forkResumeTables []string
+	for table, st := range forkDirty {
+		switch {
+		case st.kind == forkDirtyOwn:
+			delete(dirtyBefore, table)
+			delete(dirtyBeforeAll, table)
+			forkResumed = true
+			log.Printf("schema migration finishing the fork columns and indexes an interrupted open left uncommitted on %s", table)
+		case st.kind == forkDirtyOwnAndRows && st.complete:
+			forkLeave[table] = true
+			log.Printf("schema migration leaving %s uncommitted: its fork columns and indexes are complete under a user's uncommitted changes; 'bd dolt commit' commits both", table)
+		case st.kind == forkDirtyOwnAndRows:
+			forkResume[table] = true
+			forkLeave[table] = true
+			forkResumeTables = append(forkResumeTables, table)
+		}
+	}
+	sort.Strings(forkResumeTables)
 	touchedDirtyTables, err := mainSource.pendingMigrationDirtyTables(ctx, db, dirtyBefore)
 	if err != nil {
 		return 0, fmt.Errorf("checking dirty tables against pending migrations: %w", err)
@@ -792,9 +835,15 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, seedChanged bool) (
 	if len(touchedDirtyTables) > 0 {
 		return 0, &DirtyTablesError{Tables: touchedDirtyTables}
 	}
-	dirtyBeforeSignatures, err := dirtyTableSignatures(ctx, db, dirtyBefore)
+	dirtyBeforeSignatures, err := dirtyTableSignatures(ctx, db, withoutTables(dirtyBefore, forkLeave))
 	if err != nil {
 		return 0, fmt.Errorf("reading pre-migration dirty table diffs: %w", err)
+	}
+	forkRowsBefore := make(map[string]string, len(forkResumeTables))
+	for _, table := range forkResumeTables {
+		if forkRowsBefore[table], err = forkRowsSignature(ctx, db, table, forkDirty[table].compare); err != nil {
+			return 0, fmt.Errorf("reading pre-migration dirty table diffs: %s: %w", table, err)
+		}
 	}
 
 	applied, mainColumnAdded, err := mainSource.migrate(ctx, db, 0)
@@ -885,17 +934,31 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, seedChanged bool) (
 	// Fork-only columns and indexes (fork_indexes.go): DDL like mainColumnAdded,
 	// so a change is staged and committed by this pass. After the ignored
 	// series, so a fresh database already has wisps for its column.
-	forkIndexesAdded, err := ensureForkIndexes(ctx, db, dirtyBefore)
+	forkIndexesAdded, err := ensureForkIndexes(ctx, db, dirtyBefore, forkResume)
 	if err != nil {
 		return applied, fmt.Errorf("fork indexes: %w", err)
 	}
+	if forkIndexesAdded {
+		for _, table := range forkResumeTables {
+			log.Printf("schema migration finished the fork columns and indexes on %s over its uncommitted changes and left them uncommitted; 'bd dolt commit' commits both", table)
+		}
+	}
 
-	if applied == 0 && !backfilled && appliedIgnored == 0 && !mainColumnAdded && !ignoredColumnAdded && !forkIndexesAdded {
+	if applied == 0 && !backfilled && appliedIgnored == 0 && !mainColumnAdded && !ignoredColumnAdded && !forkIndexesAdded && !forkResumed {
 		return applied, nil
 	}
 	changedDirtyTables, err := changedDirtyTableSignatures(ctx, db, dirtyBeforeSignatures)
 	if err != nil {
 		return applied, fmt.Errorf("checking pre-existing dirty table diffs: %w", err)
+	}
+	for _, table := range forkResumeTables {
+		after, err := forkRowsSignature(ctx, db, table, forkDirty[table].compare)
+		if err != nil {
+			return applied, fmt.Errorf("checking pre-existing dirty table diffs: %s: %w", table, err)
+		}
+		if after != forkRowsBefore[table] {
+			changedDirtyTables = append(changedDirtyTables, table)
+		}
 	}
 	if len(changedDirtyTables) > 0 {
 		return applied, fmt.Errorf("pre-existing dirty tables changed during schema migration: %s", strings.Join(changedDirtyTables, ", "))
@@ -1028,6 +1091,21 @@ func changedDirtyTableSignatures(ctx context.Context, db DBConn, before map[stri
 	return changed, nil
 }
 
+// withoutTables returns tables less the names in drop, or tables itself when
+// drop is empty.
+func withoutTables(tables map[string]dirtyTableState, drop map[string]bool) map[string]dirtyTableState {
+	if len(drop) == 0 {
+		return tables
+	}
+	out := make(map[string]dirtyTableState, len(tables))
+	for table, state := range tables {
+		if !drop[table] {
+			out[table] = state
+		}
+	}
+	return out
+}
+
 func sortedDirtyTableNames(tables map[string]dirtyTableState) []string {
 	names := make([]string, 0, len(tables))
 	for table := range tables {
@@ -1051,7 +1129,13 @@ func dirtyTableSignature(ctx context.Context, db DBConn, table string) (string, 
 		return "", fmt.Errorf("unsafe dolt status table name %q", table)
 	}
 	//nolint:gosec // table comes from dolt_status; dolt_diff requires a literal table argument.
-	rows, err := db.QueryContext(ctx, "SELECT * FROM dolt_diff('HEAD', 'WORKING', "+sqlStringLiteral(table)+")")
+	return diffQuerySignature(ctx, db, "SELECT * FROM dolt_diff('HEAD', 'WORKING', "+sqlStringLiteral(table)+")")
+}
+
+// diffQuerySignature hashes the rows a dolt_diff query returns, order-free,
+// leaving out the commit metadata columns.
+func diffQuerySignature(ctx context.Context, db DBConn, query string) (string, error) {
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return "", err
 	}

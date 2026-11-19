@@ -221,6 +221,20 @@ type VersionChange struct {
 // versionChanges contains agent-actionable changes for recent versions
 var versionChanges = []VersionChange{
 	{
+		Version: "1.3.5-dev.2",
+		Date:    "2026-11-19",
+		Changes: []string{
+			"DEV: fork pre-release above 1.3.5-dev.1, stamped so a caller can tell by 'bd version' a build that makes everturn's four mail key columns: a reader of those columns fails with 'column not found' on a store no such build has opened, so it can wait behind a minimum bd version. It also marks the start-up and read cuts landed since 1.3.5-dev.1. No numbered schema migration; the columns and indexes come from the fork's ensure step at the first writable open.",
+			"NEW: four STORED generated columns on issues and on wisps, everturn_key, everturn_relay_source, everturn_bead and everturn_corrects (metadata $.everturn.key, $.everturn.relay.source, $.everturn.bead, $.everturn.corrects as VARCHAR(255), cut to 255 characters; a non-string key stores its JSON text), and eight indexes, each (column, created_at): idx_issues_everturn_key, idx_issues_everturn_relay_source, idx_issues_everturn_bead, idx_issues_everturn_corrects and their idx_wisps_everturn_* twins. A database gets them at its first writable open by this build, which holds the migration lock meanwhile (measured about 11 s a column on 100,000 issues, about 1 s on 20,000 wisps). A read-only open does not wait; another writable open waits for the lock, retrying for about 30-35 s, then fails with 'schema migration lock unavailable: timeout' and exits 1. A 1.3.5-dev.1 build on a database that has the columns runs no DDL and writes as before; Dolt computes the columns.",
+			"CHANGE: the dependents count seeks one index per target column (a guarded UNION ALL over depends_on_issue_id, depends_on_wisp_id and depends_on_external) instead of a COALESCE filter that read every edge: 150-220 ms per 'bd show --json' on 112,000 dependency rows before (9615a5a11).",
+			"CHANGE: the dependents rows of 'bd show' (and --include-dependents) are read the same way, one indexed branch per target column, with the old rows in the old order (11349bc2f).",
+			"CHANGE: every server-mode open sends fewer start-up statements: the driver's packet size is pinned in the DSN (1 GiB), the second ping is gone, and the project identity is read once per open without a transaction (333a18f11).",
+			"CHANGE: 'bd ready' reads a bounded status range: the ready-eligible statuses (open plus active custom statuses) are bound as a literal list when the collations match, instead of a subquery Dolt planned as a read of every unblocked issue, closed ones included (15a74ae62).",
+			"CHANGE: a writable server-mode open of a database already at this build's schema opens no migration pool and runs no migrate gate: one connection and five statements less on every write (5a0134c7d).",
+			"CHANGE: no preflight TCP dial for a remote Dolt host; the driver's 5 s connect timeout reports a dead server, with the same 'Dolt server unreachable' error and hint. A dead remote host fails after one timeout, not two. A socket or a local host keeps the dial (6e8b171d2).",
+		},
+	},
+	{
 		Version: "1.3.5-dev.1",
 		Date:    "2026-11-06",
 		Changes: []string{
