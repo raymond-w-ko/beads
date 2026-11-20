@@ -79,28 +79,40 @@ type forkColumn struct{ Table, Name, DDL string } // DDL: the whole ALTER TABLE 
 // collation (utf8mb4_0900_ai_ci on a database created with it), while the
 // JSON extraction compares as utf8mb4_bin, so on such a database
 // `everturn_worktree IN ('wt/bd-abc12')` also matches `wt/bd-ABC12`. A
-// reader that needs the exact key seeks the named column in a derived table
-// (keys cut to 255 characters) and keeps status <> 'tombstone' and the JSON
-// predicate (whole keys) as a residual in the outer query:
+// reader that needs the exact key reads in two statements, in one
+// transaction on one connection:
 //
-//	SELECT i.id FROM (SELECT id FROM issues WHERE everturn_worktree IN (?, ...)) k
-//	JOIN issues i ON i.id = k.id
-//	WHERE i.status <> 'tombstone'
-//	  AND i.metadata->>'$.everturn.worktree' IN (?, ...)
-//	ORDER BY i.id
+//	START TRANSACTION READ ONLY;
+//	SELECT id FROM issues WHERE everturn_worktree IN (?, ...);
+//	SELECT id FROM issues WHERE id IN (?, ...) AND status <> 'tombstone'
+//	  AND metadata->>'$.everturn.worktree' IN (?, ...) ORDER BY id;
+//	COMMIT;
 //
-// The derived table seeks idx_issues_everturn_worktree, the join reads each
-// hit by issues.id, and the residual drops every row whose exact key is not
-// asked for. Why not the flat form (status, named column and residual in one
-// WHERE): with the status filter beside the named column, fleet Dolt's
-// planner takes idx_issues_status_closed_at at scale and ignores USE INDEX
-// (measured by everturn on 100,001 issues, mail bd-wisp-ntsw7: seconds flat,
-// milliseconds derived).
+// Statement 1 seeks idx_issues_everturn_worktree, the named column, with
+// the keys cut to 255 characters. Statement 2 seeks the primary key with
+// statement 1's ids and keeps status <> 'tombstone' and the JSON predicate
+// (whole keys) as a residual, which drops every row whose exact key is not
+// asked for. When statement 1 returns no ids the reader skips statement 2
+// (`id IN ()` is not valid SQL). In Go the transaction is one *sql.Tx from
+// BeginTx (sql.TxOptions{ReadOnly: true} sends START TRANSACTION READ ONLY),
+// never two calls on the *sql.DB pool (READ ONLY tested on Dolt 2.2.0 and
+// 2.6.2; a plain START TRANSACTION is allowed too).
+// One transaction, because in separate autocommit snapshots a key update
+// committed between the two statements hides an issue that matches the
+// whole time (review bd-bzpm4o). Why one statement is not enough: with the
+// tombstone filter beside the named column, Dolt chooses a status index,
+// both as a flat WHERE at scale and as a derived-table join
+// ((SELECT id ... WHERE everturn_worktree IN (...)) k JOIN issues i) when
+// statistics are missing (a fresh, never-analyzed database, or after a
+// non-fast-forward merge), and it ignores USE INDEX (measured by everturn on
+// 100,001 issues, fleet Dolt, mails bd-wisp-ntsw7 and bd-wisp-qztqr:
+// seconds for either one-statement form, milliseconds for the two).
 //
-// The reader binds each key twice, differently (review bd-dguthy). In the
-// named-column list it binds the key cut to its first 255 characters,
-// counted as the column's LEFT(..., 255) counts them (characters, not
-// bytes); in the residual list it binds the whole key. The column stores
+// The reader binds each key twice, differently (review bd-dguthy). In
+// statement 1's named-column list it binds the key cut to its first 255
+// characters, counted as the column's LEFT(..., 255) counts them
+// (characters, not bytes); in statement 2's residual list it binds the
+// whole key. The column stores
 // only that cut, so a whole key longer than 255 characters seeks nothing
 // and the residual never sees the row; the residual then tells apart two
 // keys that share their first 255 characters. A key that is not a string

@@ -765,30 +765,30 @@ func TestForkIndexesEverturnMailKeysPresentAndUsed(t *testing.T) {
 		}
 	}
 	// The landing runner's read of the beads keyed to a set of worktrees
-	// (bd-0y3xe), in the reader's contract (worktreeReaderDerived,
-	// bd-l9p0we): the column named in a derived table, which seeks
-	// idx_issues_everturn_worktree. The flat form (status beside the named
-	// column, worktreeReaderNamed, the runner's read before) and the raw JSON
+	// (bd-0y3xe), in the reader's contract (worktreeReaderTwoStatementIDs,
+	// bd-0jtg0k): statement 1 seeks idx_issues_everturn_worktree, statement
+	// 2 the primary key, on this fresh, never-analyzed store. The derived
+	// table form (bd-l9p0we), the flat form (status beside the named column,
+	// worktreeReaderNamed, the runner's read before both) and the raw JSON
 	// form are logged for the record, not asserted; the reader must name the
 	// column, as for everturn_action.
 	keys := []any{"wt/bd-0", "wt/bd-1"}
 	for i := 2; i < 10; i++ {
 		keys = append(keys, fmt.Sprintf("wt/bd-absent-%d", i))
 	}
-	plan := explainBoundPlan(t, ctx, store.db, worktreeReaderDerived, worktreeReaderArgs(worktreeReaderDerived, keys))
-	t.Logf("EXPLAIN FORMAT=TREE %s\n%s", worktreeReaderDerived, plan)
-	if !strings.Contains(plan, "IndexedTableAccess(issues)") || !strings.Contains(plan, "[issues.everturn_worktree,issues.created_at]") {
-		t.Errorf("the runner's read does not seek idx_issues_everturn_worktree, plan:\n%s", plan)
-	}
+	assertWorktreeReaderPlans(t, ctx, store.db, keys, "the runner's read")
 	for _, q := range []string{worktreeReaderNamed, worktreeReaderRaw} {
 		t.Logf("EXPLAIN FORMAT=TREE %s (not asserted)\n%s", q, explainBoundPlan(t, ctx, store.db, q, worktreeReaderArgs(q, keys)))
 	}
-	ids := worktreeReaderIDs(t, ctx, store.db, worktreeReaderDerived, keys)
+	ids := worktreeReaderTwoStatementIDs(t, ctx, store.db, keys)
 	if want := 120; len(ids) != want { // i%4 != 3 and i%5 != 4 and i%3 in {0,1}, i < 300
 		t.Errorf("the runner's read returned %d issues, want %d", len(ids), want)
 	}
 	if flat := worktreeReaderIDs(t, ctx, store.db, worktreeReaderNamed, keys); !slices.Equal(ids, flat) {
 		t.Errorf("the runner's read returned %v, want the flat form's %v, in order", ids, flat)
+	}
+	if derived := worktreeReaderIDs(t, ctx, store.db, worktreeReaderDerived, keys); !slices.Equal(ids, derived) {
+		t.Errorf("the runner's read returned %v, want the derived-table form's %v, in order", ids, derived)
 	}
 }
 
@@ -2714,14 +2714,18 @@ func TestForkIndexTrackedCloneLocalTakesWholePass(t *testing.T) {
 }
 
 // The landing runner's read of the beads keyed to ten worktrees (bd-0y3xe), in
-// four forms: the raw JSON predicate (the oracle: it compares as utf8mb4_bin
+// five forms: the raw JSON predicate (the oracle: it compares as utf8mb4_bin
 // and reads the row itself), the named column alone, the flat residual form
 // (the named column and the JSON predicate in one WHERE, the contract until
-// bd-l9p0we), and the reader's contract (schema/fork_indexes.go, review
-// bd-h755xs, bd-l9p0we): the named column seeked in a derived table, the
-// status filter and the JSON predicate as a residual in the outer query. At
-// scale the flat form plans on idx_issues_status_closed_at (everturn, mail
-// bd-wisp-ntsw7); the fixtures here are small, so its plan is logged only.
+// bd-l9p0we), the derived-table form (the named column seeked in a derived
+// table, the status filter and the JSON predicate as a residual in the outer
+// query, the contract until bd-0jtg0k), and the reader's contract
+// (schema/fork_indexes.go, review bd-h755xs, bd-0jtg0k): two statements,
+// worktreeReaderSeek on the named column, then worktreeReaderResidualStatement
+// on the primary key with its ids (worktreeReaderTwoStatementIDs). Dolt plans
+// the flat form on a status index at scale, and the derived-table form too
+// when statistics are missing (everturn, mails bd-wisp-ntsw7 and
+// bd-wisp-qztqr); the fixtures here are small, so their plans are logged only.
 const (
 	worktreeReaderRaw = "SELECT i.id FROM issues i WHERE i.status <> 'tombstone'" +
 		" AND i.metadata->>'$.everturn.worktree' IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ORDER BY i.id"
@@ -2736,6 +2740,8 @@ const (
 		" WHERE i.status <> 'tombstone'" +
 		" AND i.metadata->>'$.everturn.worktree' IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" +
 		" ORDER BY i.id"
+	// worktreeReaderSeek is the reader's statement 1.
+	worktreeReaderSeek = "SELECT id FROM issues WHERE everturn_worktree IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 // worktreeReaderKeys is key and nine absent keys, the runner's ten.
@@ -2751,14 +2757,15 @@ func worktreeReaderKeys(key string) []any {
 // contract says (schema/fork_indexes.go, review bd-dguthy): the named-column
 // list takes each key cut to the column's 255 characters
 // (worktreeColumnCut), the JSON list the whole key. The named list comes
-// first in worktreeReaderResidual and worktreeReaderDerived.
+// first in worktreeReaderResidual and worktreeReaderDerived; worktreeReaderSeek
+// has only the named list.
 func worktreeReaderArgs(query string, keys []any) []any {
 	cut := make([]any, len(keys))
 	for i, k := range keys {
 		cut[i] = worktreeColumnCut(k.(string))
 	}
 	switch query {
-	case worktreeReaderNamed:
+	case worktreeReaderNamed, worktreeReaderSeek:
 		return cut
 	case worktreeReaderResidual, worktreeReaderDerived:
 		return append(cut, keys...)
@@ -2779,10 +2786,109 @@ func worktreeColumnCut(key string) string {
 	return key
 }
 
+// worktreeQueryer is where a reader statement runs: the *sql.DB pool (each
+// statement its own autocommit snapshot) or the reader's *sql.Tx.
+type worktreeQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
 // worktreeReaderIDs runs query with the ten keys and returns the ids in order.
-func worktreeReaderIDs(t *testing.T, ctx context.Context, db *sql.DB, query string, keys []any) []string {
+func worktreeReaderIDs(t *testing.T, ctx context.Context, db worktreeQueryer, query string, keys []any) []string {
 	t.Helper()
-	rows, err := db.QueryContext(ctx, query, worktreeReaderArgs(query, keys)...)
+	return worktreeQueryIDs(t, ctx, db, query, worktreeReaderArgs(query, keys))
+}
+
+// worktreeReaderResidualStatement is the reader's statement 2 for the ids
+// statement 1 returned: it seeks the primary key with ids and keeps the
+// tombstone filter and the JSON residual, bound with the whole keys. ids must
+// not be empty (`id IN ()` is not valid SQL).
+func worktreeReaderResidualStatement(ids []string, keys []any) (string, []any) {
+	query := "SELECT id FROM issues WHERE id IN (" + strings.TrimSuffix(strings.Repeat("?, ", len(ids)), ", ") + ")" +
+		" AND status <> 'tombstone'" +
+		" AND metadata->>'$.everturn.worktree' IN (" + strings.TrimSuffix(strings.Repeat("?, ", len(keys)), ", ") + ")" +
+		" ORDER BY id"
+	args := make([]any, 0, len(ids)+len(keys))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	return query, append(args, keys...)
+}
+
+// worktreeReaderTwoStatementIDs runs the reader's contract
+// (schema/fork_indexes.go, bd-0jtg0k, bd-c38bsw) with the ten keys, in one
+// read-only transaction on one connection (START TRANSACTION READ ONLY):
+// statement 1 (worktreeReaderSeek, keys cut to 255 characters), then, when it
+// returns ids, statement 2 (worktreeReaderResidualStatement, whole keys),
+// then COMMIT. It returns statement 2's ids in order, or none when statement
+// 1 found none.
+func worktreeReaderTwoStatementIDs(t *testing.T, ctx context.Context, db *sql.DB, keys []any) []string {
+	t.Helper()
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin the reader's transaction: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }() // a no-op after Commit
+	ids := worktreeReaderStatement2(t, ctx, tx, worktreeReaderStatement1(t, ctx, tx, keys), keys)
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit the reader's transaction: %v", err)
+	}
+	return ids
+}
+
+// worktreeReaderStatement1 runs the reader's statement 1 on q and returns the
+// ids it seeks.
+func worktreeReaderStatement1(t *testing.T, ctx context.Context, q worktreeQueryer, keys []any) []string {
+	t.Helper()
+	return worktreeReaderIDs(t, ctx, q, worktreeReaderSeek, keys)
+}
+
+// worktreeReaderStatement2 runs the reader's statement 2 on q for seek, the
+// ids statement 1 returned, and returns its ids in order; none, without a
+// statement, when seek is empty (the reader skips statement 2).
+func worktreeReaderStatement2(t *testing.T, ctx context.Context, q worktreeQueryer, seek []string, keys []any) []string {
+	t.Helper()
+	if len(seek) == 0 {
+		return []string{}
+	}
+	query, args := worktreeReaderResidualStatement(seek, keys)
+	return worktreeQueryIDs(t, ctx, q, query, args)
+}
+
+// assertWorktreeReaderPlans checks the plan of each of the reader's two
+// statements on db, a fresh store whose tables were never analyzed:
+// statement 1 seeks idx_issues_everturn_worktree with ten point ranges,
+// statement 2 the primary key with statement 1's ids. keys must seek at least
+// one row, so that statement 2 runs. The derived-table and flat forms' plans
+// are logged, not asserted.
+func assertWorktreeReaderPlans(t *testing.T, ctx context.Context, db *sql.DB, keys []any, what string) {
+	t.Helper()
+	seekPlan := explainBoundPlan(t, ctx, db, worktreeReaderSeek, worktreeReaderArgs(worktreeReaderSeek, keys))
+	t.Logf("EXPLAIN FORMAT=TREE %s\n%s", worktreeReaderSeek, seekPlan)
+	if !strings.Contains(seekPlan, "IndexedTableAccess(issues)") || !strings.Contains(seekPlan, "[issues.everturn_worktree,issues.created_at]") {
+		t.Errorf("%s: statement 1 does not seek idx_issues_everturn_worktree, plan:\n%s", what, seekPlan)
+	}
+	if n := worktreePointRanges(seekPlan); n != 10 {
+		t.Errorf("%s: statement 1's seek has %d point ranges, want 10, plan:\n%s", what, n, seekPlan)
+	}
+	seek := worktreeReaderIDs(t, ctx, db, worktreeReaderSeek, keys)
+	if len(seek) == 0 {
+		t.Fatalf("%s: statement 1 found no row, so statement 2 has no plan to check: the fixture is wrong", what)
+	}
+	query, args := worktreeReaderResidualStatement(seek, keys)
+	plan := explainBoundPlan(t, ctx, db, query, args)
+	t.Logf("EXPLAIN FORMAT=TREE %s\n%s", query, plan)
+	if !strings.Contains(plan, "IndexedTableAccess(issues)") || !strings.Contains(plan, "index: [issues.id]") {
+		t.Errorf("%s: statement 2 does not seek the primary key issues.id, plan:\n%s", what, plan)
+	}
+	for _, q := range []string{worktreeReaderDerived, worktreeReaderResidual} {
+		t.Logf("EXPLAIN FORMAT=TREE %s (not asserted)\n%s", q, explainBoundPlan(t, ctx, db, q, worktreeReaderArgs(q, keys)))
+	}
+}
+
+// worktreeQueryIDs runs query with args and returns the ids in order.
+func worktreeQueryIDs(t *testing.T, ctx context.Context, db worktreeQueryer, query string, args []any) []string {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		t.Fatalf("run %s: %v", query, err)
 	}
@@ -2856,14 +2962,14 @@ func doltServerAtLeast26(t *testing.T, ctx context.Context, db *sql.DB) (string,
 }
 
 // TestForkIndexWorktreeReaderResidual (review bd-h755xs, findings 1 and 2)
-// pins the reader's contract for everturn_worktree: the named column seeked in
-// a derived table with the JSON predicate kept as a residual in the outer
-// query (worktreeReaderDerived, bd-l9p0we) returns what the raw JSON read and
-// the flat residual form return, ids in the same order, under the default
-// (binary) collation and under a database created with utf8mb4_0900_ai_ci,
-// while seeking idx_issues_everturn_worktree; and after a DOLT_MERGE that
-// changes a key it
-// never returns the issue for the old key. On Dolt before 2.6 the merged
+// pins the reader's contract for everturn_worktree: the two statements
+// (worktreeReaderTwoStatementIDs, bd-0jtg0k), the named column for the seek,
+// then the primary key with the JSON predicate kept as a residual, return what
+// the raw JSON read, the derived-table form and the flat residual form return,
+// ids in the same order, under the default (binary) collation and under a
+// database created with utf8mb4_0900_ai_ci, while each statement seeks its
+// index on the fresh, never-analyzed tables; and after a DOLT_MERGE that
+// changes a key the reader never returns the issue for the old key. On Dolt before 2.6 the merged
 // issue is missed for its new key (the engine's stale index entry, held draft
 // bd-jj58j): logged, not failed.
 func TestForkIndexWorktreeReaderResidual(t *testing.T) {
@@ -2923,7 +3029,8 @@ func TestForkIndexWorktreeReaderResidual(t *testing.T) {
 			named := worktreeReaderIDs(t, ctx, db, worktreeReaderNamed, keys)
 			residual := worktreeReaderIDs(t, ctx, db, worktreeReaderResidual, keys)
 			derived := worktreeReaderIDs(t, ctx, db, worktreeReaderDerived, keys)
-			t.Logf("ids for wt/bd-abc12: raw %v, named alone %v, flat residual %v, derived %v", raw, named, residual, derived)
+			reader := worktreeReaderTwoStatementIDs(t, ctx, db, keys)
+			t.Logf("ids for wt/bd-abc12: raw %v, named alone %v, flat residual %v, derived %v, two statements %v", raw, named, residual, derived, reader)
 			if !slices.Equal(raw, []string{exact}) {
 				t.Fatalf("raw JSON read (the oracle) = %v, want [%s]: the fixture is wrong", raw, exact)
 			}
@@ -2936,20 +3043,15 @@ func TestForkIndexWorktreeReaderResidual(t *testing.T) {
 			if !slices.Equal(derived, residual) {
 				t.Errorf("derived form = %v, want the flat residual form's %v", derived, residual)
 			}
+			if !slices.Equal(reader, raw) || !slices.Equal(reader, derived) || !slices.Equal(reader, residual) {
+				t.Errorf("two-statement reader = %v, want the raw JSON read's %v, the derived form's %v and the flat residual form's %v (extra: %v)",
+					reader, raw, derived, residual, idsNotIn(reader, raw))
+			}
 			if !slices.Equal(named, tc.namedAlone) {
 				t.Errorf("named column alone = %v, want %v on a %s database", named, tc.namedAlone, tc.name)
 			}
 
-			t.Logf("EXPLAIN FORMAT=TREE %s (flat form, not asserted)\n%s", worktreeReaderResidual,
-				explainBoundPlan(t, ctx, db, worktreeReaderResidual, worktreeReaderArgs(worktreeReaderResidual, keys)))
-			plan := explainBoundPlan(t, ctx, db, worktreeReaderDerived, worktreeReaderArgs(worktreeReaderDerived, keys))
-			t.Logf("EXPLAIN FORMAT=TREE %s\n%s", worktreeReaderDerived, plan)
-			if !strings.Contains(plan, "IndexedTableAccess(issues)") || !strings.Contains(plan, "[issues.everturn_worktree,issues.created_at]") {
-				t.Errorf("the derived form does not seek idx_issues_everturn_worktree, plan:\n%s", plan)
-			}
-			if n := worktreePointRanges(plan); n != 10 {
-				t.Errorf("the derived form's seek has %d point ranges, want 10, plan:\n%s", n, plan)
-			}
+			assertWorktreeReaderPlans(t, ctx, db, keys, "wt/bd-abc12")
 
 			worktreeReaderLongKeys(t, ctx, db)
 		})
@@ -3007,38 +3109,141 @@ func TestForkIndexWorktreeReaderResidual(t *testing.T) {
 
 			oldKeys, newKeys := worktreeReaderKeys("wt/bd-seed"), worktreeReaderKeys("wt/bd-peer-update")
 			oldRaw := worktreeReaderIDs(t, ctx, dest, worktreeReaderRaw, oldKeys)
-			oldResidual := worktreeReaderIDs(t, ctx, dest, worktreeReaderDerived, oldKeys)
+			oldResidual := worktreeReaderTwoStatementIDs(t, ctx, dest, oldKeys)
 			oldNamed := worktreeReaderIDs(t, ctx, dest, worktreeReaderNamed, oldKeys)
 			oldFlat := worktreeReaderIDs(t, ctx, dest, worktreeReaderResidual, oldKeys)
+			oldDerived := worktreeReaderIDs(t, ctx, dest, worktreeReaderDerived, oldKeys)
 			newRaw := worktreeReaderIDs(t, ctx, dest, worktreeReaderRaw, newKeys)
-			newResidual := worktreeReaderIDs(t, ctx, dest, worktreeReaderDerived, newKeys)
+			newResidual := worktreeReaderTwoStatementIDs(t, ctx, dest, newKeys)
 			newFlat := worktreeReaderIDs(t, ctx, dest, worktreeReaderResidual, newKeys)
+			newDerived := worktreeReaderIDs(t, ctx, dest, worktreeReaderDerived, newKeys)
 			version, fixed := doltServerAtLeast26(t, ctx, dest)
-			t.Logf("Dolt %s after the merge: old key raw %v, named alone %v, flat residual %v, derived %v; new key raw %v, flat residual %v, derived %v",
-				version, oldRaw, oldNamed, oldFlat, oldResidual, newRaw, newFlat, newResidual)
+			t.Logf("Dolt %s after the merge: old key raw %v, named alone %v, flat residual %v, derived %v, two statements %v; new key raw %v, flat residual %v, derived %v, two statements %v",
+				version, oldRaw, oldNamed, oldFlat, oldDerived, oldResidual, newRaw, newFlat, newDerived, newResidual)
 			if len(oldRaw) != 0 || !slices.Equal(newRaw, []string{forkSeedKeys}) {
 				t.Fatalf("raw JSON read (the oracle): old key %v, new key %v, want [] and [%s]", oldRaw, newRaw, forkSeedKeys)
 			}
 			if len(oldResidual) != 0 {
-				t.Errorf("derived form returns %v for the old key wt/bd-seed after the merge, want none", oldResidual)
+				t.Errorf("two-statement reader returns %v for the old key wt/bd-seed after the merge, want none", oldResidual)
 			}
 			switch {
 			case slices.Equal(newResidual, newRaw):
 			case fixed:
-				t.Errorf("Dolt %s: derived form = %v for the new key after the merge, want the raw read's %v", version, newResidual, newRaw)
+				t.Errorf("Dolt %s: two-statement reader = %v for the new key after the merge, want the raw read's %v", version, newResidual, newRaw)
 			case len(newResidual) == 0:
 				t.Logf("Dolt %s (before 2.6): the merged issue %s is missed for its new key: the engine's stale index entry after DOLT_MERGE (review bd-h755xs finding 1, held draft bd-jj58j), a known defect, not a failure", version, forkSeedKeys)
 			default:
-				t.Errorf("Dolt %s: derived form = %v for the new key after the merge, want %v or none", version, newResidual, newRaw)
+				t.Errorf("Dolt %s: two-statement reader = %v for the new key after the merge, want %v or none", version, newResidual, newRaw)
 			}
 		})
 	}
 }
 
+// TestForkIndexWorktreeReaderSnapshot (review bd-bzpm4o, bd-c38bsw) pins that
+// the reader's two statements read one snapshot. Open issues A (wt/target)
+// and B (wt/other); statement 1 for wt/target returns A; another connection
+// swaps the two keys in one UPDATE and commits; statement 2 then runs. In the
+// reader's transaction it still returns A, as the single statement would
+// before the swap; a fresh reader afterwards returns B. With each statement
+// in its own autocommit snapshot, statement 2 sees the swap, probes only A,
+// and returns nothing, an issue that matched the whole time hidden: that
+// sequence is asserted to show the race, or logged if Dolt's snapshot hides
+// it.
+func TestForkIndexWorktreeReaderSnapshot(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+	db := store.db
+	writer, err := sql.Open("mysql", buildServerDSN(forkOpenConfig(t, store, testServerPort), store.database))
+	if err != nil {
+		t.Fatalf("open the writer's connection: %v", err)
+	}
+	defer writer.Close()
+
+	const a, b = "fx-snap-a", "fx-snap-b"
+	execAll(t, ctx, db,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, metadata) VALUES "+
+			"('"+a+"', 'A', '', '', '', '', 'open', 2, 'task', '{\"everturn\":{\"worktree\":\"wt/target\"}}'), "+
+			"('"+b+"', 'B', '', '', '', '', 'open', 2, 'task', '{\"everturn\":{\"worktree\":\"wt/other\"}}')")
+	// swap sets A's key to aKey and B's to bKey in one UPDATE, committed on
+	// the writer's connection.
+	swap := func(aKey, bKey string) {
+		t.Helper()
+		tx, err := writer.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("begin the swap: %v", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		if _, err := tx.ExecContext(ctx, "UPDATE issues SET metadata = JSON_SET(metadata, '$.everturn.worktree', CASE id WHEN ? THEN ? ELSE ? END) WHERE id IN (?, ?)",
+			a, aKey, bKey, a, b); err != nil {
+			t.Fatalf("swap the keys: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit the swap: %v", err)
+		}
+	}
+	target := worktreeReaderKeys("wt/target")
+	if got := worktreeReaderTwoStatementIDs(t, ctx, db, target); !slices.Equal(got, []string{a}) {
+		t.Fatalf("reader for wt/target before any swap = %v, want [%s]: the fixture is wrong", got, a)
+	}
+
+	// The reader's transaction, the swap committed between its statements.
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin the reader's transaction: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	seek := worktreeReaderStatement1(t, ctx, tx, target)
+	if !slices.Equal(seek, []string{a}) {
+		t.Fatalf("statement 1 for wt/target = %v, want [%s]", seek, a)
+	}
+	swap("wt/other", "wt/target")
+	inTx := worktreeReaderStatement2(t, ctx, tx, seek, target)
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit the reader's transaction: %v", err)
+	}
+	t.Logf("in one transaction, swap between the statements: statement 1 %v, statement 2 %v", seek, inTx)
+	if !slices.Equal(inTx, []string{a}) {
+		t.Errorf("statement 2 in the reader's transaction = %v, want [%s], the snapshot before the swap", inTx, a)
+	}
+	if got := worktreeReaderTwoStatementIDs(t, ctx, db, target); !slices.Equal(got, []string{b}) {
+		t.Errorf("a fresh reader for wt/target after the swap = %v, want [%s]", got, b)
+	}
+	if raw := worktreeReaderIDs(t, ctx, db, worktreeReaderRaw, target); !slices.Equal(raw, []string{b}) {
+		t.Errorf("raw JSON read for wt/target after the swap = %v, want [%s]", raw, b)
+	}
+
+	// The same sequence, each statement in its own autocommit snapshot on
+	// the pool: put the keys back, then statement 1, swap, statement 2.
+	swap("wt/target", "wt/other")
+	var autocommit int
+	if err := db.QueryRowContext(ctx, "SELECT @@autocommit").Scan(&autocommit); err != nil {
+		t.Fatalf("read @@autocommit: %v", err)
+	}
+	seek = worktreeReaderStatement1(t, ctx, db, target)
+	if !slices.Equal(seek, []string{a}) {
+		t.Fatalf("autocommit statement 1 for wt/target = %v, want [%s]", seek, a)
+	}
+	swap("wt/other", "wt/target")
+	apart := worktreeReaderStatement2(t, ctx, db, seek, target)
+	t.Logf("autocommit (@@autocommit %d), swap between the statements: statement 1 %v, statement 2 %v", autocommit, seek, apart)
+	switch {
+	case len(apart) == 0:
+		// The race the transaction closes: B matches wt/target now, A did
+		// before, and neither is returned.
+	case slices.Equal(apart, []string{a}):
+		t.Logf("Dolt gave the autocommit statement 2 a snapshot from before the swap, hiding the race: not asserted")
+	default:
+		t.Errorf("autocommit statement 2 = %v, want none (the race) or [%s] (a snapshot that hides it)", apart, a)
+	}
+}
+
 // worktreeReaderLongKeys (review bd-dguthy) runs the reader's contract
-// (worktreeReaderDerived; worktreeReaderArgs: the named list cut to 255
-// characters, the JSON list whole), and the flat residual form, against the
-// raw JSON read, the oracle, for keys around the column's
+// (worktreeReaderTwoStatementIDs: statement 1's named list cut to 255
+// characters, statement 2's JSON list whole), the derived-table form and the
+// flat residual form against the raw JSON read, the oracle, for keys around
+// the column's
 // 255-character cut, a key that is not a string, seeded random keys, and the
 // trailing-space and empty keys, on db (a fresh store, one collation).
 func worktreeReaderLongKeys(t *testing.T, ctx context.Context, db *sql.DB) {
@@ -3099,11 +3304,12 @@ func worktreeReaderLongKeys(t *testing.T, ctx context.Context, db *sql.DB) {
 		named := worktreeReaderIDs(t, ctx, db, worktreeReaderNamed, keys)
 		residual := worktreeReaderIDs(t, ctx, db, worktreeReaderResidual, keys)
 		derived := worktreeReaderIDs(t, ctx, db, worktreeReaderDerived, keys)
+		reader := worktreeReaderTwoStatementIDs(t, ctx, db, keys)
 		if probe[r.id] {
 			// Neither the JSON extraction (utf8mb4_bin) nor the column pads:
 			// "wt/bd-pad " and "wt/bd-pad" are two keys, and the empty key
 			// matches only the row that holds it, on both collations.
-			t.Logf("PROBE key %q (%s): raw %v, named alone %v, flat residual %v, derived %v", r.key, r.id, raw, named, residual, derived)
+			t.Logf("PROBE key %q (%s): raw %v, named alone %v, flat residual %v, derived %v, two statements %v", r.key, r.id, raw, named, residual, derived, reader)
 			if !slices.Equal(named, []string{r.id}) {
 				t.Errorf("%s: named column alone for %q = %v, want [%s]: the column pads or folds this key", r.id, r.key, named, r.id)
 			}
@@ -3117,6 +3323,9 @@ func worktreeReaderLongKeys(t *testing.T, ctx context.Context, db *sql.DB) {
 		if !slices.Equal(derived, raw) {
 			t.Errorf("%s (key of %d characters): derived form = %v, want the raw JSON read's %v", r.id, len([]rune(r.key)), derived, raw)
 		}
+		if !slices.Equal(reader, raw) {
+			t.Errorf("%s (key of %d characters): two-statement reader = %v, want the raw JSON read's %v", r.id, len([]rune(r.key)), reader, raw)
+		}
 		switch r.id {
 		case "fx-wt-long", "fx-wt-cut":
 			// The named column alone cannot tell the two apart: both store
@@ -3127,13 +3336,7 @@ func worktreeReaderLongKeys(t *testing.T, ctx context.Context, db *sql.DB) {
 		}
 	}
 
-	plan := explainBoundPlan(t, ctx, db, worktreeReaderDerived, worktreeReaderArgs(worktreeReaderDerived, worktreeReaderKeys(long)))
-	if !strings.Contains(plan, "IndexedTableAccess(issues)") || !strings.Contains(plan, "[issues.everturn_worktree,issues.created_at]") {
-		t.Errorf("the derived form with the long key does not seek idx_issues_everturn_worktree, plan:\n%s", plan)
-	}
-	if n := worktreePointRanges(plan); n != 10 {
-		t.Errorf("the derived form with the long key has %d point ranges, want 10, plan:\n%s", n, plan)
-	}
+	assertWorktreeReaderPlans(t, ctx, db, worktreeReaderKeys(long), "the long key")
 }
 
 // idsNotIn is the ids of got that want lacks.
