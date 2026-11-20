@@ -79,17 +79,23 @@ type forkColumn struct{ Table, Name, DDL string } // DDL: the whole ALTER TABLE 
 // collation (utf8mb4_0900_ai_ci on a database created with it), while the
 // JSON extraction compares as utf8mb4_bin, so on such a database
 // `everturn_worktree IN ('wt/bd-abc12')` also matches `wt/bd-ABC12`. A
-// reader that needs the exact key names the column for the seek and keeps
-// the JSON predicate as a residual beside it:
+// reader that needs the exact key seeks the named column in a derived table
+// (keys cut to 255 characters) and keeps status <> 'tombstone' and the JSON
+// predicate (whole keys) as a residual in the outer query:
 //
-//	SELECT i.id FROM issues i
+//	SELECT i.id FROM (SELECT id FROM issues WHERE everturn_worktree IN (?, ...)) k
+//	JOIN issues i ON i.id = k.id
 //	WHERE i.status <> 'tombstone'
-//	  AND i.everturn_worktree IN (?, ...)
 //	  AND i.metadata->>'$.everturn.worktree' IN (?, ...)
 //	ORDER BY i.id
 //
-// The plan still seeks idx_issues_everturn_worktree, and the residual drops
-// every row whose exact key is not asked for.
+// The derived table seeks idx_issues_everturn_worktree, the join reads each
+// hit by issues.id, and the residual drops every row whose exact key is not
+// asked for. Why not the flat form (status, named column and residual in one
+// WHERE): with the status filter beside the named column, fleet Dolt's
+// planner takes idx_issues_status_closed_at at scale and ignores USE INDEX
+// (measured by everturn on 100,001 issues, mail bd-wisp-ntsw7: seconds flat,
+// milliseconds derived).
 //
 // The reader binds each key twice, differently (review bd-dguthy). In the
 // named-column list it binds the key cut to its first 255 characters,

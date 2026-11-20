@@ -765,27 +765,30 @@ func TestForkIndexesEverturnMailKeysPresentAndUsed(t *testing.T) {
 		}
 	}
 	// The landing runner's read of the beads keyed to a set of worktrees
-	// (bd-0y3xe), with the column named: it seeks idx_issues_everturn_worktree.
-	// The raw JSON form of the same read is logged for the record; the reader
-	// must name the column, as for everturn_action.
-	keys := []string{"'wt/bd-0'", "'wt/bd-1'"}
+	// (bd-0y3xe), in the reader's contract (worktreeReaderDerived,
+	// bd-l9p0we): the column named in a derived table, which seeks
+	// idx_issues_everturn_worktree. The flat form (status beside the named
+	// column, worktreeReaderNamed, the runner's read before) and the raw JSON
+	// form are logged for the record, not asserted; the reader must name the
+	// column, as for everturn_action.
+	keys := []any{"wt/bd-0", "wt/bd-1"}
 	for i := 2; i < 10; i++ {
-		keys = append(keys, fmt.Sprintf("'wt/bd-absent-%d'", i))
+		keys = append(keys, fmt.Sprintf("wt/bd-absent-%d", i))
 	}
-	runner := "SELECT i.id FROM issues i WHERE i.status <> 'tombstone' AND i.everturn_worktree IN (" + strings.Join(keys, ", ") + ") ORDER BY i.id"
-	plan := explainPlan(t, ctx, store.db, runner)
-	t.Logf("EXPLAIN FORMAT=TREE %s\n%s", runner, plan)
-	if !strings.Contains(plan, "IndexedTableAccess") || !strings.Contains(plan, "[issues.everturn_worktree,issues.created_at]") {
+	plan := explainBoundPlan(t, ctx, store.db, worktreeReaderDerived, worktreeReaderArgs(worktreeReaderDerived, keys))
+	t.Logf("EXPLAIN FORMAT=TREE %s\n%s", worktreeReaderDerived, plan)
+	if !strings.Contains(plan, "IndexedTableAccess(issues)") || !strings.Contains(plan, "[issues.everturn_worktree,issues.created_at]") {
 		t.Errorf("the runner's read does not seek idx_issues_everturn_worktree, plan:\n%s", plan)
 	}
-	raw := "SELECT i.id FROM issues i WHERE i.status <> 'tombstone' AND i.metadata->>'$.everturn.worktree' IN (" + strings.Join(keys, ", ") + ") ORDER BY i.id"
-	t.Logf("EXPLAIN FORMAT=TREE %s (raw JSON form, not asserted)\n%s", raw, explainPlan(t, ctx, store.db, raw))
-	var n int
-	if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM ("+runner+") r").Scan(&n); err != nil {
-		t.Fatalf("run the runner's read: %v", err)
+	for _, q := range []string{worktreeReaderNamed, worktreeReaderRaw} {
+		t.Logf("EXPLAIN FORMAT=TREE %s (not asserted)\n%s", q, explainBoundPlan(t, ctx, store.db, q, worktreeReaderArgs(q, keys)))
 	}
-	if want := 120; n != want { // i%4 != 3 and i%5 != 4 and i%3 in {0,1}, i < 300
-		t.Errorf("the runner's read returned %d issues, want %d", n, want)
+	ids := worktreeReaderIDs(t, ctx, store.db, worktreeReaderDerived, keys)
+	if want := 120; len(ids) != want { // i%4 != 3 and i%5 != 4 and i%3 in {0,1}, i < 300
+		t.Errorf("the runner's read returned %d issues, want %d", len(ids), want)
+	}
+	if flat := worktreeReaderIDs(t, ctx, store.db, worktreeReaderNamed, keys); !slices.Equal(ids, flat) {
+		t.Errorf("the runner's read returned %v, want the flat form's %v, in order", ids, flat)
 	}
 }
 
@@ -2711,10 +2714,14 @@ func TestForkIndexTrackedCloneLocalTakesWholePass(t *testing.T) {
 }
 
 // The landing runner's read of the beads keyed to ten worktrees (bd-0y3xe), in
-// three forms: the raw JSON predicate (the oracle: it compares as utf8mb4_bin
-// and reads the row itself), the named column alone, and the reader's
-// contract (schema/fork_indexes.go, review bd-h755xs): the named column for
-// the seek and the JSON predicate as a residual.
+// four forms: the raw JSON predicate (the oracle: it compares as utf8mb4_bin
+// and reads the row itself), the named column alone, the flat residual form
+// (the named column and the JSON predicate in one WHERE, the contract until
+// bd-l9p0we), and the reader's contract (schema/fork_indexes.go, review
+// bd-h755xs, bd-l9p0we): the named column seeked in a derived table, the
+// status filter and the JSON predicate as a residual in the outer query. At
+// scale the flat form plans on idx_issues_status_closed_at (everturn, mail
+// bd-wisp-ntsw7); the fixtures here are small, so its plan is logged only.
 const (
 	worktreeReaderRaw = "SELECT i.id FROM issues i WHERE i.status <> 'tombstone'" +
 		" AND i.metadata->>'$.everturn.worktree' IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ORDER BY i.id"
@@ -2722,6 +2729,11 @@ const (
 		" AND i.everturn_worktree IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ORDER BY i.id"
 	worktreeReaderResidual = "SELECT i.id FROM issues i WHERE i.status <> 'tombstone'" +
 		" AND i.everturn_worktree IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" +
+		" AND i.metadata->>'$.everturn.worktree' IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" +
+		" ORDER BY i.id"
+	worktreeReaderDerived = "SELECT i.id FROM (SELECT id FROM issues WHERE everturn_worktree IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)) k" +
+		" JOIN issues i ON i.id = k.id" +
+		" WHERE i.status <> 'tombstone'" +
 		" AND i.metadata->>'$.everturn.worktree' IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" +
 		" ORDER BY i.id"
 )
@@ -2739,7 +2751,7 @@ func worktreeReaderKeys(key string) []any {
 // contract says (schema/fork_indexes.go, review bd-dguthy): the named-column
 // list takes each key cut to the column's 255 characters
 // (worktreeColumnCut), the JSON list the whole key. The named list comes
-// first in worktreeReaderResidual.
+// first in worktreeReaderResidual and worktreeReaderDerived.
 func worktreeReaderArgs(query string, keys []any) []any {
 	cut := make([]any, len(keys))
 	for i, k := range keys {
@@ -2748,7 +2760,7 @@ func worktreeReaderArgs(query string, keys []any) []any {
 	switch query {
 	case worktreeReaderNamed:
 		return cut
-	case worktreeReaderResidual:
+	case worktreeReaderResidual, worktreeReaderDerived:
 		return append(cut, keys...)
 	}
 	var args []any
@@ -2844,11 +2856,13 @@ func doltServerAtLeast26(t *testing.T, ctx context.Context, db *sql.DB) (string,
 }
 
 // TestForkIndexWorktreeReaderResidual (review bd-h755xs, findings 1 and 2)
-// pins the reader's contract for everturn_worktree: the named column for the
-// seek with the JSON predicate kept as a residual returns what the raw JSON
-// read returns, ids in the same order, under the default (binary) collation
-// and under a database created with utf8mb4_0900_ai_ci, while still seeking
-// idx_issues_everturn_worktree; and after a DOLT_MERGE that changes a key it
+// pins the reader's contract for everturn_worktree: the named column seeked in
+// a derived table with the JSON predicate kept as a residual in the outer
+// query (worktreeReaderDerived, bd-l9p0we) returns what the raw JSON read and
+// the flat residual form return, ids in the same order, under the default
+// (binary) collation and under a database created with utf8mb4_0900_ai_ci,
+// while seeking idx_issues_everturn_worktree; and after a DOLT_MERGE that
+// changes a key it
 // never returns the issue for the old key. On Dolt before 2.6 the merged
 // issue is missed for its new key (the engine's stale index entry, held draft
 // bd-jj58j): logged, not failed.
@@ -2908,24 +2922,33 @@ func TestForkIndexWorktreeReaderResidual(t *testing.T) {
 			raw := worktreeReaderIDs(t, ctx, db, worktreeReaderRaw, keys)
 			named := worktreeReaderIDs(t, ctx, db, worktreeReaderNamed, keys)
 			residual := worktreeReaderIDs(t, ctx, db, worktreeReaderResidual, keys)
-			t.Logf("ids for wt/bd-abc12: raw %v, named alone %v, residual %v", raw, named, residual)
+			derived := worktreeReaderIDs(t, ctx, db, worktreeReaderDerived, keys)
+			t.Logf("ids for wt/bd-abc12: raw %v, named alone %v, flat residual %v, derived %v", raw, named, residual, derived)
 			if !slices.Equal(raw, []string{exact}) {
 				t.Fatalf("raw JSON read (the oracle) = %v, want [%s]: the fixture is wrong", raw, exact)
 			}
 			if !slices.Equal(residual, raw) {
-				t.Errorf("residual form = %v, want the raw JSON read's %v (extra: %v)", residual, raw, idsNotIn(residual, raw))
+				t.Errorf("flat residual form = %v, want the raw JSON read's %v (extra: %v)", residual, raw, idsNotIn(residual, raw))
+			}
+			if !slices.Equal(derived, raw) {
+				t.Errorf("derived form = %v, want the raw JSON read's %v (extra: %v)", derived, raw, idsNotIn(derived, raw))
+			}
+			if !slices.Equal(derived, residual) {
+				t.Errorf("derived form = %v, want the flat residual form's %v", derived, residual)
 			}
 			if !slices.Equal(named, tc.namedAlone) {
 				t.Errorf("named column alone = %v, want %v on a %s database", named, tc.namedAlone, tc.name)
 			}
 
-			plan := explainBoundPlan(t, ctx, db, worktreeReaderResidual, worktreeReaderArgs(worktreeReaderResidual, keys))
-			t.Logf("EXPLAIN FORMAT=TREE %s\n%s", worktreeReaderResidual, plan)
+			t.Logf("EXPLAIN FORMAT=TREE %s (flat form, not asserted)\n%s", worktreeReaderResidual,
+				explainBoundPlan(t, ctx, db, worktreeReaderResidual, worktreeReaderArgs(worktreeReaderResidual, keys)))
+			plan := explainBoundPlan(t, ctx, db, worktreeReaderDerived, worktreeReaderArgs(worktreeReaderDerived, keys))
+			t.Logf("EXPLAIN FORMAT=TREE %s\n%s", worktreeReaderDerived, plan)
 			if !strings.Contains(plan, "IndexedTableAccess(issues)") || !strings.Contains(plan, "[issues.everturn_worktree,issues.created_at]") {
-				t.Errorf("the residual form does not seek idx_issues_everturn_worktree, plan:\n%s", plan)
+				t.Errorf("the derived form does not seek idx_issues_everturn_worktree, plan:\n%s", plan)
 			}
 			if n := worktreePointRanges(plan); n != 10 {
-				t.Errorf("the residual form's seek has %d point ranges, want 10, plan:\n%s", n, plan)
+				t.Errorf("the derived form's seek has %d point ranges, want 10, plan:\n%s", n, plan)
 			}
 
 			worktreeReaderLongKeys(t, ctx, db)
@@ -2984,35 +3007,38 @@ func TestForkIndexWorktreeReaderResidual(t *testing.T) {
 
 			oldKeys, newKeys := worktreeReaderKeys("wt/bd-seed"), worktreeReaderKeys("wt/bd-peer-update")
 			oldRaw := worktreeReaderIDs(t, ctx, dest, worktreeReaderRaw, oldKeys)
-			oldResidual := worktreeReaderIDs(t, ctx, dest, worktreeReaderResidual, oldKeys)
+			oldResidual := worktreeReaderIDs(t, ctx, dest, worktreeReaderDerived, oldKeys)
 			oldNamed := worktreeReaderIDs(t, ctx, dest, worktreeReaderNamed, oldKeys)
+			oldFlat := worktreeReaderIDs(t, ctx, dest, worktreeReaderResidual, oldKeys)
 			newRaw := worktreeReaderIDs(t, ctx, dest, worktreeReaderRaw, newKeys)
-			newResidual := worktreeReaderIDs(t, ctx, dest, worktreeReaderResidual, newKeys)
+			newResidual := worktreeReaderIDs(t, ctx, dest, worktreeReaderDerived, newKeys)
+			newFlat := worktreeReaderIDs(t, ctx, dest, worktreeReaderResidual, newKeys)
 			version, fixed := doltServerAtLeast26(t, ctx, dest)
-			t.Logf("Dolt %s after the merge: old key raw %v, named alone %v, residual %v; new key raw %v, residual %v",
-				version, oldRaw, oldNamed, oldResidual, newRaw, newResidual)
+			t.Logf("Dolt %s after the merge: old key raw %v, named alone %v, flat residual %v, derived %v; new key raw %v, flat residual %v, derived %v",
+				version, oldRaw, oldNamed, oldFlat, oldResidual, newRaw, newFlat, newResidual)
 			if len(oldRaw) != 0 || !slices.Equal(newRaw, []string{forkSeedKeys}) {
 				t.Fatalf("raw JSON read (the oracle): old key %v, new key %v, want [] and [%s]", oldRaw, newRaw, forkSeedKeys)
 			}
 			if len(oldResidual) != 0 {
-				t.Errorf("residual form returns %v for the old key wt/bd-seed after the merge, want none", oldResidual)
+				t.Errorf("derived form returns %v for the old key wt/bd-seed after the merge, want none", oldResidual)
 			}
 			switch {
 			case slices.Equal(newResidual, newRaw):
 			case fixed:
-				t.Errorf("Dolt %s: residual form = %v for the new key after the merge, want the raw read's %v", version, newResidual, newRaw)
+				t.Errorf("Dolt %s: derived form = %v for the new key after the merge, want the raw read's %v", version, newResidual, newRaw)
 			case len(newResidual) == 0:
 				t.Logf("Dolt %s (before 2.6): the merged issue %s is missed for its new key: the engine's stale index entry after DOLT_MERGE (review bd-h755xs finding 1, held draft bd-jj58j), a known defect, not a failure", version, forkSeedKeys)
 			default:
-				t.Errorf("Dolt %s: residual form = %v for the new key after the merge, want %v or none", version, newResidual, newRaw)
+				t.Errorf("Dolt %s: derived form = %v for the new key after the merge, want %v or none", version, newResidual, newRaw)
 			}
 		})
 	}
 }
 
 // worktreeReaderLongKeys (review bd-dguthy) runs the reader's contract
-// (worktreeReaderArgs: the named list cut to 255 characters, the JSON list
-// whole) against the raw JSON read, the oracle, for keys around the column's
+// (worktreeReaderDerived; worktreeReaderArgs: the named list cut to 255
+// characters, the JSON list whole), and the flat residual form, against the
+// raw JSON read, the oracle, for keys around the column's
 // 255-character cut, a key that is not a string, seeded random keys, and the
 // trailing-space and empty keys, on db (a fresh store, one collation).
 func worktreeReaderLongKeys(t *testing.T, ctx context.Context, db *sql.DB) {
@@ -3072,11 +3098,12 @@ func worktreeReaderLongKeys(t *testing.T, ctx context.Context, db *sql.DB) {
 		raw := worktreeReaderIDs(t, ctx, db, worktreeReaderRaw, keys)
 		named := worktreeReaderIDs(t, ctx, db, worktreeReaderNamed, keys)
 		residual := worktreeReaderIDs(t, ctx, db, worktreeReaderResidual, keys)
+		derived := worktreeReaderIDs(t, ctx, db, worktreeReaderDerived, keys)
 		if probe[r.id] {
 			// Neither the JSON extraction (utf8mb4_bin) nor the column pads:
 			// "wt/bd-pad " and "wt/bd-pad" are two keys, and the empty key
 			// matches only the row that holds it, on both collations.
-			t.Logf("PROBE key %q (%s): raw %v, named alone %v, residual %v", r.key, r.id, raw, named, residual)
+			t.Logf("PROBE key %q (%s): raw %v, named alone %v, flat residual %v, derived %v", r.key, r.id, raw, named, residual, derived)
 			if !slices.Equal(named, []string{r.id}) {
 				t.Errorf("%s: named column alone for %q = %v, want [%s]: the column pads or folds this key", r.id, r.key, named, r.id)
 			}
@@ -3085,7 +3112,10 @@ func worktreeReaderLongKeys(t *testing.T, ctx context.Context, db *sql.DB) {
 			t.Fatalf("raw JSON read (the oracle) for %s's key = %v, want [%s]: the fixture is wrong", r.id, raw, r.id)
 		}
 		if !slices.Equal(residual, raw) {
-			t.Errorf("%s (key of %d characters): residual form = %v, want the raw JSON read's %v", r.id, len([]rune(r.key)), residual, raw)
+			t.Errorf("%s (key of %d characters): flat residual form = %v, want the raw JSON read's %v", r.id, len([]rune(r.key)), residual, raw)
+		}
+		if !slices.Equal(derived, raw) {
+			t.Errorf("%s (key of %d characters): derived form = %v, want the raw JSON read's %v", r.id, len([]rune(r.key)), derived, raw)
 		}
 		switch r.id {
 		case "fx-wt-long", "fx-wt-cut":
@@ -3097,12 +3127,12 @@ func worktreeReaderLongKeys(t *testing.T, ctx context.Context, db *sql.DB) {
 		}
 	}
 
-	plan := explainBoundPlan(t, ctx, db, worktreeReaderResidual, worktreeReaderArgs(worktreeReaderResidual, worktreeReaderKeys(long)))
+	plan := explainBoundPlan(t, ctx, db, worktreeReaderDerived, worktreeReaderArgs(worktreeReaderDerived, worktreeReaderKeys(long)))
 	if !strings.Contains(plan, "IndexedTableAccess(issues)") || !strings.Contains(plan, "[issues.everturn_worktree,issues.created_at]") {
-		t.Errorf("the residual form with the long key does not seek idx_issues_everturn_worktree, plan:\n%s", plan)
+		t.Errorf("the derived form with the long key does not seek idx_issues_everturn_worktree, plan:\n%s", plan)
 	}
 	if n := worktreePointRanges(plan); n != 10 {
-		t.Errorf("the residual form with the long key has %d point ranges, want 10, plan:\n%s", n, plan)
+		t.Errorf("the derived form with the long key has %d point ranges, want 10, plan:\n%s", n, plan)
 	}
 }
 
