@@ -22,6 +22,7 @@ import (
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
+	"github.com/steveyegge/beads/internal/localdolt"
 	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
@@ -715,17 +716,27 @@ func bootstrapServerPort(beadsDir string, cfg *configfile.Config, isSharedServer
 		}
 	}
 
+	// A port file records the port of a server bd started. A remote-only
+	// build starts none, so neither the shared-dir nor the local file may
+	// change where bootstrap dials; it falls back as
+	// doltserver.DefaultConfig does (shared 3308, else the chain to 3307).
+	readPortFiles := !localdolt.Disabled()
+
 	if isSharedServer {
-		if sharedDir, err := doltserver.SharedServerDir(); err == nil {
-			if port := doltserver.ReadPortFile(sharedDir); port > 0 {
-				return port
+		if readPortFiles {
+			if sharedDir, err := doltserver.SharedServerDir(); err == nil {
+				if port := doltserver.ReadPortFile(sharedDir); port > 0 {
+					return port
+				}
 			}
 		}
 		return doltserver.DefaultSharedServerPort
 	}
 
-	if port := doltserver.ReadPortFile(beadsDir); port > 0 {
-		return port
+	if readPortFiles {
+		if port := doltserver.ReadPortFile(beadsDir); port > 0 {
+			return port
+		}
 	}
 
 	if p := config.GetStringFromDir(beadsDir, "dolt.port"); p != "" {
@@ -827,7 +838,7 @@ func executeBootstrapPlan(plan BootstrapPlan, cfg *configfile.Config, nonInterac
 	// mirroring how bd init passes its own resolved db path, so the
 	// physical directory bootstrap writes is actually gated.
 	gateHandle, gateErr := acquireExclusiveWorkspaceGates(ctx, plan.BeadsDir, "bd bootstrap "+plan.Action,
-		doltserver.ResolveDoltDir(plan.BeadsDir))
+		bootstrapGateExtraRoots(plan.BeadsDir)...)
 	if gateErr != nil {
 		return fmt.Errorf("bd bootstrap refuses to run over live bd activity on this workspace: %w", gateErr)
 	}
@@ -844,6 +855,25 @@ func executeBootstrapPlan(plan BootstrapPlan, cfg *configfile.Config, nonInterac
 		return executeInitAction(ctx, plan, cfg)
 	}
 	return nil
+}
+
+// bootstrapGateExtraRoots is the extra physical root bootstrap's execute
+// step gates beside the resolver's roots: the Dolt directory the actions
+// open (doltserver.ResolveDoltDir). A remote-only build gates none and does
+// not call ResolveDoltDir, which would mkdir the shared dir in shared mode.
+// No action opens a local directory under that tag: init, restore and
+// jsonl-import go through the nocgo newDoltStore, which refuses a store
+// that is not ServerMode and otherwise dials the server (dolt.New starts no
+// local server there); sync clones through the server (cloneViaServer), or
+// reaches cloneViaEmbedded/cloneViaCLI, whose engine and dolt CLI the
+// build refuses (cloneViaEmbedded mkdirs .beads/embeddeddolt before the
+// refusal; that is not a gate). A proxied-server root still comes from the
+// resolver.
+func bootstrapGateExtraRoots(beadsDir string) []string {
+	if localdolt.Disabled() {
+		return nil
+	}
+	return []string{doltserver.ResolveDoltDir(beadsDir)}
 }
 
 func executeInitAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.Config) error {
@@ -1195,6 +1225,15 @@ func resolveRemoteCloneMode(beadsDir string, cfg *configfile.Config, cloneMode r
 
 // cloneViaEmbedded clones using the embedded Dolt engine (CGO required).
 func cloneViaEmbedded(ctx context.Context, beadsDir, remoteURL, dbName string) error {
+	// A remote-only build has no embedded engine. Refuse before creating
+	// .beads/embeddeddolt: remote-only bootstrap and init take only the
+	// workspace gate, so a write here would land under someone else's held
+	// physical gate. A metadata-less workspace routes here from both the
+	// bootstrap sync action and init's remote clone (resolveRemoteCloneMode),
+	// and this is the one point every embedded route passes.
+	if err := localdolt.Check("embedded clone from remote"); err != nil {
+		return err
+	}
 	dataDir := filepath.Join(beadsDir, "embeddeddolt")
 	if err := os.MkdirAll(dataDir, 0o750); err != nil {
 		return fmt.Errorf("create embeddeddolt directory: %w", err)

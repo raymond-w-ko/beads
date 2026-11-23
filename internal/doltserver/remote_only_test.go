@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/config"
@@ -201,4 +202,39 @@ func TestRemoteOnlyPhysicalRootsMetadataServerLoopbackIsRemote(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertRemoteNoRoots(t, pr)
+}
+
+// With no metadata.json and no server env/config, a remote-only build still
+// opens no embedded or local-server data, so the on-disk discovery must not
+// name a root, whatever directories exist.
+func TestRemoteOnlyPhysicalRootsNoMetadataIsRemote(t *testing.T) {
+	resetPhysicalRootEnv(t)
+	for _, tc := range []struct {
+		name string
+		dirs []string
+	}{
+		{name: "nothing on disk"},
+		{name: "dolt present", dirs: []string{"dolt"}},
+		{name: "embeddeddolt present", dirs: []string{"embeddeddolt"}},
+		{name: "both present", dirs: []string{"dolt", "embeddeddolt"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			beadsDir := newTestBeadsDir(t)
+			for _, d := range tc.dirs {
+				if err := os.MkdirAll(filepath.Join(beadsDir, d), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pr, err := ResolvePhysicalRoots(beadsDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !pr.RemoteBackend || len(pr.Roots) != 0 {
+				t.Errorf("RemoteBackend=%v Roots=%v, want true and none (provenance: %s)", pr.RemoteBackend, pr.Roots, pr.Provenance)
+			}
+			if !strings.Contains(pr.Provenance, "remote-only") {
+				t.Errorf("provenance %q does not name the remote-only build", pr.Provenance)
+			}
+		})
+	}
 }

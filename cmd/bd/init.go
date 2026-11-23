@@ -31,6 +31,7 @@ import (
 	"github.com/steveyegge/beads/internal/templates/agents"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
+	"github.com/steveyegge/beads/internal/workspacegate"
 	"github.com/steveyegge/beads/issueops"
 	"golang.org/x/term"
 )
@@ -1000,7 +1001,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		if fi, statErr := os.Stat(plannedDBPathAbs); statErr == nil && !fi.IsDir() {
 			plannedDBPathAbs = filepath.Dir(plannedDBPathAbs)
 		}
-		initGateHandle, gateErr := acquireInitMutationGate(rootCtx, beadsDirAbs, plannedDBPathAbs, func() error {
+		initGateHandle, gateErr := acquireInitGates(rootCtx, beadsDirAbs, initMutationGateRoot(plannedDBPathAbs, initProxiedServer), func() error {
 			return runInitReinitPreflight(reinitLocal, destroyTokenPrefix, destroyToken)
 		})
 		if gateErr != nil {
@@ -1148,6 +1149,17 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// so we create the marker directory explicitly.
 		// In embedded mode the engine creates its own directories under .beads/embeddeddolt/,
 		// so skip this to avoid leaving an empty .beads/dolt/ artifact (GH#2903).
+		//
+		// A remote-only build keeps the marker: workspace discovery reads it.
+		// In a git worktree, beads.FindBeadsDir takes the worktree's own .beads
+		// only when it holds a database directory (hasBeadsDatabase), else it
+		// falls back to the main checkout's .beads, so without the marker a
+		// worktree initialized against a server would silently use the main
+		// checkout's workspace (TestRemoteOnlyInitServerMarkerKeepsWorktreeWorkspace).
+		// MkdirAll of an empty directory leaves an existing root untouched.
+		// It skips the NOCOW flag, though: that build writes no Dolt data
+		// there, and the flag would change the inode of a root another
+		// binary may hold the physical gate on.
 		if initServerMode {
 			if err := os.MkdirAll(initDBPath, config.BeadsDirPerm); err != nil {
 				return fmt.Errorf("failed to create storage directory %s: %v", initDBPath, err)
@@ -1155,8 +1167,10 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			// Linux btrfs: disable compression on the dolt data dir to avoid
 			// kworker thrashing on the append-only write path. Best-effort; a
 			// non-btrfs filesystem returns nil from applyNoCOW.
-			if err := applyNoCOW(initDBPath); err != nil && !quiet {
-				fmt.Fprintf(os.Stderr, "Warning: failed to set FS_NOCOW_FL on %s: %v\n", initDBPath, err)
+			if !localdolt.Disabled() {
+				if err := applyNoCOW(initDBPath); err != nil && !quiet {
+					fmt.Fprintf(os.Stderr, "Warning: failed to set FS_NOCOW_FL on %s: %v\n", initDBPath, err)
+				}
 			}
 		}
 
@@ -1354,31 +1368,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// of the three resolutions below is one: they are an ambient env var and
 		// two pieces of bd's own bookkeeping. Mislabeling them makes auto-start
 		// refuse to retarget a stale port the user never chose (GH#4052).
-		initPort := 0
-		initPortSource := doltserver.PortSourceUnset
-		initPortShared := false
-		if p := os.Getenv("BEADS_DOLT_SERVER_PORT"); p != "" {
-			if port, err := strconv.Atoi(p); err == nil && port > 0 {
-				initPort = port
-				initPortSource = doltserver.PortSourceEnv
-			}
-		}
-		if initPort == 0 {
-			if port := doltserver.ReadPortFile(beadsDir); port > 0 {
-				initPort = port
-				initPortSource = doltserver.PortSourcePortFile
-			}
-		}
-		// Shared server mode intentionally uses a common port for all projects.
-		if initPort == 0 && doltserver.IsSharedServerMode() {
-			initPort = doltserver.DefaultSharedServerPort
-			initPortSource = doltserver.PortSourceSharedServerDefault
-			// Mirrors doltserver.DefaultConfig's own shared-mode fill. It makes
-			// newServerMode fail closed if the shared server is down and
-			// auto-start brings up a repo-local one instead — a different
-			// database, never a benign port refresh (GH#4052).
-			initPortShared = true
-		}
+		initPort, initPortSource, initPortShared := resolveInitPort(beadsDir)
 		doltCfg := &dolt.Config{
 			Path:                   storagePath,
 			BeadsDir:               beadsDir,
@@ -3519,4 +3509,78 @@ func resolveInitDoltMode(proxiedFlag, sharedFlag, serverFlag bool) string {
 		return "server"
 	}
 	return "embedded"
+}
+
+// resolveInitPort is init's port choice from project-local sources only
+// (GH#2336): BEADS_DOLT_SERVER_PORT, then the port file, then the shared
+// server default in shared mode. Port 0 with PortSourceUnset means none, so
+// auto-start allocates an ephemeral port, or a remote-only build dials the
+// default. A remote-only build never reads the port file: it records the
+// port of a server bd started, and that build starts none, so the file must
+// not change where init dials (or where it may create the database).
+func resolveInitPort(beadsDir string) (int, doltserver.PortSource, bool) {
+	if p := os.Getenv("BEADS_DOLT_SERVER_PORT"); p != "" {
+		if port, err := strconv.Atoi(p); err == nil && port > 0 {
+			return port, doltserver.PortSourceEnv, false
+		}
+	}
+	if !localdolt.Disabled() {
+		if port := doltserver.ReadPortFile(beadsDir); port > 0 {
+			return port, doltserver.PortSourcePortFile, false
+		}
+	}
+	// Shared server mode intentionally uses a common port for all projects.
+	if doltserver.IsSharedServerMode() {
+		// Mirrors doltserver.DefaultConfig's own shared-mode fill. The
+		// shared flag makes newServerMode fail closed if the shared server
+		// is down and auto-start brings up a repo-local one instead — a
+		// different database, never a benign port refresh (GH#4052).
+		return doltserver.DefaultSharedServerPort, doltserver.PortSourceSharedServerDefault, true
+	}
+	return 0, doltserver.PortSourceUnset, false
+}
+
+// initMutationGateRoot is the physical root bd init gates beside the
+// workspace gate: the planned Dolt data directory, or "" for none. A
+// remote-only build owns no local Dolt data for a server workspace, so init
+// takes only the workspace gate there, as the command chokepoint does
+// (doltserver.ResolvePhysicalRoots). A proxied-server init keeps the root:
+// the bd-owned proxy keeps its pid file, lock and spawn marker under it.
+func initMutationGateRoot(plannedDBPathAbs string, proxied bool) string {
+	if localdolt.Disabled() && !proxied {
+		return ""
+	}
+	return plannedDBPathAbs
+}
+
+// acquireInitGates is acquireInitMutationGate with an optional physical
+// root: "" takes exactly the workspace gate, with the same refusal wording
+// and the same release of the gates on a preflight error. It skips
+// acquireExclusiveWorkspaceGates on purpose: that adds the resolver's
+// roots, which for a reinit over embedded metadata still name
+// .beads/embeddeddolt, a directory a remote-only build never opens.
+func acquireInitGates(ctx context.Context, beadsDir, physicalRoot string, preflight func() error) (*workspacegate.MultiHandle, error) {
+	if physicalRoot != "" {
+		return acquireInitMutationGate(ctx, beadsDir, physicalRoot, preflight)
+	}
+	if strings.TrimSpace(beadsDir) == "" {
+		return nil, errors.New("workspace gate: empty beads directory")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	wsGate, err := workspacegate.ForWorkspace(beadsDir)
+	if err != nil {
+		return nil, fmt.Errorf("bd init refuses to run over live bd activity on this workspace: %w", err)
+	}
+	h, err := workspacegate.AcquireAll(ctx, workspacegate.Exclusive, exclusiveGateOptions("bd init"), wsGate)
+	if err != nil {
+		return nil, fmt.Errorf("bd init refuses to run over live bd activity on this workspace: %w", err)
+	}
+	if preflight != nil {
+		if err := preflight(); err != nil {
+			return nil, errors.Join(err, h.Release())
+		}
+	}
+	return h, nil
 }

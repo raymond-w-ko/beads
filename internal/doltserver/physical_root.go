@@ -37,8 +37,9 @@ type PhysicalRoots struct {
 	// directory?").
 	Provenance string
 	// RemoteBackend is true when the backend is a server on a non-local
-	// host, or any server or shared server in a remote-only build (which
-	// never owns local Dolt data): workspace gate only, no physical gate.
+	// host, or any server, shared server or metadata-less workspace in a
+	// remote-only build (which never owns local Dolt data): workspace gate
+	// only, no physical gate.
 	RemoteBackend bool
 }
 
@@ -246,7 +247,9 @@ func isRemoteServerHost(host string) bool {
 // server workspace gets a physical root: server mode, whether metadata,
 // env or config.yaml selected it (with or without metadata.json), and
 // shared-server mode report RemoteBackend=true with no roots, for every
-// host. Proxied-server keeps its root, because the bd-owned proxy keeps its
+// host. So does a workspace with no metadata.json (item 5): that build has
+// no embedded engine, so the on-disk discovery names nothing it opens.
+// Proxied-server keeps its root, because the bd-owned proxy keeps its
 // state there.
 //
 // Roots are returned absolute. Symlink canonicalization is deliberately NOT
@@ -363,6 +366,16 @@ func ResolvePhysicalRoots(beadsDir string) (PhysicalRoots, error) {
 		if err := addRoot(root); err != nil {
 			return PhysicalRoots{}, err
 		}
+
+	case localdolt.Disabled():
+		// No metadata.json and no server env/config in a remote-only
+		// build. That build has no embedded engine and starts no local
+		// server, so neither a .beads/embeddeddolt nor a .beads/dolt
+		// directory is data bd opens: its only store is a server it
+		// dials. Nothing local to gate, whatever is on disk.
+		pr.Mode = "server"
+		pr.RemoteBackend = true
+		pr.Provenance = "no metadata.json in a remote-only build (no embedded engine, no local server); no local physical root"
 
 	default:
 		// No metadata.json at all: mirror the open path's on-disk discovery.

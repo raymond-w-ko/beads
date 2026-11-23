@@ -373,6 +373,9 @@ func TestLibraryOpenRootPath(t *testing.T) {
 }
 
 func TestResolvePhysicalRootsNoMetadataFallbacks(t *testing.T) {
+	// Default-build discovery. Remote-only builds report a metadata-less
+	// workspace as remote (TestRemoteOnlyPhysicalRootsNoMetadataIsRemote).
+	skipIfLocalDoltDisabled(t)
 	resetPhysicalRootEnv(t)
 
 	t.Run("embeddeddolt dir present", func(t *testing.T) {
@@ -416,9 +419,6 @@ func TestResolvePhysicalRootsNoMetadataFallbacks(t *testing.T) {
 		// not change what the CLI opens, so it must not change the gate.
 		// Remote-only builds treat it as a server workspace instead
 		// (TestRemoteOnlyPhysicalRootsEnvServerModeWithoutMetadataIsRemote).
-		if localdolt.Disabled() {
-			t.Skip("remote-only builds report env-selected server mode as remote")
-		}
 		beadsDir := newTestBeadsDir(t)
 		t.Setenv("BEADS_DOLT_SERVER_MODE", "1")
 		pr, err := ResolvePhysicalRoots(beadsDir)
@@ -452,7 +452,14 @@ func TestResolvePhysicalRootsSideEffectFree(t *testing.T) {
 		t.Errorf("legacy config.json was removed by pure resolution: %v", statErr)
 	}
 	// With the migration correctly NOT triggered, the legacy config is
-	// invisible and the no-metadata stat fallback applies.
+	// invisible and the no-metadata stat fallback applies. A remote-only
+	// build reports a metadata-less workspace as remote instead.
+	if localdolt.Disabled() {
+		if !pr.RemoteBackend || len(pr.Roots) != 0 {
+			t.Errorf("remote-only: RemoteBackend=%v Roots=%v, want true and none (provenance: %s)", pr.RemoteBackend, pr.Roots, pr.Provenance)
+		}
+		return
+	}
 	assertSingleRoot(t, pr, "embedded", filepath.Join(beadsDir, "embeddeddolt"))
 }
 
