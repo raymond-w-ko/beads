@@ -128,3 +128,77 @@ func TestRemoteOnlyPhysicalRootsServerMetadataIsRemote(t *testing.T) {
 		t.Errorf("RemoteBackend=%v Roots=%v, want true and none (provenance: %s)", pr.RemoteBackend, pr.Roots, pr.Provenance)
 	}
 }
+
+// A port file is bookkeeping for a server bd started; a remote-only build
+// starts none, so the file must not move the dial target. In shared mode on
+// a loopback host the target stays the shared default whether or not the
+// shared dir holds a dolt-server.port.
+func TestRemoteOnlySharedLoopbackPortIgnoresPortFile(t *testing.T) {
+	clearRemoteOnlyEnv(t)
+	sharedDir := t.TempDir()
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "127.0.0.1")
+	t.Setenv("BEADS_SHARED_SERVER_DIR", sharedDir)
+
+	beadsDir := newTestBeadsDir(t)
+	writeBeadsMetadata(t, beadsDir, `{"database":"beads.db","dolt_mode":"server"}`)
+
+	before := DefaultConfig(beadsDir)
+	if before.Port != DefaultSharedServerPort || before.PortSource != PortSourceSharedServerDefault {
+		t.Errorf("no port file: port=%d source=%q, want %d/%q",
+			before.Port, before.PortSource, DefaultSharedServerPort, PortSourceSharedServerDefault)
+	}
+
+	if err := writePortFile(sharedDir, 14567); err != nil {
+		t.Fatal(err)
+	}
+	after := DefaultConfig(beadsDir)
+	if after.Port != before.Port || after.PortSource != before.PortSource {
+		t.Errorf("shared port file moved the dial: port=%d source=%q, want %d/%q as without it",
+			after.Port, after.PortSource, before.Port, before.PortSource)
+	}
+}
+
+func assertRemoteNoRoots(t *testing.T, pr PhysicalRoots) {
+	t.Helper()
+	if !pr.RemoteBackend || len(pr.Roots) != 0 {
+		t.Errorf("RemoteBackend=%v Roots=%v, want true and none (provenance: %s)", pr.RemoteBackend, pr.Roots, pr.Provenance)
+	}
+	if pr.Mode != "server" {
+		t.Errorf("Mode = %q, want %q (provenance: %s)", pr.Mode, "server", pr.Provenance)
+	}
+}
+
+// The CLI picks server mode from env with no metadata.json (it substitutes
+// the default config), so gate planning must not fall back to the local
+// directory discovery and gate .beads/dolt.
+func TestRemoteOnlyPhysicalRootsEnvServerModeWithoutMetadataIsRemote(t *testing.T) {
+	resetPhysicalRootEnv(t)
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "1")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "127.0.0.1")
+	beadsDir := newTestBeadsDir(t)
+	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	pr, err := ResolvePhysicalRoots(beadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRemoteNoRoots(t, pr)
+}
+
+func TestRemoteOnlyPhysicalRootsMetadataServerLoopbackIsRemote(t *testing.T) {
+	resetPhysicalRootEnv(t)
+	beadsDir := newTestBeadsDir(t)
+	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeBeadsMetadata(t, beadsDir, `{"database":"beads.db","dolt_mode":"server","dolt_server_host":"127.0.0.1","dolt_server_port":43567}`)
+
+	pr, err := ResolvePhysicalRoots(beadsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRemoteNoRoots(t, pr)
+}

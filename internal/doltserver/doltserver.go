@@ -890,6 +890,14 @@ func DefaultConfig(beadsDir string) *Config {
 	}
 
 	for _, src := range portSources {
+		// The port file records the port of a server bd started. A
+		// remote-only build starts none, so the file never moves the
+		// dial target. Skip it here, before any default is chosen:
+		// taking it and dropping it later would skip the shared-server
+		// default below and fall through to 3307.
+		if localdolt.Disabled() && src.source == PortSourcePortFile {
+			continue
+		}
 		if port, ok := src.resolve(beadsDir); ok {
 			cfg.Port = port
 			cfg.PortSource = src.source
@@ -916,7 +924,11 @@ func DefaultConfig(beadsDir string) *Config {
 				fc = loaded
 			}
 		}
-		if !configfile.IsLocalHostString(fc.GetDoltServerHost()) {
+		// A remote-only build never starts a local server, so every
+		// server is external, including one reached through a loopback
+		// host: no port file is valid (the loop above already skipped
+		// it) and an unconfigured port is 3307, or the shared default.
+		if localdolt.Disabled() || !configfile.IsLocalHostString(fc.GetDoltServerHost()) {
 			// The legacy BEADS_DOLT_PORT override is not in
 			// portSources but the storage layer honors it ahead of
 			// persisted sources; resolve it the same way here so

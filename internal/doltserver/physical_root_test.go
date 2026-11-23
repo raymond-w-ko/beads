@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/localdolt"
 )
 
 // resetPhysicalRootEnv neutralizes every env var ResolvePhysicalRoots (and
@@ -193,7 +195,16 @@ func TestResolvePhysicalRootsSharedServerWinsOverMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertSingleRoot(t, pr, "shared-server", filepath.Join(sharedParent, "dolt"))
+	if localdolt.Disabled() {
+		// A remote-only build never starts the shared server, so it has
+		// no local root to gate there.
+		if pr.Mode != "shared-server" || !pr.RemoteBackend || len(pr.Roots) != 0 {
+			t.Errorf("remote-only: Mode=%q RemoteBackend=%v Roots=%v, want shared-server/true/none (provenance: %s)",
+				pr.Mode, pr.RemoteBackend, pr.Roots, pr.Provenance)
+		}
+	} else {
+		assertSingleRoot(t, pr, "shared-server", filepath.Join(sharedParent, "dolt"))
+	}
 
 	// Side-effect freedom: resolution must not have created the shared
 	// tree (SharedServerDir/SharedDoltDir mkdir on first use; the resolver
@@ -308,6 +319,15 @@ func TestResolvePhysicalRootsBracketedIPv6LoopbackIsLocal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if localdolt.Disabled() {
+		// A remote-only build owns no local Dolt data: every server host,
+		// loopback included, is a server bd only dials.
+		if !pr.RemoteBackend || len(pr.Roots) != 0 || pr.Mode != "server" {
+			t.Errorf("remote-only: Mode=%q RemoteBackend=%v Roots=%v, want server/true/none (provenance: %s)",
+				pr.Mode, pr.RemoteBackend, pr.Roots, pr.Provenance)
+		}
+		return
+	}
 	assertSingleRoot(t, pr, "server", filepath.Join(beadsDir, "dolt"))
 }
 
@@ -394,6 +414,11 @@ func TestResolvePhysicalRootsNoMetadataFallbacks(t *testing.T) {
 		// CLI parity: the nil-config branch in cmd/bd/main.go rescues ONLY
 		// shared-server mode; BEADS_DOLT_SERVER_MODE without metadata does
 		// not change what the CLI opens, so it must not change the gate.
+		// Remote-only builds treat it as a server workspace instead
+		// (TestRemoteOnlyPhysicalRootsEnvServerModeWithoutMetadataIsRemote).
+		if localdolt.Disabled() {
+			t.Skip("remote-only builds report env-selected server mode as remote")
+		}
 		beadsDir := newTestBeadsDir(t)
 		t.Setenv("BEADS_DOLT_SERVER_MODE", "1")
 		pr, err := ResolvePhysicalRoots(beadsDir)

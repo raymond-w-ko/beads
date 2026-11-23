@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/localdolt"
 )
 
 // PhysicalRoots describes the local physical database root(s) a store open
@@ -36,7 +37,8 @@ type PhysicalRoots struct {
 	// directory?").
 	Provenance string
 	// RemoteBackend is true when the backend is a server on a non-local
-	// host: workspace gate only, no physical gate.
+	// host, or any server or shared server in a remote-only build (which
+	// never owns local Dolt data): workspace gate only, no physical gate.
 	RemoteBackend bool
 }
 
@@ -240,6 +242,13 @@ func isRemoteServerHost(host string) bool {
 //     file lives beside it and workspacegate only requires the PARENT to
 //     exist). The CLI's nil-config branch honors no other env rescue.
 //
+// A remote-only build (localdolt.Disabled) owns no local Dolt data, so no
+// server workspace gets a physical root: server mode, whether metadata,
+// env or config.yaml selected it (with or without metadata.json), and
+// shared-server mode report RemoteBackend=true with no roots, for every
+// host. Proxied-server keeps its root, because the bd-owned proxy keeps its
+// state there.
+//
 // Roots are returned absolute. Symlink canonicalization is deliberately NOT
 // performed here: workspacegate.ForPhysicalRoot canonicalizes the gate
 // file's parent itself (and refuses symlinked roots), and resolving here too
@@ -274,7 +283,24 @@ func ResolvePhysicalRoots(beadsDir string) (PhysicalRoots, error) {
 		return nil
 	}
 
+	// The CLI selects server mode from env/config.yaml even with no
+	// metadata.json (cmd/bd/main.go substitutes configfile.DefaultConfig).
+	// A remote-only build follows it here, so a server workspace never
+	// falls through to the no-metadata directory discovery and gates a
+	// local .beads/dolt. The default build keeps the old discovery
+	// (TestResolvePhysicalRootsNoMetadataFallbacks).
+	serverCfg := cfg
+	if serverCfg == nil && localdolt.Disabled() {
+		if def := configfile.DefaultConfig(); def.IsDoltServerMode() {
+			serverCfg = def
+		}
+	}
+
 	switch {
+	// A remote-only build keeps the proxied-server root: the proxy is a
+	// bd-owned local process, and even with an external backend it keeps
+	// its pid file, lock and spawn marker under that root (dbproxy/proxy).
+	// Only its managed Dolt child is refused (server.NewDoltServer).
 	case cfg != nil && cfg.IsDoltProxiedServerMode():
 		pr.Mode = "proxied-server"
 		root, perr := ResolveProxiedServerRootPath(abs)
@@ -288,6 +314,14 @@ func ResolvePhysicalRoots(beadsDir string) (PhysicalRoots, error) {
 
 	case IsSharedServerMode():
 		pr.Mode = "shared-server"
+		if localdolt.Disabled() {
+			// A remote-only build never starts the shared server and
+			// owns nothing under the shared dir: bd only dials it, like
+			// any loopback server below. Nothing local to gate.
+			pr.RemoteBackend = true
+			pr.Provenance = "shared-server mode in a remote-only build; bd dials the shared server and owns no local physical root"
+			break
+		}
 		root, serr := SharedDoltPath()
 		if serr != nil {
 			return PhysicalRoots{}, fmt.Errorf("resolving shared-server root: %w", serr)
@@ -297,15 +331,23 @@ func ResolvePhysicalRoots(beadsDir string) (PhysicalRoots, error) {
 			return PhysicalRoots{}, err
 		}
 
-	case cfg != nil && cfg.IsDoltServerMode():
+	case serverCfg != nil && serverCfg.IsDoltServerMode():
 		pr.Mode = "server"
-		host := cfg.GetDoltServerHost()
+		host := serverCfg.GetDoltServerHost()
 		if isRemoteServerHost(host) {
 			pr.RemoteBackend = true
 			pr.Provenance = fmt.Sprintf("server mode with remote host %s; no local physical root", host)
 			break
 		}
-		root := cfg.DatabasePath(abs)
+		if localdolt.Disabled() {
+			// A remote-only build never starts or embeds Dolt, so even a
+			// loopback host is a server bd does not own: nothing local
+			// to gate.
+			pr.RemoteBackend = true
+			pr.Provenance = fmt.Sprintf("server mode in a remote-only build (host %q); no local physical root", host)
+			break
+		}
+		root := serverCfg.DatabasePath(abs)
 		pr.Provenance = fmt.Sprintf("server mode (env/metadata/config.yaml, local host); root %s via DatabasePath semantics", root)
 		if err := addRoot(root); err != nil {
 			return PhysicalRoots{}, err
