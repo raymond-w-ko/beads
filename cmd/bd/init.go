@@ -1150,27 +1150,11 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// In embedded mode the engine creates its own directories under .beads/embeddeddolt/,
 		// so skip this to avoid leaving an empty .beads/dolt/ artifact (GH#2903).
 		//
-		// A remote-only build keeps the marker: workspace discovery reads it.
-		// In a git worktree, beads.FindBeadsDir takes the worktree's own .beads
-		// only when it holds a database directory (hasBeadsDatabase), else it
-		// falls back to the main checkout's .beads, so without the marker a
-		// worktree initialized against a server would silently use the main
-		// checkout's workspace (TestRemoteOnlyInitServerMarkerKeepsWorktreeWorkspace).
-		// MkdirAll of an empty directory leaves an existing root untouched.
-		// It skips the NOCOW flag, though: that build writes no Dolt data
-		// there, and the flag would change the inode of a root another
-		// binary may hold the physical gate on.
+		// A remote-only build creates only the workspace marker
+		// (ensureInitServerStorageDir).
 		if initServerMode {
-			if err := os.MkdirAll(initDBPath, config.BeadsDirPerm); err != nil {
-				return fmt.Errorf("failed to create storage directory %s: %v", initDBPath, err)
-			}
-			// Linux btrfs: disable compression on the dolt data dir to avoid
-			// kworker thrashing on the append-only write path. Best-effort; a
-			// non-btrfs filesystem returns nil from applyNoCOW.
-			if !localdolt.Disabled() {
-				if err := applyNoCOW(initDBPath); err != nil && !quiet {
-					fmt.Fprintf(os.Stderr, "Warning: failed to set FS_NOCOW_FL on %s: %v\n", initDBPath, err)
-				}
+			if err := ensureInitServerStorageDir(beadsDir, initDBPath, quiet); err != nil {
+				return err
 			}
 		}
 
@@ -3583,4 +3567,39 @@ func acquireInitGates(ctx context.Context, beadsDir, physicalRoot string, prefli
 		}
 	}
 	return h, nil
+}
+
+// ensureInitServerStorageDir creates the directory a server-mode init needs
+// locally. The default build creates the Dolt data directory (initDBPath,
+// which BEADS_DOLT_DATA_DIR or --db may move outside the workspace) and sets
+// the btrfs NOCOW flag on it.
+//
+// A remote-only build writes no Dolt data locally, so it creates only the
+// literal workspace marker <beadsDir>/dolt, never a custom data root (which
+// another binary may hold the physical gate on), and sets no flag. The
+// marker stays because workspace discovery reads it: in a git worktree,
+// beads.FindBeadsDir takes the worktree's own .beads only when it holds a
+// database directory (hasBeadsDatabase), else it falls back to the main
+// checkout's .beads, so without it a worktree initialized against a server
+// would silently use the main checkout's workspace
+// (TestRemoteOnlyInitServerMarkerKeepsWorktreeWorkspace). MkdirAll of an
+// empty directory leaves an existing one untouched.
+func ensureInitServerStorageDir(beadsDir, initDBPath string, quiet bool) error {
+	if localdolt.Disabled() {
+		marker := filepath.Join(beadsDir, "dolt")
+		if err := os.MkdirAll(marker, config.BeadsDirPerm); err != nil {
+			return fmt.Errorf("failed to create workspace marker directory %s: %v", marker, err)
+		}
+		return nil
+	}
+	if err := os.MkdirAll(initDBPath, config.BeadsDirPerm); err != nil {
+		return fmt.Errorf("failed to create storage directory %s: %v", initDBPath, err)
+	}
+	// Linux btrfs: disable compression on the dolt data dir to avoid
+	// kworker thrashing on the append-only write path. Best-effort; a
+	// non-btrfs filesystem returns nil from applyNoCOW.
+	if err := applyNoCOW(initDBPath); err != nil && !quiet {
+		fmt.Fprintf(os.Stderr, "Warning: failed to set FS_NOCOW_FL on %s: %v\n", initDBPath, err)
+	}
+	return nil
 }

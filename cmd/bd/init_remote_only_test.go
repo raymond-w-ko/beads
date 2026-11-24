@@ -5,8 +5,10 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -286,5 +288,99 @@ func TestRemoteOnlyInitServerMarkerKeepsWorktreeWorkspace(t *testing.T) {
 	git.ResetCaches()
 	if got := utils.CanonicalizePath(beads.FindBeadsDir()); got != utils.CanonicalizePath(wtBeads) {
 		t.Errorf("with the marker: FindBeadsDir() = %q, want the worktree's own %q", got, wtBeads)
+	}
+}
+
+// A custom data root (BEADS_DOLT_DATA_DIR or --db) outside the workspace is
+// a directory a remote-only build never writes Dolt data to, and another
+// binary may hold its physical gate. Server init must leave it alone and
+// create only the <beadsDir>/dolt workspace marker discovery reads.
+func TestRemoteOnlyInitServerStorageDirIsOnlyTheMarker(t *testing.T) {
+	clearRemoteOnlyInitEnv(t)
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	customRoot := filepath.Join(t.TempDir(), "custom-dolt-data")
+	t.Setenv("BEADS_DOLT_DATA_DIR", customRoot)
+
+	// init resolves its storage path this way (initDBPath in init.go).
+	initDBPath := doltserver.ResolveDoltDir(beadsDir)
+	if filepath.Clean(initDBPath) != filepath.Clean(customRoot) {
+		t.Fatalf("initDBPath = %q, want the custom root %q this test guards", initDBPath, customRoot)
+	}
+
+	if err := ensureInitServerStorageDir(beadsDir, initDBPath, true); err != nil {
+		t.Fatalf("ensureInitServerStorageDir: %v", err)
+	}
+	if _, err := os.Stat(customRoot); !os.IsNotExist(err) {
+		t.Errorf("remote-only server init created the custom data root %s (stat err %v)", customRoot, err)
+	}
+	if fi, err := os.Stat(filepath.Join(beadsDir, "dolt")); err != nil || !fi.IsDir() {
+		t.Errorf("remote-only server init did not create the workspace marker %s/dolt (stat err %v)", beadsDir, err)
+	}
+}
+
+// The same fixture through the real `bd init --server --external` command,
+// so a regression at init's call site (an os.MkdirAll(initDBPath) put back
+// before the helper) fails, not only a regression inside the helper. The
+// server is a loopback port with no listener: the storage directory is made
+// before the dial, so whatever error init returns there, the custom data
+// root must still be absent and the workspace marker present.
+func TestRemoteOnlyInitCommandLeavesCustomDataDirAbsent(t *testing.T) {
+	clearRemoteOnlyInitEnv(t)
+	t.Setenv("BEADS_DIR", "")
+	t.Setenv("BEADS_DB", "")
+	// Keep the failed dial's circuit-breaker state in this test's scratch.
+	scratch := t.TempDir()
+	t.Setenv("BEADS_TEST_CIRCUIT_DIR", filepath.Join(scratch, "circuit"))
+	t.Setenv("TMPDIR", scratch)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	workspace := t.TempDir()
+	beadsDir := filepath.Join(workspace, ".beads")
+	customRoot := filepath.Join(t.TempDir(), "custom-dolt-data")
+	t.Setenv("BEADS_DOLT_DATA_DIR", customRoot)
+	t.Chdir(workspace)
+	git.ResetCaches()
+	t.Cleanup(git.ResetCaches)
+
+	origDBPath, origServerMode, origProxied := dbPath, serverMode, proxiedServerMode
+	dbPath = ""
+	t.Cleanup(func() { dbPath, serverMode, proxiedServerMode = origDBPath, origServerMode, origProxied })
+	args := []string{"init", "--server", "--external",
+		"--server-host", "127.0.0.1", "--server-port", strconv.Itoa(port),
+		"--prefix", "rotest", "--quiet", "--non-interactive", "--skip-hooks", "--skip-agents"}
+	t.Cleanup(func() {
+		for _, name := range []string{"server", "external", "server-host", "server-port",
+			"prefix", "quiet", "non-interactive", "skip-hooks", "skip-agents"} {
+			f := initCmd.Flags().Lookup(name)
+			if f == nil {
+				f = rootCmd.PersistentFlags().Lookup(name)
+			}
+			if f != nil {
+				_ = f.Value.Set(f.DefValue)
+				f.Changed = false
+			}
+		}
+		rootCmd.SetArgs(nil)
+	})
+	rootCmd.SetArgs(args)
+	initErr := rootCmd.Execute()
+	t.Logf("bd %s: err = %v", strings.Join(args, " "), initErr)
+
+	if _, err := os.Stat(customRoot); !os.IsNotExist(err) {
+		t.Errorf("remote-only bd init --server created the custom data root %s (stat err %v)", customRoot, err)
+	}
+	if fi, err := os.Stat(filepath.Join(beadsDir, "dolt")); err != nil || !fi.IsDir() {
+		t.Errorf("remote-only bd init --server did not create the workspace marker %s/dolt (stat err %v)", beadsDir, err)
 	}
 }

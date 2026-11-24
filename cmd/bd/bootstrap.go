@@ -866,9 +866,8 @@ func executeBootstrapPlan(plan BootstrapPlan, cfg *configfile.Config, nonInterac
 // that is not ServerMode and otherwise dials the server (dolt.New starts no
 // local server there); sync clones through the server (cloneViaServer), or
 // reaches cloneViaEmbedded/cloneViaCLI, whose engine and dolt CLI the
-// build refuses (cloneViaEmbedded mkdirs .beads/embeddeddolt before the
-// refusal; that is not a gate). A proxied-server root still comes from the
-// resolver.
+// build refuses (cloneViaEmbedded checks localdolt first and creates
+// nothing). A proxied-server root still comes from the resolver.
 func bootstrapGateExtraRoots(beadsDir string) []string {
 	if localdolt.Disabled() {
 		return nil
