@@ -243,8 +243,14 @@ func (r *beadsDirFSRepositoryImpl) ReadMetadataJSON(ctx context.Context) ([]byte
 
 func (r *beadsDirFSRepositoryImpl) WriteConfigYAML(ctx context.Context, content []byte) error {
 	path := filepath.Join(r.beadsDir, "config.yaml")
-	if err := os.WriteFile(path, content, 0600); err != nil {
-		return fmt.Errorf("fs: WriteConfigYAML: %w", err)
+	// Write through the config lock: an existing file is replaced in place
+	// under its exclusive lock (a concurrent reader waits, never sees it half
+	// written; a write-only file is written as os.WriteFile would), and a new
+	// file appears whole.
+	err := config.ReplaceConfigFile(path, 0600, content)
+	if err != nil {
+		_, cause := config.RewriteConfigFileCause(err)
+		return fmt.Errorf("fs: WriteConfigYAML: %w", cause)
 	}
 	return nil
 }

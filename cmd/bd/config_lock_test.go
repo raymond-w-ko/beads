@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,16 +16,18 @@ import (
 )
 
 // waitsForConfigLock proves that read takes path's shared config lock. It
-// holds the exclusive lock, as a bd rewriting config.yaml does, rewrites the
-// file to after in place and starts read. Hook events are matched to path by
+// holds the exclusive lock, as a bd rewriting config.yaml does, and starts
+// read while the file still holds its initial contents. Hook events are matched to path by
 // file identity, not by string, since readers may canonicalize the path (a
 // symlinked TMPDIR). Once the reader has opened the file ("reader-opened"),
 // it must not get its lock ("reader-locked") or return while the exclusive
 // lock is held. On Linux the kernel must also show the reader blocked: a
 // waiting ("->") FLOCK READ entry for the file in /proc/locks, so a reader
 // that skips the lock call, or fakes it, fails however long it stalls. Only
-// then is the lock released; the reader must then get its lock and report
-// want, what it reports for the whole new file. Without /proc/locks the
+// then, still under the exclusive lock, is the file rewritten to after in
+// place, and the lock released; the reader must then get its lock and report
+// want, what it reports for after. A reader that read the file before its
+// lock call saw only the initial contents and so fails too. Without /proc/locks the
 // kernel check is skipped (logged) and a 100 ms hook window stands in.
 func waitsForConfigLock(t *testing.T, path, after string, read func() string, want string) {
 	t.Helper()
@@ -61,12 +64,6 @@ func waitsForConfigLock(t *testing.T, path, after string, read func() string, wa
 		}
 	}
 	defer release()
-	if err := f.Truncate(0); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteAt([]byte(after), 0); err != nil {
-		t.Fatal(err)
-	}
 
 	got := make(chan string, 1)
 	go func() { got <- read() }()
@@ -103,6 +100,14 @@ func waitsForConfigLock(t *testing.T, path, after string, read func() string, wa
 		}
 	}
 
+	// The reader is waiting on the lock: only now write the final bytes, as
+	// the holder of the exclusive lock, then release.
+	if err := f.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte(after), 0); err != nil {
+		t.Fatal(err)
+	}
 	release()
 	select {
 	case <-locked:
@@ -257,4 +262,89 @@ func TestValidateSyncConfig_WaitsForConfigLock(t *testing.T) {
 		}
 		return "sovereignty not flagged"
 	}, "sovereignty flagged")
+}
+
+// TestInitConfigYaml_CreatesWholeUnderConfigLock: bd init's createConfigYaml
+// creates config.yaml whole: at the config writer's "created" stage the file
+// already holds the whole template, so no reader ever sees it empty or
+// partial. An existing config.yaml is left as it is.
+func TestInitConfigYaml_CreatesWholeUnderConfigLock(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(beadsDir, "config.yaml")
+	want := string(renderInitConfigYAML("", false))
+
+	var seen []string
+	var mu sync.Mutex
+	restore := config.SetIOHookForTesting(func(stage, p string) {
+		if stage != "created" || filepath.Base(p) != "config.yaml" {
+			return
+		}
+		data, err := os.ReadFile(path)
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			seen = append(seen, "error: "+err.Error())
+			return
+		}
+		seen = append(seen, string(data))
+	})
+	t.Cleanup(restore)
+
+	if err := createConfigYaml(beadsDir, false, ""); err != nil {
+		t.Fatalf("createConfigYaml: %v", err)
+	}
+	restore()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 1 {
+		t.Fatalf("config writer \"created\" stage fired %d times, want once: config.yaml was not created through the config writer", len(seen))
+	}
+	if hardLinksWork(t, beadsDir) {
+		if seen[0] != want {
+			t.Fatalf("config.yaml just after its creation is %d bytes, want the whole %d-byte template", len(seen[0]), len(want))
+		}
+	} else {
+		t.Log("whole-create check skipped: no hard links here, so the documented in-place create fallback runs")
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != want {
+		t.Fatalf("config.yaml after createConfigYaml is %d bytes (%v), want the %d-byte template", len(data), err, len(want))
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Windows' os.Stat reports 0666 for any writable file.
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
+		t.Fatalf("config.yaml mode %v; want 0600", fi.Mode())
+	}
+
+	const custom = "issue-prefix: mine\n"
+	if err := os.WriteFile(path, []byte(custom), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := createConfigYaml(beadsDir, true, "other"); err != nil {
+		t.Fatalf("createConfigYaml on an existing file: %v", err)
+	}
+	if data, _ := os.ReadFile(path); string(data) != custom {
+		t.Fatalf("createConfigYaml rewrote an existing config.yaml to %q", data)
+	}
+}
+
+// hardLinksWork reports whether dir's filesystem makes hard links (the config
+// writer's whole create needs them; without, it creates in place).
+func hardLinksWork(t *testing.T, dir string) bool {
+	t.Helper()
+	probe := filepath.Join(dir, ".hardlink-probe")
+	if err := os.WriteFile(probe, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(probe)
+	if err := os.Link(probe, probe+".link"); err != nil {
+		return false
+	}
+	_ = os.Remove(probe + ".link")
+	return true
 }

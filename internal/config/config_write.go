@@ -174,7 +174,7 @@ func RewriteConfigFile(path string, perm os.FileMode, edit func(old []byte, exis
 		if referent, ok := danglingSymlinkReferent(path); ok {
 			target = referent
 		}
-		switch made, createErr := createConfigWhole(target, out, perm); {
+		switch made, createErr := createConfigWhole(target, path, out, perm); {
 		case createErr != nil:
 			return &rewriteError{op: "write", err: createErr}
 		case made:
@@ -234,9 +234,77 @@ func RewriteConfigFile(path string, perm os.FileMode, edit func(old []byte, exis
 	return nil
 }
 
+// ReplaceConfigFile replaces path's whole content with data under the config
+// lock, as RewriteConfigFile does, but never reads the file: an existing file
+// is opened write-only (so a write-only 0200 file is replaced, as os.WriteFile
+// would), locked exclusively on that descriptor, truncated and written in
+// place, so it keeps its inode, mode, owner and links and a concurrent reader
+// waits. An absent file (or a dangling symlink's referent) is created whole,
+// as RewriteConfigFile creates one, with perm. There is no unlocked fallback.
+// Errors come back tagged with their phase (see RewriteConfigFileCause).
+func ReplaceConfigFile(path string, perm os.FileMode, data []byte) error {
+	if err := checkConfigLockReentry(); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, 0) //nolint:gosec // caller-resolved config path, not user input
+	if errors.Is(err, fs.ErrNotExist) {
+		target := path
+		if referent, ok := danglingSymlinkReferent(path); ok {
+			target = referent
+		}
+		switch made, createErr := createConfigWhole(target, path, data, perm); {
+		case createErr != nil:
+			return &rewriteError{op: "write", err: createErr}
+		case made:
+			configIOStage("created", path)
+			return nil
+		}
+		// Another writer created the file first, or no whole create is
+		// possible here: replace it in place under the lock.
+		f, err = os.OpenFile(path, os.O_WRONLY, 0) //nolint:gosec // caller-resolved config path
+		if errors.Is(err, fs.ErrNotExist) {
+			f, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE, perm) //nolint:gosec // caller-resolved config path
+			if err == nil {
+				configIOStage("created", path)
+			}
+		}
+	}
+	if err != nil {
+		return &rewriteError{op: "write", err: err}
+	}
+	defer func() { _ = f.Close() }() // closing also releases the lock
+
+	if err := lockConfigFile(f, true); err != nil {
+		return &rewriteError{op: "write", err: fmt.Errorf("lock %s: %w", path, err)}
+	}
+	if err := writeConfigLocked(f, path, data); err != nil {
+		return &rewriteError{op: "write", err: err}
+	}
+	_ = lockfile.FileUnlock(f)
+	if err := f.Close(); err != nil {
+		return &rewriteError{op: "write", err: err}
+	}
+	return nil
+}
+
 // configTempPattern names createConfigWhole's temp file: short and fixed, so
 // its length never depends on the target's name.
 const configTempPattern = ".bd-config-*.tmp"
+
+// configTempFileHook, when set by a test, gets createConfigWhole's temp file
+// just after it is created, before any write (to inject an I/O error).
+var configTempFileHook func(tmp *os.File)
+
+// targetPathError returns err, an error from an I/O step on a temp file, as a
+// *fs.PathError naming path instead, with the same Op and Err. An error that
+// is no *fs.PathError is wrapped with op.
+func targetPathError(err error, op, path string) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return &fs.PathError{Op: pe.Op, Path: path, Err: pe.Err}
+	}
+	return &fs.PathError{Op: op, Path: path, Err: err}
+}
 
 // configNoHardLinks makes createConfigWhole report hard links unavailable, so
 // tests can exercise the in-place create fallback.
@@ -253,8 +321,9 @@ var configNoHardLinks bool
 // before): the caller then falls back to its open, whose errors are the
 // historic ones. The temp name is short and independent of path's name
 // (configTempPattern), so a valid target name near NAME_MAX never makes the
-// temp name too long and forces the fallback.
-func createConfigWhole(path string, data []byte, perm os.FileMode) (made bool, err error) {
+// temp name too long and forces the fallback. An I/O error on the temp file
+// is reported against reportPath, the path the caller was asked to write.
+func createConfigWhole(path, reportPath string, data []byte, perm os.FileMode) (made bool, err error) {
 	if configNoHardLinks {
 		return false, nil
 	}
@@ -264,22 +333,28 @@ func createConfigWhole(path string, data []byte, perm os.FileMode) (made bool, e
 	}
 	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }()
+	if configTempFileHook != nil {
+		configTempFileHook(tmp)
+	}
+	// An I/O error on the temp file names reportPath, the file the caller
+	// asked for (config.yaml, even when path is a dangling symlink's
+	// referent): the temp name and the referent are implementation details.
 	if perm != 0o600 { // CreateTemp makes 0600
 		if err := tmp.Chmod(perm); err != nil {
 			_ = tmp.Close()
-			return false, err
+			return false, targetPathError(err, "chmod", reportPath)
 		}
 	}
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
-		return false, err
+		return false, targetPathError(err, "write", reportPath)
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		return false, err
+		return false, targetPathError(err, "sync", reportPath)
 	}
 	if err := tmp.Close(); err != nil {
-		return false, err
+		return false, targetPathError(err, "close", reportPath)
 	}
 	if err := os.Link(tmpName, path); err != nil {
 		// EEXIST: another writer won; anything else: no hard links here.

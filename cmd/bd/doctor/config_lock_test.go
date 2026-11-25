@@ -15,16 +15,18 @@ import (
 )
 
 // waitsForConfigLock proves that read takes path's shared config lock. It
-// holds the exclusive lock, as a bd rewriting config.yaml does, rewrites the
-// file to after in place and starts read. Hook events are matched to path by
+// holds the exclusive lock, as a bd rewriting config.yaml does, and starts
+// read while the file still holds its initial contents. Hook events are matched to path by
 // file identity, not by string, since readers may canonicalize the path (a
 // symlinked TMPDIR). Once the reader has opened the file ("reader-opened"),
 // it must not get its lock ("reader-locked") or return while the exclusive
 // lock is held. On Linux the kernel must also show the reader blocked: a
 // waiting ("->") FLOCK READ entry for the file in /proc/locks, so a reader
 // that skips the lock call, or fakes it, fails however long it stalls. Only
-// then is the lock released; the reader must then get its lock and report
-// want, what it reports for the whole new file. Without /proc/locks the
+// then, still under the exclusive lock, is the file rewritten to after in
+// place, and the lock released; the reader must then get its lock and report
+// want, what it reports for after. A reader that read the file before its
+// lock call saw only the initial contents and so fails too. Without /proc/locks the
 // kernel check is skipped (logged) and a 100 ms hook window stands in.
 func waitsForConfigLock(t *testing.T, path, after string, read func() string, want string) {
 	t.Helper()
@@ -61,12 +63,6 @@ func waitsForConfigLock(t *testing.T, path, after string, read func() string, wa
 		}
 	}
 	defer release()
-	if err := f.Truncate(0); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteAt([]byte(after), 0); err != nil {
-		t.Fatal(err)
-	}
 
 	got := make(chan string, 1)
 	go func() { got <- read() }()
@@ -103,6 +99,14 @@ func waitsForConfigLock(t *testing.T, path, after string, read func() string, wa
 		}
 	}
 
+	// The reader is waiting on the lock: only now write the final bytes, as
+	// the holder of the exclusive lock, then release.
+	if err := f.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte(after), 0); err != nil {
+		t.Fatal(err)
+	}
 	release()
 	select {
 	case <-locked:

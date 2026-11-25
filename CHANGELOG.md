@@ -71,8 +71,9 @@ init, bootstrap and port fixes and the record-only commits landed since
   `~/.config/bd/config.yaml` at start-up, and leave a file neither could
   parse; every later bd then printed `Warning: failed to initialize config`.
   Every rewrite (`bd config set` and `unset` on the project or user file,
-  `SaveConfigValue`, the repos list, the user config defaults and the
-  metrics bootstrap) now goes through one helper, `config.RewriteConfigFile`:
+  `SaveConfigValue`, the repos list, the user config defaults, the
+  metrics bootstrap and `bd init`'s `.beads/config.yaml`) now goes through
+  one helper, `config.RewriteConfigFile`:
   it opens the config file itself, takes an exclusive lock on it, reads it,
   and rewrites it in place through the same descriptor (truncate, then
   write, as before). The lock is on the file, not on a sibling lock file,
@@ -111,11 +112,8 @@ init, bootstrap and port fixes and the record-only commits landed since
   without them, js/wasm), a new file is created in place as before, so until
   its creator holds the lock another bd can see it empty, and a concurrent
   first bootstrap can then write the existing-file formatting (four-space
-  indent, quoted endpoint) with the same values; `bd init`'s creation of
-  `.beads/config.yaml` is not routed through the helper; config.yaml readers outside `internal/config`
-  (several `bd doctor` checks, the sync config validation, the storage
-  layer's raw `ReadConfigYAML`) still read without the lock; and a program
-  other than bd (an editor) takes no lock.
+  indent, quoted endpoint) with the same values; and a program other than
+  bd (an editor) takes no lock.
 - **A `remote_dolt_only` build treats every server as external** (fork
   3c79f053e): the port file records a server bd started, and a remote-only
   build starts none, so the port file never moves the dial target; an

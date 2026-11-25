@@ -1325,3 +1325,74 @@ func TestRewriteConfigFile_LongNameDanglingBootstrapRace(t *testing.T) {
 		t.Fatalf("config dir holds extra entries %v, want config.yaml and the referent only (no temp file)", names)
 	}
 }
+
+// TestRewriteConfigFile_FirstCreateErrorNamesConfig: an I/O error on the
+// whole create's temp file is reported against config.yaml, the file the
+// caller asked for, never the temp name.
+func TestRewriteConfigFile_FirstCreateErrorNamesConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	configTempFileHook = func(tmp *os.File) { _ = tmp.Close() } // the write then fails
+	t.Cleanup(func() { configTempFileHook = nil })
+
+	err := RewriteConfigFile(path, 0o600, func([]byte, bool) ([]byte, error) {
+		return []byte("k: v\n"), nil
+	})
+	if err == nil {
+		t.Fatal("RewriteConfigFile with a failing temp write = nil, want an error")
+	}
+	msg := labelRewriteErr(err, "config.yaml").Error()
+	if strings.Contains(msg, ".bd-config-") || !strings.Contains(msg, path) {
+		t.Fatalf("first-create write error = %q, want it to name %s, not the temp file", msg, path)
+	}
+	var pe *fs.PathError
+	if !errors.As(err, &pe) || pe.Path != path || pe.Op != "write" {
+		t.Fatalf("first-create write error = %#v, want a *fs.PathError{Op: write, Path: %s}", err, path)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("a failed first create left %v", entries)
+	}
+}
+
+// TestConfigWriters_DanglingFirstCreateErrorNamesRequestedPath: config.yaml
+// is a symlink to an absent referent.yaml. An I/O error on the whole create's
+// temp file must name the requested config.yaml (as os.WriteFile did), not the
+// referent or the temp file, with the temp error's Op and Err.
+func TestConfigWriters_DanglingFirstCreateErrorNamesRequestedPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need privileges on windows")
+	}
+	writers := map[string]func(path string) error{
+		"RewriteConfigFile": func(path string) error {
+			return RewriteConfigFile(path, 0o600, func([]byte, bool) ([]byte, error) {
+				return []byte("k: v\n"), nil
+			})
+		},
+		"ReplaceConfigFile": func(path string) error {
+			return ReplaceConfigFile(path, 0o600, []byte("k: v\n"))
+		},
+	}
+	for name, write := range writers {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.yaml")
+			if err := os.Symlink("referent.yaml", path); err != nil {
+				t.Fatal(err)
+			}
+			configTempFileHook = func(tmp *os.File) { _ = tmp.Close() } // the write then fails
+			t.Cleanup(func() { configTempFileHook = nil })
+
+			err := write(path)
+			var pe *fs.PathError
+			if !errors.As(err, &pe) {
+				t.Fatalf("%s with a failing temp write = %v, want a *fs.PathError", name, err)
+			}
+			if pe.Path != path || pe.Op != "write" || !errors.Is(pe.Err, os.ErrClosed) {
+				t.Fatalf("%s error = {Op: %q, Path: %q, Err: %v}, want {Op: write, Path: %s, Err: %v}", name, pe.Op, pe.Path, pe.Err, path, os.ErrClosed)
+			}
+			if _, err := os.Lstat(filepath.Join(dir, "referent.yaml")); !os.IsNotExist(err) {
+				t.Fatalf("a failed first create left referent.yaml (%v)", err)
+			}
+		})
+	}
+}

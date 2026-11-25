@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/steveyegge/beads/internal/config"
 )
 
 // createConfigYaml creates the config.yaml template in the specified directory
@@ -16,9 +18,19 @@ func createConfigYaml(beadsDir string, noDbMode bool, prefix string) error {
 		return nil
 	}
 
+	// Create it through the config lock: a new file appears whole (never empty
+	// or partial to a concurrent bd), and if another bd created it meanwhile,
+	// it is left as that bd wrote it, as an existing file always was.
 	body := renderInitConfigYAML(prefix, noDbMode)
-	if err := os.WriteFile(configYamlPath, body, 0600); err != nil {
-		return fmt.Errorf("failed to write config.yaml: %w", err)
+	err := config.RewriteConfigFile(configYamlPath, 0600, func(_ []byte, exists bool) ([]byte, error) {
+		if exists {
+			return nil, config.ErrSkipRewrite
+		}
+		return body, nil
+	})
+	if err != nil {
+		_, cause := config.RewriteConfigFileCause(err)
+		return fmt.Errorf("failed to write config.yaml: %w", cause)
 	}
 
 	return nil
