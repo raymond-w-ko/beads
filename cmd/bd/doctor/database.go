@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/cmd/bd/doctor/fix"
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage/dolt"
@@ -546,7 +547,7 @@ func getDatabasePath(beadsDir string) string {
 // Uses proper YAML parsing to avoid false matches in comments or nested keys
 func isNoDbModeConfigured(beadsDir string) bool {
 	configPath := filepath.Join(beadsDir, "config.yaml")
-	data, err := os.ReadFile(configPath) // #nosec G304 - config file path from beadsDir
+	data, err := config.ReadConfigFileShared(configPath) // shared config lock: never a half-written file
 	if err != nil {
 		return false
 	}

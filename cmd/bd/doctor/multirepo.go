@@ -138,7 +138,7 @@ func readTypesFromDB(beadsDir string) ([]string, error) {
 // readTypesFromYAML reads types.custom from config.yaml
 func readTypesFromYAML(beadsDir string) ([]string, error) {
 	configPath := filepath.Join(beadsDir, "config.yaml")
-	content, err := os.ReadFile(configPath) // #nosec G304 - path is controlled
+	content, err := config.ReadConfigFileShared(configPath) // shared config lock: never a half-written file
 	if err != nil {
 		return nil, err
 	}

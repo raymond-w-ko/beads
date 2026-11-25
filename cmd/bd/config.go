@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -711,8 +712,10 @@ func validateSyncConfig(repoPath string) []string {
 	v.SetConfigType("yaml")
 	v.SetConfigFile(configPath)
 
-	// Try to read config, but don't error if it doesn't exist
-	if err := v.ReadInConfig(); err != nil {
+	// Try to read config, but don't error if it doesn't exist. The bytes are
+	// read under the file's shared config lock, so a concurrent bd's rewrite
+	// is never seen half done, and viper parses them as ReadInConfig would.
+	if err := readViperConfigShared(v, configPath); err != nil {
 		// Config file doesn't exist or is unreadable - nothing to validate
 		return issues
 	}
@@ -1135,4 +1138,15 @@ func init() {
 	configCmd.AddCommand(configUnsetCmd)
 	configCmd.AddCommand(configValidateCmd)
 	rootCmd.AddCommand(configCmd)
+}
+
+// readViperConfigShared loads path into v (whose config type is yaml) from the
+// bytes read under the file's shared config lock: ReadInConfig's parse and
+// errors, without a by-name read that could see a half-written file.
+func readViperConfigShared(v *viper.Viper, path string) error {
+	data, err := config.ReadConfigFileShared(path)
+	if err != nil {
+		return err
+	}
+	return v.ReadConfig(bytes.NewReader(data))
 }

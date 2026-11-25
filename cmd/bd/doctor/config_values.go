@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/spf13/viper"
 	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 )
@@ -184,7 +186,7 @@ func checkYAMLConfigValues(repoPath string) []string {
 	v := viper.New()
 	v.SetConfigType("yaml")
 	v.SetConfigFile(configPath)
-	if err := v.ReadInConfig(); err != nil {
+	if err := readViperConfigShared(v, configPath); err != nil {
 		issues = append(issues, fmt.Sprintf("config.yaml: failed to parse: %v", err))
 		return issues
 	}
@@ -445,4 +447,16 @@ func checkDatabaseConfigValuesWithStore(store *dolt.DoltStore) []string {
 	}
 
 	return issues
+}
+
+// readViperConfigShared loads path into v (whose config type is yaml) from the
+// bytes read under the file's shared config lock, so a check never parses a
+// config.yaml another bd is halfway through rewriting. The parse and its
+// errors (absent, unreadable, malformed) are ReadInConfig's.
+func readViperConfigShared(v *viper.Viper, path string) error {
+	data, err := config.ReadConfigFileShared(path)
+	if err != nil {
+		return err
+	}
+	return v.ReadConfig(bytes.NewReader(data))
 }

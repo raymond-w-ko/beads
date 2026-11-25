@@ -251,8 +251,9 @@ func (r *beadsDirFSRepositoryImpl) WriteConfigYAML(ctx context.Context, content 
 
 func (r *beadsDirFSRepositoryImpl) ReadConfigYAML(ctx context.Context) ([]byte, error) {
 	path := filepath.Join(r.beadsDir, "config.yaml")
-	// #nosec G304 -- path joined under bound beadsDir
-	data, err := os.ReadFile(path)
+	// Read under the file's shared config lock, so a concurrent bd's rewrite is
+	// never seen half done.
+	data, err := config.ReadConfigFileShared(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}

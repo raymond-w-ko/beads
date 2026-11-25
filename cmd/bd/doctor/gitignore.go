@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/steveyegge/beads/internal/config"
 )
 
 // GitignoreTemplate is the canonical .beads/.gitignore content
@@ -538,7 +540,7 @@ func CheckRedirectTargetSyncWorktree(repoPath string) DoctorCheck {
 
 	// Check if the target has a sync-branch configured in config.yaml
 	configPath := filepath.Join(resolvedTarget, "config.yaml")
-	configData, err := os.ReadFile(configPath) // #nosec G304 - constructed from known path
+	configData, err := config.ReadConfigFileShared(configPath) // shared config lock: never a half-written file
 	if err != nil {
 		// No config.yaml means no sync-branch, which is fine
 		return DoctorCheck{
