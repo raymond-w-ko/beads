@@ -52,6 +52,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal from a managed (local sidecar) backend keep the full transient
   retry.
 
+## [1.3.5-dev.6] - 2026-11-24
+
+Fork pre-release above [1.3.5-dev.5], stamped so a caller can tell by
+`bd version` a build that serializes `config.yaml` rewrites under a lock on
+the file, so parallel bd runs that share a HOME cannot tear
+`~/.config/bd/config.yaml`:
+everturn moves its bd pin to this version. It also marks the remote-only
+init, bootstrap and port fixes and the record-only commits landed since
+1.3.5-dev.5.
+
+### Fixed
+
+- **Parallel bd runs no longer tear `config.yaml`**: bd rewrote its YAML
+  config files in place (truncate, then write) with no lock. Two bd
+  processes sharing a HOME could interleave, for example the user config
+  defaults and the first-run metrics notice that both write
+  `~/.config/bd/config.yaml` at start-up, and leave a file neither could
+  parse; every later bd then printed `Warning: failed to initialize config`.
+  Every rewrite (`bd config set` and `unset` on the project or user file,
+  `SaveConfigValue`, the repos list, the user config defaults and the
+  metrics bootstrap) now goes through one helper, `config.RewriteConfigFile`:
+  it opens the config file itself, takes an exclusive lock on it, reads it,
+  and rewrites it in place through the same descriptor (truncate, then
+  write, as before). The lock is on the file, not on a sibling lock file,
+  so every name of the file (symlinks and hard links) shares it, it needs
+  no write access to the directory, and no lock file is created. On unix it
+  is `flock`; on Windows it is a lock on one byte at offset 2^62, far past
+  any content, so programs that take no lock can still read and write the
+  file. The readers in `internal/config` (the config load at start-up,
+  `config.local.yaml` included, the Viper reload after `bd repo add` or
+  `remove`, the repos list, the user-global and workspace lookups
+  `WorkspaceYamlValue`, `WorkspaceYamlValueStrict` and `GetStringFromDir`)
+  and the metrics defaults check open the file read-only and hold a shared
+  lock on it while they read, so they never see a file another bd is
+  writing; an absent file reads as absent, and an empty one as an empty
+  config. Viper parses the bytes read through the locked descriptor and never
+  reopens the file by name, so a symlink retargeted meanwhile cannot make it
+  load another file. A new file is created whole: bd writes the content to a
+  temp file in the same directory and hard-links it into place, so no reader
+  or writer ever sees it empty; if another bd created it first, the edit runs
+  again on what that bd wrote. `bd repo add`/`remove` and the user config
+  defaults decide what to change from the file as read under the exclusive
+  lock, so a concurrent change (for example `metrics.disabled: true` written
+  meanwhile) is kept. The user config defaults first read under the shared
+  lock and return when nothing is missing, so a complete or opted-out
+  config in a read-only file or directory is left alone, as before. The
+  bytes written, and when and where bd writes, are unchanged. The in-place
+  write keeps the file's inode, mode, ACLs, owner, hard links and symlinks;
+  a read-only (`0444`) file is refused as before; a new file is `0600`; a
+  rewrite of an absent file that would write nothing (for example
+  `bd config unset` on an empty HOME) creates nothing. If the lock cannot
+  be taken, the read or write fails; there is no unlocked fallback, except
+  on js/wasm and filesystems that report file locks unsupported. Limits: a
+  crash during a write can still leave a partial file, as the unlocked
+  write could; a file already torn by an older bd is not repaired (fix or
+  delete it by hand); where hard links are unavailable (a filesystem
+  without them, js/wasm) or `config.yaml` is a dangling symlink, a new file
+  is created in place as before, so until its creator holds the lock another
+  bd can see it empty, and a concurrent first bootstrap can then write the
+  existing-file formatting (four-space indent, quoted endpoint) with the same
+  values; `bd init`'s creation of `.beads/config.yaml` is not
+  routed through the helper; config.yaml readers outside `internal/config`
+  (several `bd doctor` checks, the sync config validation, the storage
+  layer's raw `ReadConfigYAML`) still read without the lock; and a program
+  other than bd (an editor) takes no lock.
+- **A `remote_dolt_only` build treats every server as external** (fork
+  3c79f053e): the port file records a server bd started, and a remote-only
+  build starts none, so the port file never moves the dial target; an
+  unconfigured port is 3307, or the shared-server default, even on a
+  loopback host. Server mode, whether metadata, env or `config.yaml` chose
+  it (with or without `metadata.json`), and shared-server mode take no
+  local physical root. Proxied-server keeps its root, because the bd-owned
+  proxy keeps its pid file, lock and spawn marker there.
+- **A `remote_dolt_only` `bd init` and `bd bootstrap` touch no local Dolt
+  data** (fork 1176a394d, 9a60c5b0f): both ignore port files, take only the
+  workspace gate, not the local Dolt gate, and create no local Dolt
+  directory. A bootstrap embedded clone is refused (naming
+  `remote_dolt_only`) before it creates `.beads/embeddeddolt`.
+  `bd init --server` creates only the `.beads/dolt` workspace marker, which
+  worktree discovery reads, never a data dir that `BEADS_DOLT_DATA_DIR` or
+  `--db` moves elsewhere, and sets no NOCOW flag. The default build is
+  unchanged.
+
+### Documentation
+
+- The `everturn_worktree` reader contract on `everturnKeyColumns` now names
+  two statements in one read-only transaction: one seeks
+  `idx_issues_everturn_worktree`, the next seeks the primary key with its
+  ids, because Dolt's planner ignores the index for either one-statement
+  form at scale (fork 852957edf, d56029820). Comments, tests and
+  `UPSTREAM.md` only; no schema change.
+- `UPSTREAM.md` records the `bd-time` line row (fork c9cbe58e2), and two
+  comments and two `UPSTREAM.md` rows say their reason instead of citing
+  another project's record (fork f01c43afc).
+
 ## [1.3.5-dev.5] - 2026-11-19
 
 Fork pre-release above [1.3.5-dev.4], stamped so a caller can tell by

@@ -3,6 +3,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -381,7 +382,7 @@ func WorkspaceYamlValueStrict(beadsDir, key string) (value string, present bool,
 	if beadsDir == "" {
 		return "", false, nil
 	}
-	data, err := os.ReadFile(filepath.Join(beadsDir, "config.yaml")) //nolint:gosec // beadsDir is caller-resolved workspace state
+	data, err := readConfigShared(filepath.Join(beadsDir, "config.yaml")) // shared config lock: never a half-written file
 	if os.IsNotExist(err) {
 		return "", false, nil
 	}
@@ -437,7 +438,7 @@ func strictYamlScalarString(v interface{}) (string, error) {
 }
 
 func readYamlValueAtPath(path, key string) (string, bool) {
-	data, err := os.ReadFile(path) //nolint:gosec // path is a resolved config.yaml path, not user input
+	data, err := readConfigShared(path) // shared config lock: never a half-written file
 	if err != nil {
 		return "", false
 	}
@@ -533,24 +534,16 @@ func UnsetUserYamlConfig(key string) error {
 	if err != nil {
 		return err
 	}
-	content, err := os.ReadFile(configPath) //nolint:gosec // configPath is a validated absolute user config path
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("failed to read user config.yaml: %w", err)
-	}
-
-	newContent := commentOutYamlKey(string(content), key)
-
 	// Preserve the owner-private 0600 posture every other user-global writer
 	// uses (SetUserYamlConfig, setYamlConfigAtPath, the metrics bootstrap);
 	// rewriting at 0644 would relax this shared user config to world-readable.
-	if err := os.WriteFile(configPath, []byte(newContent), 0o600); err != nil { //nolint:gosec // configPath is from UserConfigYamlPath
-		return fmt.Errorf("failed to write user config.yaml: %w", err)
-	}
-
-	return nil
+	err = RewriteConfigFile(configPath, 0o600, func(content []byte, exists bool) ([]byte, error) {
+		if !exists {
+			return nil, ErrSkipRewrite
+		}
+		return []byte(commentOutYamlKey(string(content), key)), nil
+	})
+	return labelRewriteErr(err, "user config.yaml")
 }
 
 func SetUserYamlConfig(key, value string) error {
@@ -564,35 +557,41 @@ func SetUserYamlConfig(key, value string) error {
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 		return fmt.Errorf("failed to create user config directory: %w", err)
 	}
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		if err := os.WriteFile(configPath, []byte{}, 0o600); err != nil {
-			return fmt.Errorf("failed to create user config.yaml: %w", err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("failed to stat user config.yaml: %w", err)
+	// A missing user config is created as if it were empty, under the same
+	// lock as the update, so no reader sees a half-made file.
+	return rewriteYamlKeyAtPath(configPath, key, value, true)
+}
+
+// UpdateYamlConfigContent returns content (a config.yaml's text) with key set
+// to value, exactly as SetUserYamlConfig would write it. It touches no file:
+// callers use it inside a RewriteConfigFile edit.
+func UpdateYamlConfigContent(content, key, value string) (string, error) {
+	if err := validateYamlConfigValue(key, value); err != nil {
+		return "", err
 	}
-	return setYamlConfigAtPath(configPath, key, value)
+	return updateYamlKey(content, key, value)
 }
 
 func setYamlConfigAtPath(configPath, key, value string) error {
-	// Read existing config
-	content, err := os.ReadFile(configPath) //nolint:gosec // configPath is from findProjectConfigYaml
-	if err != nil {
-		return fmt.Errorf("failed to read config.yaml: %w", err)
-	}
+	return rewriteYamlKeyAtPath(configPath, key, value, false)
+}
 
-	// Update or add the key
-	newContent, err := updateYamlKey(string(content), key, value)
-	if err != nil {
-		return err
-	}
-
-	// Write back
-	if err := os.WriteFile(configPath, []byte(newContent), 0600); err != nil { //nolint:gosec // configPath is validated
-		return fmt.Errorf("failed to write config.yaml: %w", err)
-	}
-
-	return nil
+// rewriteYamlKeyAtPath updates key in configPath under the config write lock.
+// createMissing treats an absent file as empty; otherwise an absent file is
+// the read error it always was.
+func rewriteYamlKeyAtPath(configPath, key, value string, createMissing bool) error {
+	err := RewriteConfigFile(configPath, 0o600, func(content []byte, exists bool) ([]byte, error) {
+		if !exists && !createMissing {
+			return nil, &rewriteError{op: "read", err: &fs.PathError{Op: "open", Path: configPath, Err: fs.ErrNotExist}}
+		}
+		// Update or add the key
+		newContent, err := updateYamlKey(string(content), key, value)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(newContent), nil
+	})
+	return labelRewriteErr(err, "config.yaml")
 }
 
 // GetYamlConfig gets a configuration value from config.yaml.
@@ -612,18 +611,13 @@ func UnsetYamlConfig(key string) error {
 		return err
 	}
 
-	content, err := os.ReadFile(configPath) //nolint:gosec // configPath is from findProjectConfigYaml
-	if err != nil {
-		return fmt.Errorf("failed to read config.yaml: %w", err)
-	}
-
-	newContent := commentOutYamlKey(string(content), key)
-
-	if err := os.WriteFile(configPath, []byte(newContent), 0600); err != nil { //nolint:gosec // configPath is validated
-		return fmt.Errorf("failed to write config.yaml: %w", err)
-	}
-
-	return nil
+	err = RewriteConfigFile(configPath, 0o600, func(content []byte, exists bool) ([]byte, error) {
+		if !exists {
+			return nil, &rewriteError{op: "read", err: &fs.PathError{Op: "open", Path: configPath, Err: fs.ErrNotExist}}
+		}
+		return []byte(commentOutYamlKey(string(content), key)), nil
+	})
+	return labelRewriteErr(err, "config.yaml")
 }
 
 // findProjectConfigYaml finds the active config.yaml path for YAML-only config writes.

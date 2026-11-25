@@ -356,15 +356,17 @@ func Initialize() error {
 
 	// Load config files: lowest priority first, each MergeInConfig overwrites
 	if len(configPaths) > 0 {
+		// Each load holds the file's shared config lock, so it never reads a
+		// config.yaml that a concurrent bd is halfway through rewriting.
 		v.SetConfigFile(configPaths[0])
-		if err := v.ReadInConfig(); err != nil {
+		if err := loadViperConfigLocked(v, configPaths[0], false); err != nil {
 			return fmt.Errorf("error reading config file: %w", err)
 		}
 		debug.Logf("Debug: loaded config from %s\n", configPaths[0])
 
 		for _, p := range configPaths[1:] {
 			v.SetConfigFile(p)
-			if err := v.MergeInConfig(); err != nil {
+			if err := loadViperConfigLocked(v, p, true); err != nil {
 				return fmt.Errorf("error merging config file %s: %w", p, err)
 			}
 			debug.Logf("Debug: merged config from %s\n", p)
@@ -379,7 +381,7 @@ func Initialize() error {
 		localConfigPath := filepath.Join(filepath.Dir(primaryConfigPath), "config.local.yaml")
 		if _, err := os.Stat(localConfigPath); err == nil {
 			v.SetConfigFile(localConfigPath)
-			if err := v.MergeInConfig(); err != nil {
+			if err := loadViperConfigLocked(v, localConfigPath, true); err != nil {
 				return fmt.Errorf("error merging local config file: %w", err)
 			}
 			debug.Logf("Debug: merged local config from %s\n", localConfigPath)
@@ -643,20 +645,23 @@ func SaveConfigValue(key string, value interface{}, beadsDir string) error {
 	}
 
 	// Read existing file contents to avoid dumping all merged viper state
-	// (defaults, env vars, overrides) into the config file.
-	existing := make(map[string]interface{})
-	if data, err := os.ReadFile(filepath.Clean(configPath)); err == nil {
+	// (defaults, env vars, overrides) into the config file. The read, the
+	// update and the write happen under the config write lock.
+	err := RewriteConfigFile(filepath.Clean(configPath), 0o600, func(data []byte, _ bool) ([]byte, error) {
+		existing := make(map[string]interface{})
 		_ = yaml.Unmarshal(data, &existing)
-	}
 
-	// Set the single key using dot-path splitting for nested keys (e.g. "routing.mode").
-	setNestedKey(existing, key, value)
+		// Set the single key using dot-path splitting for nested keys (e.g. "routing.mode").
+		setNestedKey(existing, key, value)
 
-	out, err := yaml.Marshal(existing)
-	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
-	}
-	return os.WriteFile(configPath, out, 0o600)
+		out, err := yaml.Marshal(existing)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal config: %w", err)
+		}
+		return out, nil
+	})
+	_, cause := RewriteConfigFileCause(err)
+	return cause
 }
 
 // setNestedKey sets a value in a nested map using a dot-separated key path.
@@ -692,7 +697,7 @@ func GetString(key string) string {
 // Returns "" if the file is absent, the key is not found, or any error occurs.
 func GetStringFromDir(beadsDir, key string) string {
 	configPath := filepath.Join(beadsDir, "config.yaml")
-	data, err := os.ReadFile(configPath)
+	data, err := readConfigShared(configPath) // shared config lock: never a half-written file
 	if err != nil {
 		return ""
 	}

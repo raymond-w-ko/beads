@@ -52,3 +52,42 @@ func FlockExclusiveNonBlock(f *os.File) error {
 	}
 	return err
 }
+
+// FileLockOffset is the offset of the single byte FileLockShared and
+// FileLockExclusive lock on Windows. LockFileEx locks are mandatory: a
+// locked range refuses other handles' reads and writes. Locking one byte far
+// beyond any real content (as SQLite locks its lock-byte page) serializes the
+// lockers while every plain reader or writer of the content, an editor for
+// one, is never blocked. Windows permits locking a range past the end of
+// the file.
+const FileLockOffset = 1 << 62
+
+// fileLockOverlapped addresses the byte at FileLockOffset.
+func fileLockOverlapped() *windows.Overlapped {
+	return &windows.Overlapped{
+		Offset:     uint32(FileLockOffset & 0xFFFFFFFF),
+		OffsetHigh: uint32(FileLockOffset >> 32),
+	}
+}
+
+// FileLockShared takes a shared lock on the file f is open on, waiting while
+// another handle holds FileLockExclusive. The lock belongs to the file, so
+// every name of the file shares it, and it needs no write access to f or its
+// directory. On Windows it locks the one byte at FileLockOffset, so the
+// content stays readable and writable by handles that take no lock. Two
+// handles conflict even in one process, so a holder must not take a second
+// lock on the same file; release with FileUnlock, or by closing f.
+func FileLockShared(f *os.File) error {
+	return windows.LockFileEx(windows.Handle(f.Fd()), 0, 0, 1, 0, fileLockOverlapped())
+}
+
+// FileLockExclusive is FileLockShared's exclusive form: it waits until no
+// other handle holds either lock on the file.
+func FileLockExclusive(f *os.File) error {
+	return windows.LockFileEx(windows.Handle(f.Fd()), windows.LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, fileLockOverlapped())
+}
+
+// FileUnlock releases FileLockShared or FileLockExclusive.
+func FileUnlock(f *os.File) error {
+	return windows.UnlockFileEx(windows.Handle(f.Fd()), 0, 1, 0, fileLockOverlapped())
+}

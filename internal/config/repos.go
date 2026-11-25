@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -33,14 +34,18 @@ func FindConfigYAMLPath() (string, error) {
 // GetReposFromYAML reads the repos configuration from config.yaml
 // Returns an empty ReposConfig if repos section doesn't exist
 func GetReposFromYAML(configPath string) (*ReposConfig, error) {
-	data, err := os.ReadFile(configPath) // #nosec G304 - config file path from caller
+	data, err := readConfigShared(configPath) // shared config lock: never a half-written file
 	if err != nil {
 		if os.IsNotExist(err) {
 			return &ReposConfig{}, nil
 		}
 		return nil, fmt.Errorf("failed to read config.yaml: %w", err)
 	}
+	return reposFromYAML(data)
+}
 
+// reposFromYAML parses the repos section out of config.yaml's bytes.
+func reposFromYAML(data []byte) (*ReposConfig, error) {
 	// Parse into a generic map to extract repos section
 	var cfg map[string]interface{}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
@@ -76,17 +81,55 @@ func GetReposFromYAML(configPath string) (*ReposConfig, error) {
 // SetReposInYAML writes the repos configuration to config.yaml
 // It preserves other config sections and comments where possible
 func SetReposInYAML(configPath string, repos *ReposConfig) error {
-	// Read existing config or create new
-	data, err := os.ReadFile(configPath) // #nosec G304 - config file path from caller
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to read config.yaml: %w", err)
+	// No current section is parsed: a whole replacement overwrites any repos
+	// value, even one that is not a map, as it always did.
+	return updateReposInYAML(configPath, nil, repos)
+}
+
+// updateReposInYAML writes config.yaml's repos section in one locked rewrite.
+// With change set, it parses the current section and writes what change derives
+// from it, so a concurrent AddRepo or RemoveRepo is never lost; else it writes
+// repos.
+func updateReposInYAML(configPath string, change func(current *ReposConfig) (*ReposConfig, error), repos *ReposConfig) error {
+	// Read existing config or create new, under the config write lock.
+	err := RewriteConfigFile(configPath, 0600, func(data []byte, _ bool) ([]byte, error) {
+		next := repos
+		if change != nil {
+			current, err := reposFromYAML(data)
+			if err != nil {
+				return nil, &reposReadError{err: err}
+			}
+			if next, err = change(current); err != nil {
+				return nil, err
+			}
+		}
+		return reposYAML(data, next)
+	})
+	if err != nil {
+		return labelRewriteErr(err, "config.yaml")
 	}
 
+	// Reload viper config so changes take effect immediately. The write lock
+	// is released by now; the reload parses the bytes read under the file's
+	// shared lock, so it never loads a file another bd is halfway through
+	// writing.
+	if v != nil && v.ConfigFileUsed() != "" {
+		if err := loadViperConfigLocked(v, v.ConfigFileUsed(), false); err != nil {
+			// Not fatal - config is on disk, will be picked up on next command
+			_ = err // Best effort: viper reload failure is non-fatal since config was already written to disk
+		}
+	}
+
+	return nil
+}
+
+// reposYAML returns config.yaml's bytes data with its repos section set to repos.
+func reposYAML(data []byte, repos *ReposConfig) ([]byte, error) {
 	// Parse existing config into yaml.Node to preserve structure
 	var root yaml.Node
 	if len(data) > 0 {
 		if err := yaml.Unmarshal(data, &root); err != nil {
-			return fmt.Errorf("failed to parse config.yaml: %w", err)
+			return nil, fmt.Errorf("failed to parse config.yaml: %w", err)
 		}
 	}
 
@@ -141,26 +184,13 @@ func SetReposInYAML(configPath string, repos *ReposConfig) error {
 	encoder := yaml.NewEncoder(&buf)
 	encoder.SetIndent(2)
 	if err := encoder.Encode(&root); err != nil {
-		return fmt.Errorf("failed to encode config.yaml: %w", err)
+		return nil, fmt.Errorf("failed to encode config.yaml: %w", err)
 	}
 	if err := encoder.Close(); err != nil {
-		return fmt.Errorf("failed to close encoder: %w", err)
+		return nil, fmt.Errorf("failed to close encoder: %w", err)
 	}
 
-	// Write back to file
-	if err := os.WriteFile(configPath, []byte(buf.String()), 0600); err != nil {
-		return fmt.Errorf("failed to write config.yaml: %w", err)
-	}
-
-	// Reload viper config so changes take effect immediately
-	if v != nil {
-		if err := v.ReadInConfig(); err != nil {
-			// Not fatal - config is on disk, will be picked up on next command
-			_ = err // Best effort: viper reload failure is non-fatal since config was already written to disk
-		}
-	}
-
-	return nil
+	return []byte(buf.String()), nil
 }
 
 // buildReposNode creates a yaml.Node for the repos configuration
@@ -195,62 +225,77 @@ func buildReposNode(repos *ReposConfig) *yaml.Node {
 	return node
 }
 
+// reposReadError marks a failure to parse the current repos section inside
+// updateReposInYAML, which AddRepo and RemoveRepo report as they always did.
+type reposReadError struct{ err error }
+
+func (e *reposReadError) Error() string { return e.err.Error() }
+func (e *reposReadError) Unwrap() error { return e.err }
+
+// reposChangeErr restores AddRepo/RemoveRepo's historic wording for a repos
+// section that cannot be read ("failed to get repos config: ...").
+func reposChangeErr(err error) error {
+	var rr *reposReadError
+	if errors.As(err, &rr) {
+		return fmt.Errorf("failed to get repos config: %w", rr.err)
+	}
+	var rw *rewriteError
+	if errors.As(err, &rw) && rw.op == "read" {
+		return fmt.Errorf("failed to get repos config: %w", labelRewriteErr(rw, "config.yaml"))
+	}
+	return err
+}
+
 // AddRepo adds a repository to the repos.additional list in config.yaml
 // If primary is not set, it defaults to "."
 func AddRepo(configPath, repoPath string) error {
-	repos, err := GetReposFromYAML(configPath)
-	if err != nil {
-		return fmt.Errorf("failed to get repos config: %w", err)
-	}
-
-	// Set primary to "." if not already set (standard multi-repo convention)
-	if repos.Primary == "" {
-		repos.Primary = "."
-	}
-
-	// Check if repo already exists
-	for _, existing := range repos.Additional {
-		if existing == repoPath {
-			return fmt.Errorf("repository already configured: %s", repoPath)
+	err := updateReposInYAML(configPath, func(repos *ReposConfig) (*ReposConfig, error) {
+		// Set primary to "." if not already set (standard multi-repo convention)
+		if repos.Primary == "" {
+			repos.Primary = "."
 		}
-	}
 
-	// Add the new repo
-	repos.Additional = append(repos.Additional, repoPath)
+		// Check if repo already exists
+		for _, existing := range repos.Additional {
+			if existing == repoPath {
+				return nil, fmt.Errorf("repository already configured: %s", repoPath)
+			}
+		}
 
-	return SetReposInYAML(configPath, repos)
+		// Add the new repo
+		repos.Additional = append(repos.Additional, repoPath)
+		return repos, nil
+	}, nil)
+	return reposChangeErr(err)
 }
 
 // RemoveRepo removes a repository from the repos.additional list in config.yaml
 func RemoveRepo(configPath, repoPath string) error {
-	repos, err := GetReposFromYAML(configPath)
-	if err != nil {
-		return fmt.Errorf("failed to get repos config: %w", err)
-	}
-
-	// Find and remove the repo
-	found := false
-	newAdditional := make([]string, 0, len(repos.Additional))
-	for _, existing := range repos.Additional {
-		if existing == repoPath {
-			found = true
-			continue
+	err := updateReposInYAML(configPath, func(repos *ReposConfig) (*ReposConfig, error) {
+		// Find and remove the repo
+		found := false
+		newAdditional := make([]string, 0, len(repos.Additional))
+		for _, existing := range repos.Additional {
+			if existing == repoPath {
+				found = true
+				continue
+			}
+			newAdditional = append(newAdditional, existing)
 		}
-		newAdditional = append(newAdditional, existing)
-	}
 
-	if !found {
-		return fmt.Errorf("repository not found: %s", repoPath)
-	}
+		if !found {
+			return nil, fmt.Errorf("repository not found: %s", repoPath)
+		}
 
-	repos.Additional = newAdditional
+		repos.Additional = newAdditional
 
-	// If no repos left, clear primary too
-	if len(repos.Additional) == 0 {
-		repos.Primary = ""
-	}
-
-	return SetReposInYAML(configPath, repos)
+		// If no repos left, clear primary too
+		if len(repos.Additional) == 0 {
+			repos.Primary = ""
+		}
+		return repos, nil
+	}, nil)
+	return reposChangeErr(err)
 }
 
 // ListRepos returns the current repos configuration from YAML
