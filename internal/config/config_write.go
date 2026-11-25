@@ -137,9 +137,10 @@ func lockConfigFile(f *os.File, exclusive bool) error {
 // file hard-linked into place), so no reader or writer ever sees the new file
 // empty. If another writer created the file first, edit is called again under
 // the lock on what that writer wrote, so edit must be a pure function of its
-// arguments. Where no whole create is possible (no hard links, a dangling
-// symlink), the file is created in place and locked as before; exists is then
-// false while it is still empty under the lock. A pre-existing empty file
+// arguments. A dangling symlink's referent is created whole the same way, in
+// the referent's directory, so the link stays a link. Where no whole create is
+// possible (no hard links), the file is created in place and locked as before;
+// exists is then false while it is still empty under the lock. A pre-existing empty file
 // takes the existing-file path. There is no unlocked fallback: a failed lock
 // fails the write.
 //
@@ -167,20 +168,27 @@ func RewriteConfigFile(path string, perm os.FileMode, edit func(old []byte, exis
 			}
 			return editErr
 		}
-		switch made, createErr := createConfigWhole(path, out, perm); {
+		// A dangling symlink names its referent: create that whole, so the
+		// link stays a link and no one sees the new file empty.
+		target := path
+		if referent, ok := danglingSymlinkReferent(path); ok {
+			target = referent
+		}
+		switch made, createErr := createConfigWhole(target, out, perm); {
 		case createErr != nil:
 			return &rewriteError{op: "write", err: createErr}
 		case made:
 			configIOStage("created", path)
 			return nil
 		}
-		// Another writer created the file first (or a dangling symlink names
-		// it): the locked edit below runs again on what is there.
+		// Another writer created the file first: the locked edit below runs
+		// again on what is there.
 		f, err = os.OpenFile(path, os.O_RDWR, 0) //nolint:gosec // caller-resolved config path
 		if errors.Is(err, fs.ErrNotExist) {
-			// No whole create here (hard links unsupported, or path is a
-			// dangling symlink): create in place as before. Limit: until this
-			// writer holds the lock, another can see the new file empty.
+			// No whole create here (hard links unsupported, or a dangling
+			// symlink whose referent's directory is absent, which fails here
+			// as before): create in place as before. Limit: until this writer
+			// holds the lock, another can see the new file empty.
 			created = true
 			f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE, perm) //nolint:gosec // caller-resolved config path
 			if err == nil {
@@ -226,6 +234,10 @@ func RewriteConfigFile(path string, perm os.FileMode, edit func(old []byte, exis
 	return nil
 }
 
+// configTempPattern names createConfigWhole's temp file: short and fixed, so
+// its length never depends on the target's name.
+const configTempPattern = ".bd-config-*.tmp"
+
 // configNoHardLinks makes createConfigWhole report hard links unavailable, so
 // tests can exercise the in-place create fallback.
 var configNoHardLinks bool
@@ -234,15 +246,19 @@ var configNoHardLinks bool
 // reader or writer ever sees it empty or partial: it writes data to a temp file
 // in path's directory and hard-links that to path, which fails if path exists.
 // made is true when path now holds data. made is false, with no error, when
-// path appeared first (or is a dangling symlink, which a link never follows),
-// and when hard links or the temp file are unavailable here (a filesystem
-// without hard links, js/wasm, a temp name the directory refuses): the caller
-// then falls back to its open, whose errors are the historic ones.
+// path appeared first (or is a symlink, which a link never follows: callers
+// pass a dangling symlink's referent instead), and when hard links or the temp
+// file are unavailable here (a filesystem without hard links, js/wasm, a
+// directory that refuses a new file, where the caller's create then fails as
+// before): the caller then falls back to its open, whose errors are the
+// historic ones. The temp name is short and independent of path's name
+// (configTempPattern), so a valid target name near NAME_MAX never makes the
+// temp name too long and forces the fallback.
 func createConfigWhole(path string, data []byte, perm os.FileMode) (made bool, err error) {
 	if configNoHardLinks {
 		return false, nil
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".~"+filepath.Base(path)+".")
+	tmp, err := os.CreateTemp(filepath.Dir(path), configTempPattern)
 	if err != nil {
 		return false, nil
 	}
@@ -266,11 +282,72 @@ func createConfigWhole(path string, data []byte, perm os.FileMode) (made bool, e
 		return false, err
 	}
 	if err := os.Link(tmpName, path); err != nil {
-		// EEXIST: another writer won, or a dangling symlink; anything else:
-		// no hard links here. Both fall back to the caller's open.
+		// EEXIST: another writer won; anything else: no hard links here.
+		// Both fall back to the caller's open.
 		return false, nil
 	}
 	return true, nil
+}
+
+// danglingSymlinkReferent returns the absent file a dangling symlink at path
+// names, resolved physically as an open would follow it: each link text is
+// taken against the real directory of the link it came from, a chain of links
+// is followed, and ".." applies after a directory symlink, never lexically
+// first. ok is false when path is no symlink, when the chain ends at an
+// existing file, or when it cannot be resolved (the referent's directory is
+// absent, a loop): the caller then keeps its plain path and its errors.
+func danglingSymlinkReferent(path string) (referent string, ok bool) {
+	fi, err := os.Lstat(path)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return "", false
+	}
+	p := path
+	for i := 0; i < 64; i++ {
+		// Resolve p's directory physically, then look at its last element.
+		// Split by hand: filepath.Dir would clean "hop/.." away before hop is
+		// followed.
+		dir, base := splitLastElem(p)
+		realDir, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			return "", false
+		}
+		candidate := filepath.Join(realDir, base)
+		fi, err := os.Lstat(candidate)
+		if errors.Is(err, fs.ErrNotExist) {
+			return candidate, true
+		}
+		if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			return "", false // exists (or unreadable): not dangling
+		}
+		link, err := os.Readlink(candidate)
+		if err != nil {
+			return "", false
+		}
+		if filepath.IsAbs(link) || filepath.VolumeName(link) != "" {
+			p = link
+		} else {
+			// Keep the link text unclean: EvalSymlinks walks it element by
+			// element, so ".." follows the symlink it comes after.
+			p = realDir + string(filepath.Separator) + link
+		}
+	}
+	return "", false
+}
+
+// splitLastElem splits p at its last separator without cleaning either part.
+func splitLastElem(p string) (dir, base string) {
+	i := len(p) - 1
+	for i >= 0 && !os.IsPathSeparator(p[i]) {
+		i--
+	}
+	switch {
+	case i < 0:
+		return ".", p
+	case i == 0, filepath.VolumeName(p[:i]) == p[:i]:
+		// The root ("/", or "C:\" on Windows) keeps its separator.
+		return p[:i+1], p[i+1:]
+	}
+	return p[:i], p[i+1:]
 }
 
 // openFailurePhase names the phase a failed read-write open reports: "read"
@@ -312,9 +389,11 @@ func writeConfigLocked(f *os.File, path string, data []byte) error {
 // read while holding it, so read never sees a RewriteConfigFile half done. The
 // open's error (an absent file is fs.ErrNotExist) is returned without calling
 // read: an absent config is absent, never read later without a lock. read
-// gets the locked descriptor; a reader that reopens the path by name (Viper)
-// still reads under the lock, which belongs to the file. No file or
-// directory is ever created to read, and the lock is released on return.
+// gets the locked descriptor and must read through it: a reopen of the path
+// by name can reach another inode (a symlink retargeted after the lock), so
+// Viper parses the bytes read from this descriptor (loadViperConfigLocked),
+// never the reopened name. No file or directory is ever created to read, and
+// the lock is released on return.
 func withConfigReadLock(path string, read func(f *os.File) error) error {
 	if err := checkConfigLockReentry(); err != nil {
 		return err

@@ -1033,3 +1033,295 @@ func TestSetReposInYAML_RetargetedSymlinkReloadReadsLockedFile(t *testing.T) {
 		t.Fatalf("ConfigFileUsed after the reload = %q, want %q", got, path)
 	}
 }
+
+// danglingBootstrapBody is what a first metrics bootstrap writes to an absent
+// user config (the body internal/metrics writes).
+const danglingBootstrapBody = "metrics:\n  disabled: false\n  endpoint: https://example.invalid/collect\n"
+
+// bootstrapLikeEdit is the metrics bootstrap's edit: the whole body for an
+// absent file, else the missing keys set as SetUserYamlConfig would (the
+// existing-file formatting), else nothing.
+func bootstrapLikeEdit(old []byte, exists bool) ([]byte, error) {
+	if !exists {
+		return []byte(danglingBootstrapBody), nil
+	}
+	var root map[string]interface{}
+	if err := yaml.Unmarshal(old, &root); err != nil {
+		return nil, err
+	}
+	metrics, _ := root["metrics"].(map[string]interface{})
+	content, changed := string(old), false
+	for _, kv := range [][2]string{{"disabled", "false"}, {"endpoint", "https://example.invalid/collect"}} {
+		if _, ok := metrics[kv[0]]; ok {
+			continue
+		}
+		var err error
+		if content, err = UpdateYamlConfigContent(content, "metrics."+kv[0], kv[1]); err != nil {
+			return nil, err
+		}
+		changed = true
+	}
+	if !changed {
+		return nil, ErrSkipRewrite
+	}
+	return []byte(content), nil
+}
+
+// requireHardLinks skips unless dir's filesystem supports hard links.
+func requireHardLinks(t *testing.T, dir string) {
+	t.Helper()
+	probe := filepath.Join(dir, ".probe")
+	if err := os.WriteFile(probe, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(probe)
+	if err := os.Link(probe, probe+".link"); err != nil {
+		t.Skipf("no hard links here: %v", err)
+	}
+	_ = os.Remove(probe + ".link")
+}
+
+// TestRewriteConfigFile_DanglingSymlinkBootstrapRace: config.yaml is a
+// symlink to an absent dotfile. The first bootstrap is stopped right after it
+// creates the file, before any lock; a second bootstrap runs to the end. The
+// referent must have been created whole, so the final bytes equal one serial
+// bootstrap's, and config.yaml stays a symlink.
+func TestRewriteConfigFile_DanglingSymlinkBootstrapRace(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need privileges on windows")
+	}
+	setup := func(t *testing.T) (dir, path, referent string) {
+		dir = t.TempDir()
+		requireHardLinks(t, dir)
+		path = filepath.Join(dir, "config.yaml")
+		referent = filepath.Join(dir, "dotfile.yaml")
+		if err := os.Symlink("dotfile.yaml", path); err != nil {
+			t.Fatal(err)
+		}
+		return dir, path, referent
+	}
+
+	_, serialPath, _ := setup(t)
+	if err := RewriteConfigFile(serialPath, 0o600, bootstrapLikeEdit); err != nil {
+		t.Fatalf("serial bootstrap: %v", err)
+	}
+	if err := RewriteConfigFile(serialPath, 0o600, bootstrapLikeEdit); err != nil {
+		t.Fatalf("serial second bootstrap: %v", err)
+	}
+	want, err := os.ReadFile(serialPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir, path, referent := setup(t)
+	created := make(chan struct{})
+	resume := make(chan struct{})
+	var once sync.Once
+	configIOHook = func(stage, p string) {
+		if stage == "created" && p == path {
+			once.Do(func() {
+				close(created)
+				<-resume
+			})
+		}
+	}
+	t.Cleanup(func() { configIOHook = nil })
+
+	first := make(chan error, 1)
+	go func() { first <- RewriteConfigFile(path, 0o600, bootstrapLikeEdit) }()
+	select {
+	case <-created:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first bootstrap never created the file")
+	}
+	second := make(chan error, 1)
+	go func() { second <- RewriteConfigFile(path, 0o600, bootstrapLikeEdit) }()
+	select {
+	case err := <-second:
+		if err != nil {
+			close(resume)
+			t.Fatalf("second bootstrap: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		close(resume)
+		t.Fatal("the second bootstrap waited on the paused first one")
+	}
+	close(resume)
+	if err := <-first; err != nil {
+		t.Fatalf("first bootstrap: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("raced bootstrap through a dangling symlink wrote %q, want the serial bootstrap's %q", got, want)
+	}
+	if fi, err := os.Lstat(path); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("config.yaml is no longer a symlink (%v)", err)
+	}
+	if fi, err := os.Stat(referent); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("referent dotfile.yaml: %v, want a 0600 file", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 2 {
+		t.Fatalf("config dir holds %v, want config.yaml and dotfile.yaml only (no temp file)", entries)
+	}
+}
+
+// TestRewriteConfigFile_DanglingSymlinkChain: config.yaml -> a, a -> sub/b,
+// sub -> a directory elsewhere, b absent. A set creates the file the chain
+// names (in sub's real directory), a read through config.yaml sees it, and
+// both links stay links.
+func TestRewriteConfigFile_DanglingSymlinkChain(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need privileges on windows")
+	}
+	path := setRewriteTestHome(t, t.TempDir())
+	dir := filepath.Dir(path)
+	realSub := filepath.Join(t.TempDir(), "real-sub")
+	for _, d := range []string{dir, realSub} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(realSub, filepath.Join(dir, "sub")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("sub", "b"), filepath.Join(dir, "a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("a", path); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := SetUserYamlConfig("rewrite.chain", "made"); err != nil {
+		t.Fatalf("SetUserYamlConfig through a dangling chain: %v", err)
+	}
+	if got, ok := readYamlValueAtPath(path, "rewrite.chain"); !ok || got != "made" {
+		t.Fatalf("read through config.yaml: rewrite.chain = %q (found %v), want made", got, ok)
+	}
+	if got, _ := readYamlValueAtPath(filepath.Join(realSub, "b"), "rewrite.chain"); got != "made" {
+		t.Fatalf("the chain's referent %s holds rewrite.chain = %q, want made", filepath.Join(realSub, "b"), got)
+	}
+	for _, link := range []string{path, filepath.Join(dir, "a")} {
+		if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("%s is no longer a symlink (%v)", filepath.Base(link), err)
+		}
+	}
+	if entries, _ := os.ReadDir(realSub); len(entries) != 1 {
+		t.Fatalf("%s holds %v, want only b (no temp file)", realSub, entries)
+	}
+
+	// A dangling link whose referent's directory is absent fails as before.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("missing-dir", "c.yaml"), path); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetUserYamlConfig("rewrite.chain", "x"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("SetUserYamlConfig through a link into an absent directory = %v, want not-exist", err)
+	}
+}
+
+// TestRewriteConfigFile_LongNameDanglingBootstrapRace: config.yaml links to an
+// absent file whose basename is 254 bytes, valid where NAME_MAX is 255. The
+// temp name must not grow with the target's name: otherwise its create fails,
+// the in-place fallback publishes an empty file, and a concurrent bootstrap
+// writes the existing-file formatting. The first bootstrap-like edit is paused
+// at "created" and a second runs to the end; the final bytes equal a serial
+// bootstrap's and no temp file is left.
+func TestRewriteConfigFile_LongNameDanglingBootstrapRace(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need privileges on windows")
+	}
+	long := strings.Repeat("d", 249) + ".yaml" // 254 bytes
+	setup := func(t *testing.T) (dir, path, referent string) {
+		dir = t.TempDir()
+		requireHardLinks(t, dir)
+		probe := filepath.Join(dir, strings.Repeat("n", 255))
+		if err := os.WriteFile(probe, nil, 0o600); err != nil {
+			t.Skipf("NAME_MAX below 255 here: %v", err)
+		}
+		if err := os.Remove(probe); err != nil {
+			t.Fatal(err)
+		}
+		path = filepath.Join(dir, "config.yaml")
+		referent = filepath.Join(dir, long)
+		if err := os.Symlink(long, path); err != nil {
+			t.Fatal(err)
+		}
+		return dir, path, referent
+	}
+
+	_, serialPath, _ := setup(t)
+	for i := 0; i < 2; i++ {
+		if err := RewriteConfigFile(serialPath, 0o600, bootstrapLikeEdit); err != nil {
+			t.Fatalf("serial bootstrap %d: %v", i, err)
+		}
+	}
+	want, err := os.ReadFile(serialPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir, path, referent := setup(t)
+	created := make(chan struct{})
+	resume := make(chan struct{})
+	var once sync.Once
+	configIOHook = func(stage, p string) {
+		if stage == "created" && p == path {
+			once.Do(func() {
+				close(created)
+				<-resume
+			})
+		}
+	}
+	t.Cleanup(func() { configIOHook = nil })
+
+	first := make(chan error, 1)
+	go func() { first <- RewriteConfigFile(path, 0o600, bootstrapLikeEdit) }()
+	select {
+	case <-created:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first bootstrap never created the file")
+	}
+	second := make(chan error, 1)
+	go func() { second <- RewriteConfigFile(path, 0o600, bootstrapLikeEdit) }()
+	select {
+	case err := <-second:
+		if err != nil {
+			close(resume)
+			t.Fatalf("second bootstrap: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		close(resume)
+		t.Fatal("the second bootstrap waited on the paused first one")
+	}
+	close(resume)
+	if err := <-first; err != nil {
+		t.Fatalf("first bootstrap: %v", err)
+	}
+
+	got, err := os.ReadFile(referent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("raced bootstrap to a 254-byte referent wrote %q, want the serial bootstrap's %q", got, want)
+	}
+	if fi, err := os.Lstat(path); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("config.yaml is no longer a symlink (%v)", err)
+	}
+	entries, _ := os.ReadDir(dir)
+	var names []string
+	for _, e := range entries {
+		if e.Name() != "config.yaml" && e.Name() != long {
+			names = append(names, e.Name())
+		}
+	}
+	if len(names) != 0 {
+		t.Fatalf("config dir holds extra entries %v, want config.yaml and the referent only (no temp file)", names)
+	}
+}

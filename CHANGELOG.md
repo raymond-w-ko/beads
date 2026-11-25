@@ -108,12 +108,11 @@ init, bootstrap and port fixes and the record-only commits landed since
   crash during a write can still leave a partial file, as the unlocked
   write could; a file already torn by an older bd is not repaired (fix or
   delete it by hand); where hard links are unavailable (a filesystem
-  without them, js/wasm) or `config.yaml` is a dangling symlink, a new file
-  is created in place as before, so until its creator holds the lock another
-  bd can see it empty, and a concurrent first bootstrap can then write the
-  existing-file formatting (four-space indent, quoted endpoint) with the same
-  values; `bd init`'s creation of `.beads/config.yaml` is not
-  routed through the helper; config.yaml readers outside `internal/config`
+  without them, js/wasm), a new file is created in place as before, so until
+  its creator holds the lock another bd can see it empty, and a concurrent
+  first bootstrap can then write the existing-file formatting (four-space
+  indent, quoted endpoint) with the same values; `bd init`'s creation of
+  `.beads/config.yaml` is not routed through the helper; config.yaml readers outside `internal/config`
   (several `bd doctor` checks, the sync config validation, the storage
   layer's raw `ReadConfigYAML`) still read without the lock; and a program
   other than bd (an editor) takes no lock.
